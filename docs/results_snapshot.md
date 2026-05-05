@@ -5,7 +5,10 @@
 This repository is an early-stage research pipeline for the earnings event
 volatility project. The current implementation can build audited candidate
 events, provisional event panels, and a second-aggregate trade-price proxy
-panel. It does not yet produce paper-grade quote/NBBO backtest results.
+panel. It does not yet produce paper-grade quote/NBBO backtest results. The
+active market-data route has no historical option quote rows: proxy entry marks
+come from Massive option second aggregates, and proxy exit marks come from
+exit-date option day-aggregate closes when available.
 
 Active and current:
 
@@ -16,32 +19,50 @@ Active and current:
 - Verification front door: `just check`, including `ruff format`, `ruff check
   --fix`, strict mypy, pytest, MkDocs strict, status, and Massive credential
   probes.
-- Test coverage floor: 93% on the active package. Current local gate:
-  51 tests passed with 94.23% total coverage.
+- Test coverage floor: 93% on the active package. Current local test gate:
+  57 tests passed with 93.55% total coverage.
 - Data-audit gate: `just audit` for fixtures; `just audit date=YYYY-MM-DD` for
   a narrow Massive flat-file sample gate.
 - Data-engineering gate: `just data` for resumable stages. The current stages
-  are `fixture-audit`, `massive-probe`, `calendar-pilot`, `contracts`,
-  `panel`, `pilot-panel`, and `trade-proxy-panel`; outputs are skipped when
-  present unless `--force` is passed through `args`.
-- `just data` defaults to the `trade-proxy-panel` stage with a 10-event,
-  4-worker, 900-second pre-cutoff VWAP window. Explicit stage names are still
-  available for rebuilding the calendar, pilot panel, fixture audit, and quote
-  panel smoke paths.
-- Data lake layout: Massive downloads are temporary transfer files. They are
-  converted immediately into compressed Parquet under `data/bronze/`; cleaned
-  intermediate tables go to `data/silver/`; analysis-ready panels go to
+  are `fixture-audit`, `massive-probe`, `universe`, `calendar-pilot`,
+  `contracts`, `panel`, `pilot-panel`, `trade-proxy-panel`, and `proxy-all`;
+  outputs are skipped when present unless `--force` is passed through `args`.
+- `just data` defaults to `proxy-all`, which runs
+  `calendar-pilot -> pilot-panel -> trade-proxy-panel` over the Phase 1
+  `2020-2025` range with a 10-event smoke cap, 4 workers, a 900-second pricing
+  lookback, a 60-minute resolved-close pre-cutoff buffer, and DTE `3-21`
+  contract discovery. Explicit stage names are still available for rebuilding
+  the calendar, pilot panel, fixture audit, and legacy fixture panel smoke
+  paths. It prints stage-level progress plus second-agg and exit day-agg
+  count/status updates during long runs.
+- Data lake layout: Massive flat-file downloads are temporary transfer files.
+  They are converted immediately into compressed Parquet under `data/bronze/`;
+  second-aggregate trade-proxy bars are cached under
+  `data/bronze/massive/options_second_aggs/` for entry/pre-cutoff diagnostics
+  only; exit option prices come from exit-date `options_day_aggs` closes.
+  Cached Parquet partitions are reused if readable with the expected schema;
+  corrupt second-agg or exit day-agg caches are repaired by deleting and
+  re-fetching the affected partition.
+  Cleaned intermediate tables go to `data/silver/`; analysis-ready panels go to
   `data/gold/`. `artifacts/` is reserved for manifests, readiness reports, and
   audit summaries.
+- Dynamic universe scaffolding now exists as `just data universe
+  args="--options-day-aggs PATH"`: it builds monthly ticker liquidity from
+  normalized option day aggregates and top-50 trailing six-month option premium
+  dollar-volume snapshots, with Phase 1 telemetry split into `covid_shock` and
+  `steady_proxy`.
 - First real Massive flat-file probe: `just audit date=2025-02-05` succeeded
   for option day aggregates, option quotes metadata, and underlying day
-  aggregates. Outputs are in `artifacts/massive_flat_file_probe/`.
+  aggregates. Outputs are in `artifacts/massive_flat_file_probe/`. The
+  `options_quotes_v1` observation is metadata/readiness only; current proxy data
+  engineering does not ingest that quote file.
 - Current data-readiness finding: `day_aggs_v1` supports contract parsing,
   underlying close sampling, and a provisional local-IV route from option close
   prices. It lacks bid/ask, open interest, quote condition, IV, and Greeks, so
   it cannot support paper-grade IVAR extraction or transaction-cost backtests by
-  itself. The next data route must use `options_quotes_v1` plus an IV/Greeks/OI
-  source or a local IV solver from NBBO mids.
+  itself. The active near-term route therefore remains `no_nbbo_trade_proxy`.
+  A later paper-grade route would need `options_quotes_v1` or another
+  historical bid/ask/NBBO source plus IV/Greeks/OI or local IV from mids.
 - First earnings-source probe: `artifacts/earnings_calendar_source_probe/`
   compares Nasdaq calendar rows, SEC EDGAR company submissions, and Massive
   8-K text for AAPL, AMZN, MSFT, NVDA, and TSLA. SEC EDGAR submissions are the
@@ -66,8 +87,10 @@ Not yet paper evidence:
   `just data trade-proxy-panel`. It uses Massive option second aggregates to
   take the latest pre-cutoff VWAP or close for candidate contracts, recompute
   local IV, and write a `no_nbbo_trade_proxy` event panel plus gross/haircut
-  straddle diagnostics. This is useful for screening, not paper-grade execution
-  claims.
+  straddle diagnostics. Exit diagnostics use exit-date option day-aggregate
+  closes by default and record `option_exit_price_status` plus
+  `used_intrinsic_fallback` when intrinsic payoff is needed. This is useful for
+  screening, not paper-grade execution claims.
 - No paper-grade Massive `options_quotes_v1` ingestion or final top-50 earnings
   panel has been implemented yet.
 - The active implementation is still deterministic/pilot plumbing: event
@@ -79,7 +102,7 @@ Not yet paper evidence:
   vendor/local IV audit prerequisites.
 - Contract discovery now records multiplier, contract size, deliverable status,
   corporate-action flags, and `contract_discovery_status`; non-standard OCC
-  contracts are excluded before quote pooling.
+  contracts are excluded before proxy-price pooling.
 - Event-panel scaffolding now records `forward_source`, `forward_price`,
   `atm_selection_method`, `american_forward_caveat_flag`, and
   `possible_preannouncement_or_prior_guidance`.
@@ -101,15 +124,18 @@ Latest local pilot-panel run:
 Latest local trade-proxy run:
 
 - Command:
-  `just data trade-proxy-panel args="--force --max-events 20 --max-contracts 180 --jobs 8 --lookback-seconds 900"`.
+  `just data args="--force --max-events 10 --jobs 4"`.
 - Gold panel: `data/gold/event_panel/trade_proxy_event_panel.parquet`.
 - Rows: 10 events.
-- Contract proxy prices: 180/180 contracts had pre-cutoff second-aggregate prices
-  and local IV estimates.
+- Contract proxy prices: 239/240 contracts had pre-cutoff second-aggregate
+  prices and local IV estimates; 1 contract had
+  `no_trade_in_cutoff_window`.
 - Trade-proxy IVAR coverage: 10/10 events.
 - Gross proxy straddle diagnostics: 10 rows. Mean gross proxy PnL is about
-  `-577.44` USD and mean haircut PnL is about `-720.62` USD in this tiny
+  `-268.61` USD and mean haircut PnL is about `-370.37` USD in this tiny
   screening slice.
+- Bronze second-agg cache: 240 contract partitions written under
+  `data/bronze/massive/options_second_aggs/`.
 - Limitation: every row is `panel_grade = no_nbbo_trade_proxy`; this is a
   screening panel based on trade-price OHLCV bars, not a bid/ask executable
   strategy result.
@@ -128,25 +154,19 @@ The current rule is:
 
 ## Next Gate
 
-The next implementation gate is trade-proxy screening, then paper-grade
-quote/IV ingestion:
+The next implementation gate is larger trade-proxy calibration, not quote/NBBO
+ingestion. The recommended sequence is:
 
-1. Run `just data trade-proxy-panel` on a small recent event sample and inspect
-   `trade_proxy_panel_report.json` for coverage, stale contracts, and IVAR
-   failures.
-2. Decide how to extract end-of-day option quotes from `options_quotes_v1`
-   without downloading a full 95GB day file into memory.
-3. Add an IV/OI path: either Massive historical snapshot/contract endpoint if
-   available for the date, or local IV calculation from quote mid plus contract
-   metadata and underlying close.
-4. Replace the provisional `options_day_aggs` close proxy in
-   `data/gold/event_panel/pilot_event_panel.parquet` with pre-event NBBO quote
-   pools and quote-condition/liquidity diagnostics.
-5. Produce an event-alignment audit showing no post-announcement quotes enter
-   predictors.
-6. Promote a real data audit only after required Massive fields, quote-source
-   semantics, vendor/local IV differences, and earnings timestamp source are
-   documented.
+1. Run `just data args="--force --max-events 50 --jobs 4"` and inspect
+   `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` for
+   coverage, repair status, fallback usage, stale contracts, and IVAR failures.
+2. If coverage is healthy, run `just data args="--force --max-events 200 --jobs
+   4"` to estimate Phase 1 storage/API/coverage telemetry.
+3. Use that telemetry to decide whether the full 2020-2025 Phase 1 proxy lake
+   stays on WSL ext4 or moves `DATA_DIR` to a larger NVMe/external path.
+4. Only after the proxy lake is stable, build the feature matrix and model
+   baselines. Paper-grade quote/NBBO ingestion remains a later route, not a
+   current dependency for the proxy data-engineering pass.
 
 Promotion criterion:
 

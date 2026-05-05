@@ -346,6 +346,7 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         events_path=args.events,
         contracts_path=args.contracts,
         quotes_path=args.quotes,
+        options_day_aggs_path=args.options_day_aggs,
         ex_dividends_path=args.ex_dividends,
         sec_submissions_dir=args.sec_submissions_dir,
         massive_8k_text_dir=args.massive_8k_text_dir,
@@ -356,7 +357,11 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         max_contracts=args.max_contracts,
         download_samples=args.download_samples,
         lookback_seconds=args.lookback_seconds,
+        second_agg_buffer_minutes=args.second_agg_buffer_minutes,
         price_field=args.price_field,
+        dry_run=args.dry_run,
+        universe_top_n=args.universe_top_n,
+        universe_trailing_months=args.universe_trailing_months,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -512,8 +517,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         choices=[
             "all",
+            "proxy-all",
             "fixture-audit",
             "massive-probe",
+            "universe",
             "calendar-pilot",
             "contracts",
             "panel",
@@ -537,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--events", type=Path)
     data.add_argument("--contracts", type=Path)
     data.add_argument("--quotes", type=Path)
+    data.add_argument("--options-day-aggs", type=Path)
     data.add_argument("--ex-dividends", type=Path)
     data.add_argument("--sec-submissions-dir", type=Path)
     data.add_argument("--massive-8k-text-dir", type=Path)
@@ -546,7 +554,11 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--max-events", type=int)
     data.add_argument("--max-contracts", type=int)
     data.add_argument("--download-samples", action="store_true")
+    data.add_argument("--dry-run", action="store_true")
     data.add_argument("--lookback-seconds", type=int, default=900)
+    data.add_argument("--second-agg-buffer-minutes", type=int, default=60)
+    data.add_argument("--universe-top-n", type=int, default=50)
+    data.add_argument("--universe-trailing-months", type=int, default=6)
     data.add_argument(
         "--price-field",
         choices=["option_vwap", "option_close"],

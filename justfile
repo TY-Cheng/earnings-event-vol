@@ -1,4 +1,4 @@
-set dotenv-load
+set dotenv-load := true
 set shell := ["bash", "-cu"]
 
 cli := "PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli"
@@ -16,24 +16,24 @@ _sync: _require-external-uv-env
     uv sync --all-extras --dev
 
 _format: _sync
-    uv run ruff format {{format_paths}}
-    uv run ruff check --fix {{format_paths}}
+    uv run ruff format {{ format_paths }}
+    uv run ruff check --fix {{ format_paths }}
 
 check: _format
-    uv run mypy {{active_src}} {{active_tests}}
+    uv run mypy {{ active_src }} {{ active_tests }}
     uv run pytest
     uv run mkdocs build --strict --clean
-    {{cli}} status
-    {{cli}} source-probe all
+    {{ cli }} status
+    {{ cli }} source-probe all
 
 status: _require-external-uv-env
-    {{cli}} status
+    {{ cli }} status
 
 audit date="": _format
-    @probe_date="{{ date }}"; probe_date="${probe_date#date=}"; if [[ -n "$probe_date" ]]; then {{cli}} massive-flat-files --date "$probe_date" --out artifacts/massive_flat_file_probe; else {{cli}} audit-data --quotes tests/fixtures/option_quotes.csv --underlying tests/fixtures/underlying_bars.csv --earnings tests/fixtures/earnings_calendar.csv --out artifacts/audit_data_fixtures; fi
+    @probe_date="{{ date }}"; probe_date="${probe_date#date=}"; if [[ -n "$probe_date" ]]; then {{ cli }} massive-flat-files --date "$probe_date" --out artifacts/massive_flat_file_probe; else {{ cli }} audit-data --quotes tests/fixtures/option_quotes.csv --underlying tests/fixtures/underlying_bars.csv --earnings tests/fixtures/earnings_calendar.csv --out artifacts/audit_data_fixtures; fi
 
-data stage="trade-proxy-panel" args="": _require-external-uv-env
-    @extra='{{args}}'; extra="${extra#args=}"; defaults=(); if [[ "{{stage}}" == "trade-proxy-panel" ]]; then defaults=(--max-events 10 --jobs 4 --lookback-seconds 900 --price-field option_vwap); fi; read -r -a extra_args <<< "$extra"; {{cli}} data --stage "{{stage}}" "${defaults[@]}" "${extra_args[@]}"
+data stage="proxy-all" args="": _require-external-uv-env
+    @stage='{{ stage }}'; extra='{{ args }}'; if [[ "$stage" == args=* ]]; then extra="${stage#args=}"; stage="proxy-all"; elif [[ "$stage" == --* ]]; then extra="$stage ${extra#args=}"; stage="proxy-all"; else extra="${extra#args=}"; fi; defaults=(); if [[ "$stage" == "proxy-all" ]]; then defaults=(--start 2020-01-01 --end 2025-12-31 --max-events 10 --jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap --dte-min 3 --dte-max 21); elif [[ "$stage" == "trade-proxy-panel" ]]; then defaults=(--max-events 10 --jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap); fi; read -r -a extra_args <<< "$extra"; {{ cli }} data --stage "$stage" "${defaults[@]}" "${extra_args[@]}"
 
 docs port="8000": _format
     uv run mkdocs build --strict --clean

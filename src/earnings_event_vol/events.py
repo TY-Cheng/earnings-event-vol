@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,7 @@ from earnings_event_vol.schemas import AnnouncementTiming, EarningsEvent, EventW
 
 NEW_YORK_TZ = ZoneInfo("America/New_York")
 REGULAR_CLOSE = time(hour=16, minute=0)
+EARLY_CLOSE = time(hour=13, minute=0)
 
 
 def _sorted_dates(dates: Iterable[date]) -> list[date]:
@@ -26,8 +27,25 @@ def next_trading_date(trading_dates: Iterable[date], target: date) -> date | Non
     return future[0] if future else None
 
 
+def market_close_timestamp(
+    day: date,
+    *,
+    early_closes: Mapping[date, time] | None = None,
+) -> datetime:
+    close_time = (early_closes or {}).get(day, REGULAR_CLOSE)
+    return datetime.combine(day, close_time, tzinfo=NEW_YORK_TZ)
+
+
+def market_close_timestamp_utc(
+    day: date,
+    *,
+    early_closes: Mapping[date, time] | None = None,
+) -> datetime:
+    return market_close_timestamp(day, early_closes=early_closes).astimezone(ZoneInfo("UTC"))
+
+
 def regular_close_timestamp(day: date) -> datetime:
-    return datetime.combine(day, REGULAR_CLOSE, tzinfo=NEW_YORK_TZ)
+    return market_close_timestamp(day)
 
 
 def align_event_window(event: EarningsEvent, trading_dates: Iterable[date]) -> EventWindow:

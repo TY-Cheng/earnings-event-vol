@@ -26,6 +26,12 @@ TRADE_PROXY_STATUS_OK = "ok"
 TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW = "no_trade_in_cutoff_window"
 TRADE_PROXY_STATUS_MISSING_CONTRACT = "missing_contract"
 TRADE_PROXY_STATUS_FETCH_FAILED = "fetch_failed"
+UNDERLYING_EXIT_PRICE_SOURCE = "day_aggs_close"
+OPTION_EXIT_PRICE_SOURCE_DAY_AGGS = "options_day_aggs_close"
+OPTION_EXIT_PAYOFF_FALLBACK_INTRINSIC = "intrinsic_value_at_underlying_exit"
+OPTION_EXIT_STATUS_OK = "ok"
+OPTION_EXIT_STATUS_MISSING_DAY_AGG = "missing_exit_option_close"
+OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT = "expiration_at_exit_intrinsic"
 
 
 @dataclass(frozen=True)
@@ -47,7 +53,7 @@ def _to_date(value: object) -> date:
 def _to_datetime(value: object) -> datetime:
     timestamp = pd.Timestamp(value)
     if timestamp.tzinfo is None:
-        timestamp = timestamp.tz_localize("America/New_York")
+        raise ValueError("timestamp must be timezone-aware")
     return cast(datetime, timestamp.to_pydatetime())
 
 
@@ -57,6 +63,36 @@ def _as_float(value: object) -> float:
 
 def _as_int(value: object) -> int:
     return int(cast(Any, value))
+
+
+def _aware_et_timestamp(value: object, *, name: str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return timestamp.tz_convert("America/New_York")
+
+
+def filter_pre_cutoff_buffer(
+    bars: pd.DataFrame,
+    *,
+    cutoff_timestamp: datetime,
+    buffer_minutes: int,
+) -> pd.DataFrame:
+    """Keep only bars in the pre-cutoff buffer used for entry pricing/features."""
+    if buffer_minutes <= 0:
+        raise ValueError("buffer_minutes must be positive.")
+    if bars.empty:
+        return bars.copy()
+    if "timestamp_et" not in bars.columns:
+        raise ValueError("bar frame missing timestamp_et column.")
+    cutoff = _aware_et_timestamp(cutoff_timestamp, name="cutoff_timestamp")
+    start = cutoff - pd.Timedelta(minutes=buffer_minutes)
+    frame = bars.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
+    if frame["timestamp_et"].dt.tz is None:
+        raise ValueError("timestamp_et must be timezone-aware")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
+    return frame.loc[frame["timestamp_et"].between(start, cutoff, inclusive="both")].copy()
 
 
 def _api_key(config: ProjectConfig) -> str:
@@ -151,14 +187,13 @@ def select_latest_proxy_price(
         return ProxyPriceSelection(status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW)
     if "timestamp_et" not in bars.columns:
         raise ValueError("bar frame missing timestamp_et column.")
-    cutoff = pd.Timestamp(cutoff_timestamp)
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.tz_localize("America/New_York")
+    cutoff = _aware_et_timestamp(cutoff_timestamp, name="cutoff_timestamp")
     start = cutoff - pd.Timedelta(seconds=lookback_seconds)
     frame = bars.copy()
     frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
     if frame["timestamp_et"].dt.tz is None:
-        frame["timestamp_et"] = frame["timestamp_et"].dt.tz_localize("America/New_York")
+        raise ValueError("timestamp_et must be timezone-aware")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
     frame[price_field] = pd.to_numeric(frame[price_field], errors="coerce")
     eligible = frame.loc[
         frame["timestamp_et"].between(start, cutoff, inclusive="both") & frame[price_field].gt(0)
@@ -211,7 +246,10 @@ def build_trade_proxy_price_frame(
         cutoff = (
             _to_datetime(cutoff_raw)
             if cutoff_raw is not None and not pd.isna(cutoff_raw)
-            else datetime.combine(_to_date(contract["entry_date"]), datetime.min.time())
+            else pd.Timestamp(
+                _to_date(contract["entry_date"]).isoformat() + " 16:00:00",
+                tz="America/New_York",
+            ).to_pydatetime()
         )
         selection = select_latest_proxy_price(
             bar_frames.get(option_ticker, pd.DataFrame()),
@@ -441,16 +479,37 @@ def extract_trade_proxy_event_panel(
     return pd.DataFrame(rows)
 
 
+def _option_exit_close_lookup(
+    option_exit_prices: pd.DataFrame | None,
+) -> dict[tuple[str, date], float]:
+    if option_exit_prices is None or option_exit_prices.empty:
+        return {}
+    required = {"options_ticker", "date", "option_close"}
+    missing = sorted(required - set(option_exit_prices.columns))
+    if missing:
+        raise ValueError(f"option exit price frame missing required columns: {missing}")
+    lookup: dict[tuple[str, date], float] = {}
+    for row in option_exit_prices.to_dict("records"):
+        close = row.get("option_close")
+        if close is None or pd.isna(close) or float(close) <= 0:
+            continue
+        lookup[(str(row["options_ticker"]), _to_date(row["date"]))] = float(close)
+    return lookup
+
+
 def build_proxy_straddle_diagnostics(
     iv_contracts: pd.DataFrame,
     windows: pd.DataFrame,
     *,
+    option_exit_prices: pd.DataFrame | None = None,
     haircut_fraction: float = 0.10,
 ) -> pd.DataFrame:
     """Compute one-contract long ATM straddle proxy PnL using entry proxy prices.
 
-    Exit value is intrinsic value at the close-to-close `s_after`; this is a gross screening
-    diagnostic, not a quote-executable strategy result.
+    Exit value uses the same contracts' exit-date option day-aggregate close when available.
+    Intrinsic value is a fallback only when the exit option close is missing or the contract
+    expires on the exit date. This remains a gross screening diagnostic, not a quote-executable
+    strategy result.
     """
     columns = [
         "event_id",
@@ -460,7 +519,12 @@ def build_proxy_straddle_diagnostics(
         "expiration",
         "strike",
         "entry_premium_usd",
+        "exit_option_value_usd",
         "exit_intrinsic_usd",
+        "underlying_exit_price_source",
+        "option_exit_price_source",
+        "option_exit_price_status",
+        "used_intrinsic_fallback",
         "gross_proxy_pnl_usd",
         "haircut_pnl_usd",
         "proxy_volume_window",
@@ -469,6 +533,7 @@ def build_proxy_straddle_diagnostics(
     ]
     if iv_contracts.empty:
         return pd.DataFrame(columns=columns)
+    exit_close_by_contract = _option_exit_close_lookup(option_exit_prices)
     rows: list[dict[str, object]] = []
     seen_events: set[object] = set()
     grouped = iv_contracts.sort_values(["event_id", "expiration"]).groupby(
@@ -494,6 +559,8 @@ def build_proxy_straddle_diagnostics(
                         "strike": float(strike),
                         "call_price": float(call["proxy_price"]),
                         "put_price": float(put["proxy_price"]),
+                        "call_options_ticker": str(call["options_ticker"]),
+                        "put_options_ticker": str(put["options_ticker"]),
                         "moneyness_abs": abs(float(strike) / spot - 1.0),
                         "volume": int(strike_group["proxy_volume_window"].sum()),
                         "transactions": int(strike_group["proxy_transactions_window"].sum()),
@@ -509,18 +576,45 @@ def build_proxy_straddle_diagnostics(
         entry_premium_usd = (
             _as_float(selected["call_price"]) + _as_float(selected["put_price"])
         ) * 100.0
-        exit_intrinsic_usd = abs(float(event_row["s_after"]) - strike) * 100.0
-        gross_pnl = exit_intrinsic_usd - entry_premium_usd
+        exit_date = _to_date(event_row["exit_date"])
+        expiry = _to_date(expiration)
+        terminal_spot = float(event_row["s_after"])
+        exit_intrinsic_usd = abs(terminal_spot - strike) * 100.0
+        call_exit_close = exit_close_by_contract.get(
+            (str(selected["call_options_ticker"]), exit_date)
+        )
+        put_exit_close = exit_close_by_contract.get(
+            (str(selected["put_options_ticker"]), exit_date)
+        )
+        use_intrinsic = expiry <= exit_date or call_exit_close is None or put_exit_close is None
+        if expiry <= exit_date:
+            exit_status = OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT
+        elif call_exit_close is None or put_exit_close is None:
+            exit_status = OPTION_EXIT_STATUS_MISSING_DAY_AGG
+        else:
+            exit_status = OPTION_EXIT_STATUS_OK
+        if use_intrinsic:
+            exit_option_value_usd = exit_intrinsic_usd
+        else:
+            assert call_exit_close is not None
+            assert put_exit_close is not None
+            exit_option_value_usd = (float(call_exit_close) + float(put_exit_close)) * 100.0
+        gross_pnl = exit_option_value_usd - entry_premium_usd
         rows.append(
             {
                 "event_id": event_id,
                 "ticker": event_row["ticker"],
                 "entry_date": event_row["entry_date"],
-                "exit_date": event_row["exit_date"],
-                "expiration": _to_date(expiration),
+                "exit_date": exit_date,
+                "expiration": expiry,
                 "strike": strike,
                 "entry_premium_usd": entry_premium_usd,
+                "exit_option_value_usd": exit_option_value_usd,
                 "exit_intrinsic_usd": exit_intrinsic_usd,
+                "underlying_exit_price_source": UNDERLYING_EXIT_PRICE_SOURCE,
+                "option_exit_price_source": OPTION_EXIT_PRICE_SOURCE_DAY_AGGS,
+                "option_exit_price_status": exit_status,
+                "used_intrinsic_fallback": use_intrinsic,
                 "gross_proxy_pnl_usd": gross_pnl,
                 "haircut_pnl_usd": gross_pnl - haircut_fraction * entry_premium_usd,
                 "proxy_volume_window": selected["volume"],

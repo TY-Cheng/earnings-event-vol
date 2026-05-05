@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import gzip
+import importlib
 import json
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pandas as pd
 import pytest
 
+import scripts.build_trade_proxy_panel as trade_proxy_panel_script
 from earnings_event_vol.backtest import (
     GaussianEventJumpDistribution,
     SymmetricTwoPointJumpDistribution,
@@ -59,6 +61,8 @@ from earnings_event_vol.events import (
     align_event_window,
     has_ex_dividend_between,
     is_halted_or_proxy_halted,
+    market_close_timestamp,
+    market_close_timestamp_utc,
     regular_close_timestamp,
     rvar_prices_for_window,
     validate_calendar_frame,
@@ -100,6 +104,8 @@ from earnings_event_vol.schemas import (
     UnderlyingBar,
 )
 from earnings_event_vol.trade_proxy import (
+    OPTION_EXIT_STATUS_MISSING_DAY_AGG,
+    OPTION_EXIT_STATUS_OK,
     TRADE_PROXY_PANEL_GRADE,
     TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
     TRADE_PROXY_STATUS_OK,
@@ -110,10 +116,25 @@ from earnings_event_vol.trade_proxy import (
     edge_decile_diagnostics,
     extract_trade_proxy_event_panel,
     fetch_massive_option_second_aggregates,
+    filter_pre_cutoff_buffer,
     normalize_second_aggregates,
     select_latest_proxy_price,
     summarize_trade_proxy_panel,
     write_trade_proxy_metadata,
+)
+from earnings_event_vol.universe import (
+    ELIGIBLE_EQUITY_RULE_VERSION,
+    PHASE1_COVID_SHOCK_BUCKET,
+    PHASE1_STEADY_PROXY_BUCKET,
+    TICKER_MAPPING_AMBIGUOUS,
+    TICKER_MAPPING_OK,
+    TICKER_NOT_FOUND,
+    build_eligible_equity_tickers,
+    build_monthly_liquid_universe,
+    build_ticker_month_liquidity,
+    eligible_equity_cache_matches_rule,
+    phase1_telemetry_bucket,
+    ticker_mapping_diagnostics,
 )
 from earnings_event_vol.variance import (
     TotalVariancePoint,
@@ -1334,6 +1355,7 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     out_root = tmp_path / "pipeline"
 
     assert parse_text_list(["AAPL,MSFT", "NVDA TSLA"]) == ["AAPL", "MSFT", "NVDA", "TSLA"]
+    assert parse_text_list(None) == []
 
     fixture_run = run_data_pipeline(config, stage="fixture-audit", out_root=out_root)
     assert fixture_run["ok"] is True
@@ -1377,6 +1399,47 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     assert blocked["ok"] is False
     assert _pipeline_steps(blocked)[0]["status"] == "blocked"
 
+    universe_source = tmp_path / "option_day_aggs.csv"
+    universe_source.write_text(
+        "\n".join(
+            [
+                "ticker,quote_date,option_close,volume",
+                "AAA,2020-01-15,1.0,100",
+                "BBB,2020-02-15,4.0,100",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    universe_run = run_data_pipeline(
+        config,
+        stage="universe",
+        out_root=out_root,
+        options_day_aggs_path=universe_source,
+        start_date=date(2020, 3, 1),
+        end_date=date(2020, 3, 31),
+        universe_top_n=1,
+        universe_trailing_months=2,
+    )
+    assert universe_run["ok"] is True
+    universe_step = _pipeline_steps(universe_run)[0]
+    assert universe_step["status"] == "ran"
+    assert (out_root / "universe" / "monthly_top50_universe.parquet").exists()
+    universe_resume = run_data_pipeline(
+        config,
+        stage="universe",
+        out_root=out_root,
+        options_day_aggs_path=universe_source,
+        start_date=date(2020, 3, 1),
+        end_date=date(2020, 3, 31),
+        universe_top_n=1,
+        universe_trailing_months=2,
+    )
+    assert _pipeline_steps(universe_resume)[0]["status"] == "skipped"
+    universe_blocked = run_data_pipeline(config, stage="universe", out_root=tmp_path / "blocked")
+    assert universe_blocked["ok"] is False
+    assert _pipeline_steps(universe_blocked)[0]["status"] == "blocked"
+
     with pytest.raises(ValueError, match="unsupported data stage"):
         run_data_pipeline(config, stage="bad-stage", out_root=out_root)
     with pytest.raises(ValueError, match="jobs must be positive"):
@@ -1389,6 +1452,33 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
             start_date=date(2026, 12, 31),
             end_date=date(2026, 1, 1),
         )
+    with pytest.raises(ValueError, match="universe_top_n"):
+        run_data_pipeline(config, stage="universe", out_root=out_root, universe_top_n=0)
+    with pytest.raises(ValueError, match="universe_trailing_months"):
+        run_data_pipeline(
+            config,
+            stage="universe",
+            out_root=out_root,
+            universe_trailing_months=0,
+        )
+
+    dry_run = run_data_pipeline(
+        config,
+        stage="proxy-all",
+        out_root=out_root,
+        tickers=["AAPL", "MSFT"],
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 3, 31),
+        max_events=8,
+        max_contracts=80,
+        dry_run=True,
+    )
+    assert dry_run["dry_run"] is True
+    assert dry_run["writes_data_outputs"] is False
+    assert cast(dict[str, object], dry_run["estimated_counts"])["second_agg_rest_calls"] == 80
+    assert "missing_option_day_agg_exit_price" in cast(
+        dict[str, object], dry_run["exclusion_estimate"]
+    )
 
 
 def test_data_pipeline_contracts_and_panel_stages(tmp_path: Path) -> None:
@@ -1470,15 +1560,11 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
         command: Sequence[str],
         *,
         cwd: Path,
-        text: bool,
-        capture_output: bool,
-        check: bool,
+        label: str,
     ) -> subprocess.CompletedProcess[str]:
         captured["command"] = list(command)
         captured["cwd"] = cwd
-        captured["text"] = text
-        captured["capture_output"] = capture_output
-        captured["check"] = check
+        captured["label"] = label
         gold_output = config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet"
         report = out_root / "event_panel" / "pilot_panel_report.json"
         gold_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1487,7 +1573,7 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
         report.write_text("{}", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="pilot ok", stderr="")
 
-    monkeypatch.setattr("earnings_event_vol.data_pipeline.subprocess.run", fake_run)
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
 
     result = run_data_pipeline(
         config,
@@ -1509,6 +1595,7 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
     assert "--dte-min" in command
     assert "--dte-max" in command
     assert captured["cwd"] == tmp_path
+    assert captured["label"] == "pilot-panel"
 
     skipped = run_data_pipeline(config, stage="pilot-panel", out_root=out_root)
     assert _pipeline_steps(skipped)[0]["status"] == "skipped"
@@ -1530,12 +1617,11 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
         command: Sequence[str],
         *,
         cwd: Path,
-        text: bool,
-        capture_output: bool,
-        check: bool,
+        label: str,
     ) -> subprocess.CompletedProcess[str]:
         captured["command"] = list(command)
         captured["cwd"] = cwd
+        captured["label"] = label
         gold_output = config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
         report = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
         gold_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1544,7 +1630,7 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
         report.write_text("{}", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="trade proxy ok", stderr="")
 
-    monkeypatch.setattr("earnings_event_vol.data_pipeline.subprocess.run", fake_run)
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
 
     result = run_data_pipeline(
         config,
@@ -1565,13 +1651,250 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
     assert "build_trade_proxy_panel.py" in command[1]
     assert "--jobs" in command
     assert "--lookback-seconds" in command
+    assert "--second-agg-buffer-minutes" in command
     assert "--price-field" in command
     assert "--max-events" in command
     assert "--max-contracts" in command
     assert captured["cwd"] == tmp_path
+    assert captured["label"] == "trade-proxy-panel"
 
     skipped = run_data_pipeline(config, stage="trade-proxy-panel", out_root=out_root)
     assert _pipeline_steps(skipped)[0]["status"] == "skipped"
+
+
+def test_data_pipeline_proxy_all_orchestrates_calendar_pilot_and_trade_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        repo_root=tmp_path,
+        gold_data_dir=tmp_path / "data" / "gold",
+    )
+    out_root = tmp_path / "artifacts" / "data_pipeline"
+    calendar_out = out_root / "earnings_calendar_pilot"
+    calendar_out.mkdir(parents=True)
+    (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
+    (calendar_out / "earnings_calendar_report.json").write_text("{}")
+    captured_commands: list[list[str]] = []
+
+    def fake_run(
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        label: str,
+    ) -> subprocess.CompletedProcess[str]:
+        assert cwd == tmp_path
+        captured_commands.append(list(command))
+        if "build_pilot_panel.py" in command[1]:
+            gold_output = config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet"
+            report = out_root / "event_panel" / "pilot_panel_report.json"
+        else:
+            gold_output = config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
+            report = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
+        gold_output.parent.mkdir(parents=True, exist_ok=True)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        gold_output.write_text("parquet-placeholder", encoding="utf-8")
+        report.write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
+
+    result = run_data_pipeline(
+        config,
+        stage="proxy-all",
+        out_root=out_root,
+        jobs=3,
+        dte_min=3,
+        dte_max=21,
+        max_events=5,
+        max_contracts=90,
+    )
+
+    steps = _pipeline_steps(result)
+    assert result["ok"] is True
+    assert [step["name"] for step in steps] == [
+        "calendar-pilot",
+        "pilot-panel",
+        "trade-proxy-panel",
+    ]
+    assert [step["status"] for step in steps] == ["skipped", "ran", "ran"]
+    assert len(captured_commands) == 2
+    pilot_command, trade_command = captured_commands
+    assert "build_pilot_panel.py" in pilot_command[1]
+    assert "build_trade_proxy_panel.py" in trade_command[1]
+    assert "--dte-min" in pilot_command
+    assert "--dte-max" in pilot_command
+    assert "--max-contracts" in trade_command
+
+
+def test_data_pipeline_proxy_all_stops_after_blocked_upstream_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_project_config(), repo_root=tmp_path)
+    out_root = tmp_path / "artifacts" / "data_pipeline"
+    calendar_out = out_root / "earnings_calendar_pilot"
+    calendar_out.mkdir(parents=True)
+    (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
+    (calendar_out / "earnings_calendar_report.json").write_text("{}", encoding="utf-8")
+    captured_commands: list[list[str]] = []
+
+    def fake_run(
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        label: str,
+    ) -> subprocess.CompletedProcess[str]:
+        captured_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="pilot failed")
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
+
+    result = run_data_pipeline(
+        config,
+        stage="proxy-all",
+        out_root=out_root,
+        force=False,
+    )
+
+    steps = _pipeline_steps(result)
+    assert result["ok"] is False
+    assert [step["name"] for step in steps] == ["calendar-pilot", "pilot-panel"]
+    assert [step["status"] for step in steps] == ["skipped", "blocked"]
+    assert len(captured_commands) == 1
+    assert "build_pilot_panel.py" in captured_commands[0][1]
+
+
+def test_trade_proxy_second_aggregates_are_cached_in_bronze_parquet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "data" / "bronze")
+    contracts = pd.DataFrame(
+        {
+            "options_ticker": ["O:ABC260213C00100000"],
+            "entry_date": ["2026-02-05"],
+            "event_entry_timestamp": [pd.Timestamp("2026-02-05 16:00:00", tz="America/New_York")],
+        }
+    )
+    fetch_calls = 0
+    normalized = pd.DataFrame(
+        {
+            "options_ticker": ["O:ABC260213C00100000"],
+            "timestamp_utc": [pd.Timestamp("2026-02-05 20:59:58Z")],
+            "timestamp_et": [pd.Timestamp("2026-02-05 15:59:58", tz="America/New_York")],
+            "option_open": [4.0],
+            "option_high": [4.2],
+            "option_low": [3.9],
+            "option_close": [4.1],
+            "option_vwap": [4.05],
+            "volume": [3],
+            "transactions": [2],
+            "source_dataset": ["massive_rest_second_aggs"],
+        }
+    )
+
+    def fake_fetch_one_contract(
+        config: object,
+        *,
+        option_ticker: str,
+        entry_date: pd.Timestamp,
+        limit: int,
+    ) -> tuple[str, pd.DataFrame, dict[str, object]]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return (
+            option_ticker,
+            normalized,
+            {
+                "options_ticker": option_ticker,
+                "status": "ok",
+                "rows": len(normalized),
+                "entry_date": entry_date.date(),
+            },
+        )
+
+    monkeypatch.setattr(
+        trade_proxy_panel_script,
+        "_fetch_one_contract",
+        fake_fetch_one_contract,
+    )
+
+    first_frames, first_report = trade_proxy_panel_script._fetch_second_aggregate_bars(
+        config,
+        contracts,
+        jobs=1,
+        limit=100,
+        buffer_minutes=60,
+        force=False,
+    )
+    assert fetch_calls == 1
+    assert first_report["cache_status"].tolist() == ["written"]
+    assert Path(first_report["bronze_path"].iloc[0]).exists()
+    assert first_frames["O:ABC260213C00100000"]["option_vwap"].iloc[0] == pytest.approx(4.05)
+
+    second_frames, second_report = trade_proxy_panel_script._fetch_second_aggregate_bars(
+        config,
+        contracts,
+        jobs=1,
+        limit=100,
+        buffer_minutes=60,
+        force=False,
+    )
+    assert fetch_calls == 1
+    assert second_report["cache_status"].tolist() == ["hit"]
+    assert second_frames["O:ABC260213C00100000"]["option_close"].iloc[0] == pytest.approx(4.1)
+
+    Path(first_report["bronze_path"].iloc[0]).write_text("not a parquet file", encoding="utf-8")
+    repaired_frames, repaired_report = trade_proxy_panel_script._fetch_second_aggregate_bars(
+        config,
+        contracts,
+        jobs=1,
+        limit=100,
+        buffer_minutes=60,
+        force=False,
+    )
+    assert fetch_calls == 2
+    assert repaired_report["cache_status"].tolist() == ["repaired"]
+    assert repaired_frames["O:ABC260213C00100000"]["option_close"].iloc[0] == pytest.approx(4.1)
+
+
+def test_trade_proxy_exit_day_aggs_repair_corrupt_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "data" / "bronze")
+    day = pd.Timestamp("2026-02-06")
+    destination = trade_proxy_panel_script._options_day_agg_path(config, day)
+    destination.parent.mkdir(parents=True)
+    destination.write_text("not a parquet file", encoding="utf-8")
+
+    def fake_download_command(config: object, *, key: str, destination: Path) -> list[str]:
+        return ["fake-download", str(destination)]
+
+    def fake_aws_env(config: object) -> dict[str, str]:
+        return {}
+
+    def fake_run_download(command: Sequence[str], env: Mapping[str, str], timeout: float) -> object:
+        with gzip.open(command[-1], "wt", encoding="utf-8") as handle:
+            handle.write("ticker,close\nO:ABC260213C00100000,4.75\n")
+        return subprocess.CompletedProcess(list(command), 0)
+
+    monkeypatch.setattr(
+        trade_proxy_panel_script,
+        "build_download_file_command",
+        fake_download_command,
+    )
+    monkeypatch.setattr(trade_proxy_panel_script, "massive_flat_file_aws_env", fake_aws_env)
+    monkeypatch.setattr(trade_proxy_panel_script, "_run_head_object_command", fake_run_download)
+
+    status = trade_proxy_panel_script._ensure_options_day_agg_file(config, day)
+
+    assert status == "repaired"
+    repaired = pd.read_parquet(destination)
+    assert repaired["ticker"].tolist() == ["O:ABC260213C00100000"]
+    assert repaired["close"].tolist() == pytest.approx([4.75])
 
 
 def test_second_aggregates_trade_proxy_panel_requires_pre_cutoff_trades() -> None:
@@ -1608,6 +1931,22 @@ def test_second_aggregates_trade_proxy_panel_requires_pre_cutoff_trades() -> Non
         lookback_seconds=1,
     )
     assert stale.status == TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW
+    buffered = filter_pre_cutoff_buffer(
+        bars,
+        cutoff_timestamp=pd.Timestamp("2026-02-05 16:00:00", tz="America/New_York").to_pydatetime(),
+        buffer_minutes=1,
+    )
+    assert buffered["option_vwap"].tolist() == [4.0, 4.2]
+    early_close = market_close_timestamp(
+        date(2026, 11, 27), early_closes={date(2026, 11, 27): time(13)}
+    )
+    assert early_close.hour == 13
+    assert (
+        market_close_timestamp_utc(
+            date(2026, 11, 27), early_closes={date(2026, 11, 27): time(13)}
+        ).tzinfo
+        is not None
+    )
 
 
 def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
@@ -1635,22 +1974,41 @@ def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
         ).status
         == TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW
     )
-    naive_selection = select_latest_proxy_price(
-        pd.DataFrame(
-            {
-                "timestamp_et": ["2026-02-05 15:59:59"],
-                "option_vwap": [1.25],
-                "volume": [1],
-                "transactions": [1],
-            }
-        ),
-        cutoff_timestamp=datetime(2026, 2, 5, 16, 0),
-    )
-    assert naive_selection.proxy_price == pytest.approx(1.25)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        select_latest_proxy_price(
+            pd.DataFrame(
+                {
+                    "timestamp_et": ["2026-02-05 15:59:59"],
+                    "option_vwap": [1.25],
+                    "volume": [1],
+                    "transactions": [1],
+                }
+            ),
+            cutoff_timestamp=datetime(2026, 2, 5, 16, 0),
+        )
     with pytest.raises(ValueError, match="contract frame missing"):
         build_trade_proxy_price_frame(pd.DataFrame({"event_id": ["x"]}), {})
 
-    windows = pd.DataFrame({"event_id": ["ABC_2026Q1"], "s_before": [100.0]})
+    pilot_panel_script = cast(Any, importlib.import_module("scripts.build_pilot_panel"))
+    pilot_no_inputs = pilot_panel_script._extract_event_ivar(
+        pd.DataFrame(),
+        pd.DataFrame(
+            {
+                "event_id": ["ABC_2026Q1"],
+                "ticker": ["ABC"],
+                "announcement_date": [date(2026, 2, 5)],
+                "exit_date": [date(2026, 2, 6)],
+                "s_before": [100.0],
+                "rvar_event": [0.01],
+            }
+        ),
+    )
+    assert pilot_no_inputs["ivar_event"].isna().all()
+    assert pilot_no_inputs["ivar_failure_reason"].iloc[0] == (
+        IVARFailureReason.NO_TWO_EVENT_COVERING_EXPIRIES.value
+    )
+
+    windows = pd.DataFrame({"event_id": ["ABC_2026Q1"], "ticker": ["ABC"], "s_before": [100.0]})
     invalid_proxy_iv = attach_trade_proxy_local_iv(
         pd.DataFrame(
             {
@@ -1734,6 +2092,56 @@ def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
         ),
         windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
     ).empty
+
+    exit_close_straddle = build_proxy_straddle_diagnostics(
+        pd.DataFrame(
+            {
+                "event_id": ["ABC_2026Q1", "ABC_2026Q1"],
+                "expiration": [date(2026, 2, 20), date(2026, 2, 20)],
+                "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
+                "proxy_status": [TRADE_PROXY_STATUS_OK, TRADE_PROXY_STATUS_OK],
+                "right": ["call", "put"],
+                "strike": [100.0, 100.0],
+                "proxy_price": [5.0, 4.0],
+                "proxy_volume_window": [10, 20],
+                "proxy_transactions_window": [1, 2],
+            }
+        ),
+        windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
+        option_exit_prices=pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
+                "date": [date(2026, 2, 6), date(2026, 2, 6)],
+                "option_close": [6.0, 3.5],
+            }
+        ),
+    )
+    assert exit_close_straddle["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_OK
+    assert bool(exit_close_straddle["used_intrinsic_fallback"].iloc[0]) is False
+    assert exit_close_straddle["exit_option_value_usd"].iloc[0] == pytest.approx(950.0)
+    assert exit_close_straddle["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(50.0)
+
+    missing_exit_close = build_proxy_straddle_diagnostics(
+        pd.DataFrame(
+            {
+                "event_id": ["ABC_2026Q1", "ABC_2026Q1"],
+                "expiration": [date(2026, 2, 20), date(2026, 2, 20)],
+                "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
+                "proxy_status": [TRADE_PROXY_STATUS_OK, TRADE_PROXY_STATUS_OK],
+                "right": ["call", "put"],
+                "strike": [100.0, 100.0],
+                "proxy_price": [5.0, 4.0],
+                "proxy_volume_window": [10, 20],
+                "proxy_transactions_window": [1, 2],
+            }
+        ),
+        windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
+        option_exit_prices=pd.DataFrame(),
+    )
+    assert (
+        missing_exit_close["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_MISSING_DAY_AGG
+    )
+    assert bool(missing_exit_close["used_intrinsic_fallback"].iloc[0]) is True
 
     empty_panel = pd.DataFrame()
     empty_summary = summarize_trade_proxy_panel(
@@ -1905,6 +2313,8 @@ def test_trade_proxy_ivar_and_gross_straddle_diagnostics_are_no_nbbo() -> None:
     assert empty_input_panel["trade_proxy_ivar_event"].isna().all()
     assert empty_input_panel["ivar_failure_reason"].iloc[0] == "no_two_event_covering_expiries"
     assert straddles["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(-380.0)
+    assert straddles["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_MISSING_DAY_AGG
+    assert bool(straddles["used_intrinsic_fallback"].iloc[0]) is True
     assert straddles["haircut_pnl_usd"].iloc[0] < straddles["gross_proxy_pnl_usd"].iloc[0]
 
 
@@ -2141,6 +2551,138 @@ def test_features_universe_and_sequence_rules() -> None:
         )
         == 50
     )
+
+
+def test_eligible_equity_cache_version_and_ticker_mapping_soft_fail() -> None:
+    eligible = build_eligible_equity_tickers(
+        [
+            {"ticker": "", "exchange": "NASDAQ", "title": "Blank Corporation"},
+            {"ticker": "ABC", "exchange": "NASDAQ", "title": "ABC Corporation"},
+            {"ticker": "SPY", "exchange": "NYSE ArCA", "title": "SPDR S&P 500 ETF Trust"},
+            {"ticker": "OTC", "exchange": "OTC", "title": "OTC Company"},
+        ],
+        source_snapshot_date=date(2026, 5, 5),
+    )
+
+    assert eligible_equity_cache_matches_rule(eligible)
+    assert not eligible_equity_cache_matches_rule(eligible, expected_rule_version="v9")
+    assert eligible.loc[eligible["ticker"].eq("ABC"), "filter_reason"].iloc[0] == (
+        "eligible_common_equity"
+    )
+    assert bool(eligible.loc[eligible["ticker"].eq("SPY"), "eligible"].iloc[0]) is False
+    assert eligible["rule_version"].iloc[0] == ELIGIBLE_EQUITY_RULE_VERSION
+
+    diagnostics = ticker_mapping_diagnostics(
+        ["META", "FB", "GOOG"],
+        ["META", "GOOGL", "GOOG"],
+        aliases={"FB": ["META"], "GOOG": ["GOOG", "GOOGL"]},
+    )
+    assert diagnostics.loc[diagnostics["ticker"].eq("META"), "mapping_status"].iloc[0] == (
+        TICKER_MAPPING_OK
+    )
+    assert diagnostics.loc[diagnostics["ticker"].eq("FB"), "mapped_ticker"].iloc[0] == "META"
+    assert diagnostics.loc[diagnostics["ticker"].eq("GOOG"), "mapping_status"].iloc[0] == (
+        TICKER_MAPPING_AMBIGUOUS
+    )
+    missing = ticker_mapping_diagnostics(["XYZ"], ["ABC"])
+    assert missing["mapping_status"].iloc[0] == TICKER_NOT_FOUND
+
+
+def test_monthly_universe_uses_trailing_option_premium_volume_only() -> None:
+    liquidity = build_ticker_month_liquidity(
+        pd.DataFrame(
+            {
+                "ticker": ["AAA", "AAA", "BBB", "CCC", "CCC"],
+                "quote_date": [
+                    date(2020, 1, 15),
+                    date(2020, 2, 14),
+                    date(2020, 2, 14),
+                    date(2020, 3, 16),
+                    date(2020, 4, 16),
+                ],
+                "option_vwap": [1.0, None, 5.0, 2.0, 100.0],
+                "option_close": [1.1, 3.0, 4.0, 2.5, 100.0],
+                "volume": [100, 10, 30, 40, 1],
+            }
+        ),
+        source_snapshot_date=date(2026, 5, 5),
+    )
+    assert set(
+        [
+            "source_snapshot_date",
+            "rule_version",
+            "source_dataset",
+            "option_premium_dollar_volume",
+        ]
+    ).issubset(liquidity.columns)
+    feb_aaa = liquidity.loc[liquidity["ticker"].eq("AAA") & liquidity["month"].eq(date(2020, 2, 1))]
+    assert feb_aaa["option_premium_dollar_volume"].iloc[0] == pytest.approx(3_000.0)
+
+    universe = build_monthly_liquid_universe(
+        liquidity,
+        start_month=date(2020, 3, 1),
+        end_month=date(2020, 5, 1),
+        top_n=2,
+        trailing_months=2,
+        eligible_tickers=["AAA", "BBB", "CCC"],
+    )
+    march = universe.loc[universe["universe_month"].eq(date(2020, 3, 1))]
+    assert march["ticker"].tolist() == ["BBB", "AAA"]
+    may = universe.loc[universe["universe_month"].eq(date(2020, 5, 1))]
+    assert may["ticker"].tolist() == ["CCC"]
+    assert phase1_telemetry_bucket(date(2020, 3, 31)) == PHASE1_COVID_SHOCK_BUCKET
+    assert phase1_telemetry_bucket(date(2020, 10, 1)) == PHASE1_STEADY_PROXY_BUCKET
+
+    close_only = build_ticker_month_liquidity(
+        pd.DataFrame(
+            {
+                "ticker": ["O:DDD200117C00100000", "O:BAD"],
+                "source_date": [date(2020, 1, 2), date(2020, 1, 2)],
+                "close": [2.0, None],
+                "vwap": [None, 1.0],
+                "volume": [5, 1],
+            }
+        ),
+        source_snapshot_date=date(2026, 5, 5),
+    )
+    assert close_only["ticker"].iloc[0] == "DDD"
+    assert close_only["ticker"].iloc[1] == "O:BAD"
+    assert close_only["option_premium_dollar_volume"].iloc[0] == pytest.approx(1_000.0)
+    with pytest.raises(ValueError, match="missing required columns"):
+        build_ticker_month_liquidity(
+            pd.DataFrame({"ticker": ["AAA"]}),
+            source_snapshot_date=date(2026, 5, 5),
+        )
+    with pytest.raises(ValueError, match="requires vwap/option_vwap"):
+        build_ticker_month_liquidity(
+            pd.DataFrame({"ticker": ["AAA"], "quote_date": [date(2020, 1, 1)], "volume": [1]}),
+            source_snapshot_date=date(2026, 5, 5),
+        )
+    with pytest.raises(ValueError, match="requires quote_date"):
+        build_ticker_month_liquidity(
+            pd.DataFrame({"ticker": ["AAA"], "option_close": [1.0], "volume": [1]}),
+            source_snapshot_date=date(2026, 5, 5),
+        )
+    with pytest.raises(ValueError, match="top_n"):
+        build_monthly_liquid_universe(
+            liquidity,
+            start_month=date(2020, 1, 1),
+            end_month=date(2020, 1, 1),
+            top_n=0,
+        )
+    with pytest.raises(ValueError, match="trailing_months"):
+        build_monthly_liquid_universe(
+            liquidity,
+            start_month=date(2020, 1, 1),
+            end_month=date(2020, 1, 1),
+            trailing_months=0,
+        )
+    with pytest.raises(ValueError, match="missing required columns"):
+        build_monthly_liquid_universe(
+            pd.DataFrame({"ticker": ["AAA"]}),
+            start_month=date(2020, 1, 1),
+            end_month=date(2020, 1, 1),
+        )
 
 
 def test_premium_space_threshold_and_swappable_distribution() -> None:

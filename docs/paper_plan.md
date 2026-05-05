@@ -133,18 +133,22 @@ Target sample:
 - Robustness DTE 3-21.
 - Drop DMH and unknown announcement-time events in v1.
 
-Top 50 is the main-sample default because `options_quotes_v1` is large and the
-first empirical gate should prioritize clean option-price/event alignment over
-universe breadth. A top-150 expansion is deferred until the quote/IV pipeline is
-stable.
+Top 50 is the main-sample default because the first empirical gate should
+prioritize clean option-price/event alignment, storage telemetry, and API
+coverage over universe breadth. A top-150 expansion is deferred until the
+top-50 proxy data lake and later paper-grade quote/IV route are stable.
 
-V1.5 adds a Massive second-aggregate trade-price proxy panel before the
-paper-grade quote panel. For each candidate contract, use the latest pre-entry
-VWAP or close inside a configured cutoff window, recompute local IV, and require
+V1.5 is the active no-quote data route: Massive option second aggregates provide
+pre-cutoff trade-price OHLCV bars for entry pricing and diagnostics, while
+exit-date option day aggregates provide same-contract exit closes when
+available. For each candidate contract, use the latest pre-entry VWAP or close
+inside the resolved market-close cutoff window, recompute local IV, and require
 paired call/put prices before constructing the event-expiry ATM input. These
 outputs are labeled `no_nbbo_trade_proxy`. They can test whether the event
 alignment, IVAR extraction, and edge-ranking pipeline has signal, but they do
 not support full-spread crossing claims because they lack bid/ask and NBBO.
+`options_quotes_v1` is a future paper-grade route/readiness probe, not an input
+to the current proxy pipeline.
 
 ## Event Alignment
 
@@ -273,8 +277,9 @@ deliverable_status == standard
 
 The robustness sample expands DTE to `3 <= DTE <= 21`.
 
-Non-standard OCC contracts are excluded before quote pooling. Splits, spinoffs,
-special dividends, or reference rows with non-100 deliverables get
+Non-standard OCC contracts are excluded before proxy-price or paper-grade quote
+pooling. Splits, spinoffs, special dividends, or reference rows with non-100
+deliverables get
 `contract_discovery_status = non_standard_excluded`. They are reported in the
 discovery table but never enter IV or backtest inputs.
 
@@ -287,7 +292,7 @@ V1 event-level feature families:
 - Term spread.
 - RR25 and BF25.
 - Short-expiry `iv_butterfly_25d`.
-- Bid-ask spread and quote liquidity.
+- Paper-grade only: bid-ask spread and quote liquidity.
 - V1.5 only: second-aggregate trade-price proxy activity, including last
   pre-cutoff trade time, window volume, transaction count, and stale-window
   status. This is a screening feature family, not a substitute for bid-ask
@@ -382,10 +387,11 @@ Premium-space valuation:
 
 - V1 primary uses deterministic quadrature under a zero-mean Gaussian event
   return with variance `forecast_RVAR_event`.
-- The current smoke implementation marks each option leg to intrinsic payoff
-  after the event jump and ignores residual post-event time value. Paper-grade
-  runs must either justify negligible residual value or replace this with a
-  post-event option-pricing layer.
+- The deterministic smoke backtest still uses a simplified payoff layer. The
+  Massive V1.5 trade-proxy diagnostics mark exit using the same contracts'
+  exit-date option day-aggregate closes when available, preserving residual
+  extrinsic value; intrinsic payoff is only a flagged fallback for missing exit
+  option closes or 0DTE expiry.
 - Robustness hooks include symmetric two-point, Student-t, empirical residual,
   and later mixed-normal/Laplace jump distributions.
 - Multi-leg fills assume simultaneous quoted bid/ask execution; legging risk is
