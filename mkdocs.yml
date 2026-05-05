@@ -1,0 +1,100 @@
+site_name: Earnings Event Vol
+site_description: Documentation for earnings event variance forecasting and risk-defined option backtests.
+site_url: https://ty-cheng.github.io/earnings-event-vol/
+repo_url: https://github.com/TY-Cheng/earnings-event-vol
+repo_name: TY-Cheng/earnings-event-vol
+edit_uri: edit/main/docs/
+docs_dir: docs
+dev_addr: 127.0.0.1:8001
+theme:
+  name: material
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - announce.dismiss
+    - content.action.view
+    - content.code.annotate
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.path
+    - navigation.footer
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.tabs.link
+    - content.tooltips
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+  icon:
+    logo: material/chart-bell-curve-cumulative
+    repo: fontawesome/brands/github
+    annotation: material/arrow-right-circle
+plugins:
+  - search
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/TY-Cheng/earnings-event-vol
+      name: GitHub repository
+copyright: Copyright &copy; 2026 Earnings Event Vol
+extra_css:
+  - assets/stylesheets/extra.css
+extra_javascript:
+  - https://unpkg.com/mermaid@11/dist/mermaid.min.js
+  - assets/javascripts/mermaid-init.js
+nav:
+  - Home: index.md
+  - Research Overview: research_overview.md
+  - V1 Spec: spec.md
+  - Results Snapshot: results_snapshot.md
+  - Paper Plan: paper_plan.md
+  - Audit Briefs:
+      - Development Audit: development_audit_prompt.md
+      - Manuscript Audit: manuscript_audit_prompt.md
+  - Future Work: future_work.md
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.snippets:
+      base_path:
+        - .
+      check_paths: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+strict: true

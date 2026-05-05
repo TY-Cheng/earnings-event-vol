@@ -1,0 +1,65 @@
+[project]
+name = "earnings-event-vol"
+version = "0.1.0"
+description = "Research scaffold for earnings event variance mispricing and risk-defined options backtests."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "httpx>=0.28.0",
+    "numpy>=2.1.0",
+    "pandas>=2.2.0",
+    "polars>=1.20.0",
+    "pyarrow>=18.0.0",
+    "pydantic>=2.10.0",
+    "python-dotenv>=1.0.1",
+    "pyyaml>=6.0.2",
+    "scipy>=1.15.0",
+    "torch>=2.6,<3",
+    "tzdata>=2025.1",
+]
+
+[project.optional-dependencies]
+docs = ["mkdocs>=1.6.1", "mkdocs-material>=9.6.0"]
+ml = ["lightgbm>=4.5.0"]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "mypy>=1.14.0",
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.9.0",
+    "types-PyYAML>=6.0.12.20250516",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["pandas.*", "scipy.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["src"]
+addopts = "-q --cov=earnings_event_vol --cov-report=term-missing --cov-fail-under=93"
+
+[tool.coverage.run]
+branch = true
+source = ["earnings_event_vol"]
+omit = ["src/earnings_event_vol/__main__.py"]

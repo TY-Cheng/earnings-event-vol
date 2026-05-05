@@ -1,0 +1,42 @@
+massive:
+  credential_policy: file_only
+  api_key_file_env: MASSIVE_API_KEY_FILE
+  flat_file_key_file_env: MASSIVE_FLAT_FILE_KEY_FILE
+  options_flat_file_dataset_env: MASSIVE_OPTIONS_FLAT_FILE_DATASET
+  option_flat_file_key_template_env: MASSIVE_OPTION_FLAT_FILE_KEY_TEMPLATE
+  underlying_flat_file_key_template_env: MASSIVE_UNDERLYING_FLAT_FILE_KEY_TEMPLATE
+
+earnings_calendar:
+  status: source_probe_completed_primary_not_ingested
+  primary_candidate: sec_edgar_submissions_item_2_02
+  validation_candidate: massive_8k_text
+  auxiliary_candidate: nasdaq_earnings_calendar
+  rejected_as_primary:
+    - nasdaq_historical_timing_flags
+  timestamp_fallback: none
+  required_fields:
+    - ticker
+    - announcement_date
+    - announcement_timing
+    - source
+    - source_timestamp
+    - source_id
+    - text_validation_status
+  allowed_times:
+    - bmo
+    - amc
+    - dmh
+    - unknown
+
+audit:
+  required_outputs:
+    - required_fields_report.json
+    - field_coverage.csv
+    - vendor_local_iv_diff.csv
+    - quote_source_report.csv
+  quote_source_flags:
+    - nbbo
+    - consolidated
+    - single_exchange
+    - vendor
+    - unknown

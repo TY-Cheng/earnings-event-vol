@@ -1,0 +1,41 @@
+cost_models:
+  - mid
+  - half_spread
+  - full_spread_crossing
+
+entry_threshold:
+  metric: "expected_strategy_edge_usd"
+  transaction_cost_multiplier_primary: 1.5
+  transaction_cost_multiplier_robustness: [1.0, 2.0]
+  valuation_distribution_primary: "zero_mean_gaussian_quadrature"
+  valuation_distribution_robustness:
+    - symmetric_two_point
+    - student_t
+    - empirical_standardized_residual
+
+primary_strategies:
+  long_atm_straddle:
+    signal: "expected_strategy_edge_usd > k * estimated_transaction_cost_usd"
+    open_buy_price: ask
+    close_sell_price: bid
+  short_iron_fly:
+    signal: "expected_strategy_edge_usd > k * estimated_transaction_cost_usd"
+    short_legs: "ATMF call and ATMF put"
+    long_wings: "25-delta put and 25-delta call"
+    delta_source_order: ["vendor_delta", "bs_delta_from_quoted_iv"]
+    open_short_price: bid
+    open_long_wing_price: ask
+
+risk_controls:
+  per_event_max_loss_fraction_nav: 0.01
+  per_event_date_max_loss_fraction_nav: 0.10
+  per_sector_event_date_max_loss_fraction_nav: 0.03
+  sector_classification: "GICS_11_frozen_at_universe_freeze_date"
+  cap_scaling: "pro_rata_by_expected_net_edge"
+  main_sizing: "fractional_theoretical_contracts"
+  robustness_sizing: "integer_contract_rounding"
+  require_defined_risk: true
+
+execution_assumptions:
+  multi_leg_fill: "simultaneous_nbbo_or_consolidated_bid_ask"
+  legging_risk: "documented_limitation_not_modeled_in_v1"

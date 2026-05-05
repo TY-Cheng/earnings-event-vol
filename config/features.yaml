@@ -1,0 +1,46 @@
+event_level:
+  - ivar_event
+  - atm_iv_event_expiry
+  - atm_iv_next_expiry
+  - term_spread
+  - rr25
+  - bf25
+  - iv_butterfly_25d
+  - spread_over_mid
+  - option_volume
+  - open_interest
+  - rv5
+  - rv20
+  - rv60
+  - previous_earnings_move
+  - last_four_earnings_average_move
+  - spy_return
+  - sector_etf_return
+  - vix
+  - bmo_amc_flag
+  - market_cap_bucket
+
+sequence_daily_state:
+  lookback_trading_days: 20
+  relaxed_robustness_lookback_trading_days: 10
+  primary_missing_policy: "exclude_no_forward_fill"
+  fields:
+    - atm_iv
+    - ivar_event_estimate
+    - skew
+    - butterfly
+    - iv_butterfly_25d
+    - term_spread
+    - spread
+    - volume
+    - rv5
+    - spy_return
+    - vix
+
+leakage_controls:
+  require_feature_asof_timestamp: true
+  block_vendor_forecast_fields_by_default: true
+  block_same_event_realized_fields: true
+  macro_cutoff:
+    amc: "regular_close_on_announcement_date"
+    bmo: "regular_close_on_previous_trading_date"

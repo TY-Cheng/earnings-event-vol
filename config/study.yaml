@@ -1,0 +1,74 @@
+study:
+  name: earnings-event-vol
+  title: "Can Deep Learning Improve Earnings Volatility Trading?"
+  active_scope: "event variance mispricing forecasting and risk-defined backtests"
+
+sample:
+  universe: "top_50_liquid_us_single_name_options"
+  start_year: 2013
+  end_year: 2025
+  announcement_times: ["bmo", "amc"]
+  exclude_announcement_times: ["dmh", "unknown"]
+  event_expiry_dte_main: [5, 14]
+  event_expiry_dte_robustness: [3, 21]
+
+targets:
+  realized_event_variance: "close_to_close log(S_after / S_before)^2"
+  mispricing: "realized_event_variance - implied_event_variance"
+  research_edge: "forecast_realized_event_variance - implied_event_variance"
+  trading_edge: "expected_strategy_edge_usd"
+  decision: "expected_strategy_edge_usd > k * estimated_transaction_cost_usd"
+
+ivar:
+  time_to_expiry_convention_default: "ACT/365"
+  forbid_mixed_time_conventions: true
+  repair_nonmonotone_total_variance: false
+  failure_reasons:
+    - no_two_event_covering_expiries
+    - nonpositive_time_gap
+    - negative_extracted_ivar
+    - stale_or_missing_iv
+    - nonpositive_total_variance
+    - nonmonotone_total_variance
+
+sources:
+  options: massive
+  underlying: massive
+  earnings_calendar: pending
+  market_controls: pending
+
+baselines:
+  - market_implied_event_variance
+  - last_four_rvar
+  - last_four_ivar
+  - patell_wolfson_diagnostic
+  - linear_or_elastic_net
+  - lightgbm
+
+models:
+  - ft_transformer
+  - mamba_sequence_encoder
+
+strategies:
+  main:
+    - long_atm_straddle
+    - short_iron_fly
+  deferred:
+    - vega_normalized_calendar_straddle
+
+evaluation:
+  sample_diagnostics:
+    - exclusion_counts_and_shares
+    - exclusions_by_year
+    - exclusions_by_vix_regime
+    - negative_ivar_by_term_structure_bucket
+  forecast_metrics: [mae, rmse, qlike, oos_r2_vs_ivar]
+  signal_metrics: [auc, brier, calibration, precision_by_edge_decile]
+  economic_metrics:
+    - per_event_pnl
+    - event_date_aggregated_sharpe
+    - sortino
+    - max_drawdown
+    - turnover
+    - average_transaction_cost
+    - mean_net_pnl_by_edge_decile

@@ -1,0 +1,2 @@
+ticker,event_date,strategy,spot,forecast_rvar_event,ivar_event,estimated_transaction_cost_usd
+ABC,2026-02-05,long_atm_straddle,100,0.04,0.01,20

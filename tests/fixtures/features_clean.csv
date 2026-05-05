@@ -1,0 +1,2 @@
+ticker,event_date,feature_asof_timestamp,event_entry_timestamp,spy_return,vix
+ABC,2026-02-05,2026-02-05T16:00:00,2026-02-05T16:00:00,0.01,20

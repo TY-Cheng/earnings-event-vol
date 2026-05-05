@@ -1,0 +1,11 @@
+# Normalize source and docs line endings.
+* text=auto
+
+# Keep research data and generated binary artifacts out of text normalization.
+*.parquet binary
+*.csv.gz binary
+*.zip binary
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
