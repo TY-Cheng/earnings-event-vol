@@ -4,6 +4,7 @@ import gzip
 import importlib
 import json
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime, time
@@ -12,8 +13,10 @@ from typing import Any, cast
 
 import httpx
 import pandas as pd
+import polars as pl
 import pytest
 
+import earnings_event_vol.data_pipeline as data_pipeline
 import scripts.build_trade_proxy_panel as trade_proxy_panel_script
 from earnings_event_vol.backtest import (
     GaussianEventJumpDistribution,
@@ -29,13 +32,19 @@ from earnings_event_vol.backtest import (
 from earnings_event_vol.cli import main
 from earnings_event_vol.config import load_project_config
 from earnings_event_vol.data_audit import audit_data_fields, vendor_local_iv_comparison
-from earnings_event_vol.data_pipeline import parse_text_list, run_data_pipeline
+from earnings_event_vol.data_pipeline import (
+    DataPipelineStep,
+    parse_text_list,
+    run_data_pipeline,
+)
 from earnings_event_vol.earnings_calendar import (
+    apply_official_then_aux_text_validation,
     apply_text_validation,
     build_earnings_calendar_candidates,
     build_earnings_calendar_report,
     classify_8k_text,
     fetch_massive_8k_text_payloads,
+    fetch_sec_primary_document_texts,
     fetch_sec_submission_payloads,
     fetch_sec_ticker_map,
     infer_timing_from_acceptance_timestamp,
@@ -149,6 +158,26 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 def _pipeline_steps(payload: dict[str, object]) -> list[dict[str, object]]:
     return cast(list[dict[str, object]], payload["steps"])
+
+
+def _calendar_pipeline_params(
+    *,
+    tickers: Sequence[str],
+    start_date: date,
+    end_date: date,
+    validate_with_massive: bool = True,
+) -> dict[str, object]:
+    return {
+        "pipeline_params": {
+            "stage": "calendar-pilot",
+            "tickers": sorted({ticker.upper() for ticker in tickers if ticker.strip()}),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "sec_submissions_dir": None,
+            "massive_8k_text_dir": None,
+            "validate_with_massive": validate_with_massive,
+        }
+    }
 
 
 def _sec_submissions_payload(rows: list[dict[str, str]]) -> dict[str, object]:
@@ -568,12 +597,14 @@ def test_earnings_calendar_http_fetch_path_uses_official_and_massive_sources(
     api_key.write_text("redacted", encoding="utf-8")
     monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(api_key))
     monkeypatch.setenv("MASSIVE_BASE_URL", "https://massive.example")
+    monkeypatch.setenv("MASSIVE_MAX_RETRIES", "1")
+    monkeypatch.setenv("MASSIVE_RETRY_BACKOFF_SECONDS", "0")
     monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
     monkeypatch.setenv(
         "SEC_SUBMISSIONS_URL_TEMPLATE",
         "https://sec.example/submissions/CIK{cik:010d}.json",
     )
-    config = load_project_config()
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
 
     sec_payload = _sec_submissions_payload(
         [
@@ -583,16 +614,31 @@ def test_earnings_calendar_http_fetch_path_uses_official_and_massive_sources(
                 "acceptanceDateTime": "2026-01-29T21:30:33.000Z",
                 "form": "8-K",
                 "items": "2.02,9.01",
+                "primaryDocument": "aapl-20260129.htm",
             }
         ]
     )
+    massive_calls = {"count": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == "https://sec.example/tickers.json":
             return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
         if str(request.url) == "https://sec.example/submissions/CIK0000320193.json":
             return httpx.Response(200, json=sec_payload)
+        if str(request.url) == (
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/aapl-20260129.htm"
+        ):
+            return httpx.Response(
+                200,
+                text=(
+                    "Item 2.02 Results of Operations and Financial Condition. "
+                    "Apple issued financial results for its fiscal quarter."
+                ),
+            )
         if request.url.host == "massive.example":
+            massive_calls["count"] += 1
+            if massive_calls["count"] == 1:
+                raise httpx.RemoteProtocolError("server disconnected")
             assert request.url.params["apiKey"] == "redacted"
             return httpx.Response(
                 200,
@@ -622,7 +668,305 @@ def test_earnings_calendar_http_fetch_path_uses_official_and_massive_sources(
 
     assert frame["announcement_timing"].tolist() == ["AMC"]
     assert frame["is_main_sample_candidate"].tolist() == [True]
-    assert report["validation_route"] == "sec_edgar_http+massive_8k_text_http"
+    assert frame["text_validation_source"].tolist() == ["sec_primary_document_text"]
+    assert report["validation_route"] == "sec_edgar_http+sec_primary_document_text"
+    assert report["massive_8k_fetch_failed"] == 0
+    assert massive_calls["count"] == 0
+
+
+def test_earnings_calendar_uses_massive_only_as_auxiliary_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_key = tmp_path / "massive_api_key"
+    api_key.write_text("redacted", encoding="utf-8")
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(api_key))
+    monkeypatch.setenv("MASSIVE_BASE_URL", "https://massive.example")
+    monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
+    monkeypatch.setenv(
+        "SEC_SUBMISSIONS_URL_TEMPLATE",
+        "https://sec.example/submissions/CIK{cik:010d}.json",
+    )
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
+    sec_payload = _sec_submissions_payload(
+        [
+            {
+                "accessionNumber": "0000320193-26-000005",
+                "filingDate": "2026-01-29",
+                "acceptanceDateTime": "2026-01-29T21:30:33.000Z",
+                "form": "8-K",
+                "items": "2.02,9.01",
+                "primaryDocument": "aapl-20260129.htm",
+            }
+        ]
+    )
+    massive_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://sec.example/tickers.json":
+            return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
+        if str(request.url) == "https://sec.example/submissions/CIK0000320193.json":
+            return httpx.Response(200, json=sec_payload)
+        if str(request.url) == (
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/aapl-20260129.htm"
+        ):
+            return httpx.Response(200, text="Item 2.02 Results of Operations.")
+        if request.url.host == "massive.example":
+            massive_calls["count"] += 1
+            assert request.url.params["apiKey"] == "redacted"
+            return httpx.Response(
+                200,
+                json=_massive_text_payload(
+                    [
+                        {
+                            "accession_number": "0000320193-26-000005",
+                            "filing_date": "2026-01-29",
+                            "items_text": (
+                                "Item 2.02 Results of Operations and Financial Condition. "
+                                "Apple issued financial results for its fiscal quarter."
+                            ),
+                        }
+                    ]
+                ),
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        frame, report = build_earnings_calendar_candidates(
+            config=config,
+            tickers=["AAPL"],
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            http_client=client,
+        )
+
+    assert frame["text_validation_source"].tolist() == ["massive_8k_text_fallback"]
+    assert frame["text_validation_aux_status"].tolist() == ["validated_earnings_release"]
+    assert frame["is_main_sample_candidate"].tolist() == [True]
+    assert report["validation_route"] == (
+        "sec_edgar_http+sec_primary_document_text+massive_8k_text_http_auxiliary"
+    )
+    assert massive_calls["count"] == 2
+
+
+def test_earnings_calendar_soft_fails_when_auxiliary_massive_key_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
+    monkeypatch.setenv(
+        "SEC_SUBMISSIONS_URL_TEMPLATE",
+        "https://sec.example/submissions/CIK{cik:010d}.json",
+    )
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        massive_api_key_file=tmp_path / "missing_massive_key",
+    )
+    sec_payload = _sec_submissions_payload(
+        [
+            {
+                "accessionNumber": "0000320193-26-000005",
+                "filingDate": "2026-01-29",
+                "acceptanceDateTime": "2026-01-29T21:30:33.000Z",
+                "form": "8-K",
+                "items": "2.02,9.01",
+                "primaryDocument": "aapl-20260129.htm",
+            }
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://sec.example/tickers.json":
+            return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
+        if str(request.url) == "https://sec.example/submissions/CIK0000320193.json":
+            return httpx.Response(200, json=sec_payload)
+        if str(request.url) == (
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/aapl-20260129.htm"
+        ):
+            return httpx.Response(200, text="Item 2.02 Results of Operations.")
+        raise AssertionError(f"Massive fallback should stop at missing key: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        frame, report = build_earnings_calendar_candidates(
+            config=config,
+            tickers=["AAPL"],
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            http_client=client,
+        )
+
+    assert frame["text_validation_source"].tolist() == ["sec_primary_document_text"]
+    assert frame["text_validation_status"].tolist() == ["ambiguous_item_2_02_text"]
+    assert report["massive_8k_aux_status"] == "unavailable_missing_key"
+
+
+def test_sec_primary_document_fetch_cache_and_failure_paths(tmp_path: Path) -> None:
+    config = replace(load_project_config(), massive_max_retries=0)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(404))) as client:
+        empty_texts, empty_failures = fetch_sec_primary_document_texts(
+            candidates=pd.DataFrame(),
+            config=config,
+            client=client,
+            cache_dir=tmp_path / "cache",
+            request_interval_seconds=0,
+        )
+    assert empty_texts == {}
+    assert empty_failures == []
+
+    candidates = pd.DataFrame(
+        [
+            {
+                "ticker": "AAPL",
+                "source_id": "0000320193-26-000005",
+                "cik": 320193,
+                "primary_document": "ok.htm",
+            },
+            {
+                "ticker": "AAPL",
+                "source_id": "0000320193-26-000005",
+                "cik": 320193,
+                "primary_document": "ok.htm",
+            },
+            {
+                "ticker": "MSFT",
+                "source_id": "0000789019-26-000001",
+                "cik": 789019,
+                "primary_document": "missing.htm",
+            },
+            {
+                "ticker": "NVDA",
+                "source_id": "0001045810-26-000001",
+                "cik": None,
+                "primary_document": "",
+            },
+            {
+                "ticker": "",
+                "source_id": "",
+                "cik": 1,
+                "primary_document": "ignored.htm",
+            },
+        ]
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url).endswith("/ok.htm"):
+            return httpx.Response(200, text="Item 2.02 quarterly results.")
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        texts, failures = fetch_sec_primary_document_texts(
+            candidates=candidates,
+            config=config,
+            client=client,
+            cache_dir=tmp_path / "cache",
+            request_interval_seconds=0,
+        )
+
+    assert texts[("AAPL", "0000320193-26-000005")] == "Item 2.02 quarterly results."
+    assert len([url for url in calls if url.endswith("/ok.htm")]) == 1
+    assert {failure["reason"] for failure in failures} == {
+        "missing_cik_or_primary_document",
+        "sec_primary_document_fetch_failed",
+    }
+
+    def no_network_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected cache-miss fetch: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(no_network_handler)) as client:
+        cached_texts, cached_failures = fetch_sec_primary_document_texts(
+            candidates=candidates.iloc[[0]],
+            config=config,
+            client=client,
+            cache_dir=tmp_path / "cache",
+            request_interval_seconds=0,
+        )
+    assert cached_texts == texts
+    assert cached_failures == []
+
+    unresolved = apply_official_then_aux_text_validation(
+        pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "source_id": "0000320193-26-000005",
+                    "is_main_sample_timing": True,
+                }
+            ]
+        ),
+        sec_text_by_accession={
+            ("AAPL", "0000320193-26-000005"): "Item 2.02 Results of Operations."
+        },
+        aux_text_by_accession={},
+    )
+    assert unresolved["text_validation_source"].iloc[0] == "sec_primary_document_text"
+    assert unresolved["text_validation_aux_status"].iloc[0] == "missing_text"
+    assert "Massive auxiliary status: missing_text" in unresolved["text_validation_reason"].iloc[0]
+
+
+def test_sec_archived_submission_files_are_cached_normalized_and_deduped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
+    monkeypatch.setenv(
+        "SEC_SUBMISSIONS_URL_TEMPLATE",
+        "https://data.sec.gov/submissions/CIK{cik:010d}.json",
+    )
+    config = load_project_config()
+    archive_name = "CIK0000320193-submissions-001.json"
+    recent_payload = _sec_submissions_payload(
+        [
+            {
+                "accessionNumber": "duplicate",
+                "filingDate": "2013-01-24",
+                "acceptanceDateTime": "2013-01-24T21:30:00.000Z",
+                "form": "8-K",
+                "items": "2.02",
+            }
+        ]
+    )
+    recent_payload["filings"]["files"] = [{"name": archive_name}]  # type: ignore[index]
+    archive_payload = {
+        "accessionNumber": ["duplicate", "archive-only"],
+        "filingDate": ["2013-01-24", "2013-04-23"],
+        "acceptanceDateTime": ["2013-01-24T21:30:00.000Z", "2013-04-23T12:15:00.000Z"],
+        "form": ["8-K", "8-K"],
+        "items": ["2.02", "2.02"],
+        "reportDate": ["", ""],
+        "primaryDocument": ["", ""],
+        "primaryDocDescription": ["", ""],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://sec.example/tickers.json":
+            return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
+        if str(request.url) == "https://data.sec.gov/submissions/CIK0000320193.json":
+            return httpx.Response(200, json=recent_payload)
+        if str(request.url) == f"https://data.sec.gov/submissions/{archive_name}":
+            return httpx.Response(200, json=archive_payload)
+        return httpx.Response(404)
+
+    cache_dir = tmp_path / "sec_cache"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        payloads = fetch_sec_submission_payloads(
+            tickers=["AAPL"],
+            config=config,
+            client=client,
+            archive_cache_dir=cache_dir,
+            request_interval_seconds=0,
+        )
+    normalized = normalize_sec_submission_candidates(
+        ticker="AAPL",
+        payload=payloads["AAPL"],
+        start_date=date(2013, 1, 1),
+        end_date=date(2013, 12, 31),
+    )
+    assert (cache_dir / "ticker=AAPL" / archive_name).exists()
+    assert normalized["source_id"].tolist() == ["duplicate", "archive-only"]
+    assert normalized["source"].tolist() == [
+        "sec_edgar_submissions_recent",
+        "sec_edgar_submissions_archive",
+    ]
 
 
 def test_earnings_calendar_timing_and_text_classification() -> None:
@@ -688,6 +1032,20 @@ def test_earnings_calendar_timing_and_text_classification() -> None:
                 {"form": "8-K", "items": "2.02", "filingDate": "not-a-date"},
             ]
         ),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    ).empty
+    assert normalize_sec_submission_candidates(
+        ticker="AAPL",
+        payload={
+            "filings": {
+                "recent": {
+                    "form": ["8-K", "8-K"],
+                    "items": ["2.02", "2.02"],
+                    "filingDate": [None, ""],
+                }
+            }
+        },
         start_date=date(2026, 1, 1),
         end_date=date(2026, 12, 31),
     ).empty
@@ -857,6 +1215,56 @@ def test_earnings_calendar_http_fetch_fail_closed_branches(
     assert payloads["AAPL"]["results"] == [
         {"filing_date": "2026-01-29", "accession_number": "keep"}
     ]
+
+    monkeypatch.setenv("MASSIVE_MAX_RETRIES", "1")
+    monkeypatch.setenv("MASSIVE_RETRY_BACKOFF_SECONDS", "0")
+    retry_config = load_project_config()
+
+    def disconnecting_massive_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("server disconnected")
+
+    with httpx.Client(transport=httpx.MockTransport(disconnecting_massive_handler)) as client:
+        failed_payloads = fetch_massive_8k_text_payloads(
+            tickers=["AAPL"],
+            config=retry_config,
+            client=client,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+    assert sorted(failed_payloads["AAPL"]["results"], key=lambda item: item["form_type"]) == [
+        {
+            "fetch_failure": "massive_8k_text_transport_retry_exhausted",
+            "ticker": "AAPL",
+            "form_type": "8-K",
+            "error": "server disconnected",
+        },
+        {
+            "fetch_failure": "massive_8k_text_transport_retry_exhausted",
+            "ticker": "AAPL",
+            "form_type": "8-K/A",
+            "error": "server disconnected",
+        },
+    ]
+
+    monkeypatch.setenv("MASSIVE_MAX_RETRIES", "0")
+    retry_config = load_project_config()
+
+    def retryable_http_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "try later"})
+
+    with httpx.Client(transport=httpx.MockTransport(retryable_http_handler)) as client:
+        http_failed_payloads = fetch_massive_8k_text_payloads(
+            tickers=["AAPL"],
+            config=retry_config,
+            client=client,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+    assert {item["fetch_failure"] for item in http_failed_payloads["AAPL"]["results"]} == {
+        "massive_8k_text_http_retry_exhausted"
+    }
 
 
 def test_act_365_default_and_mixed_convention_rejected() -> None:
@@ -1372,7 +1780,16 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     calendar_out = out_root / "earnings_calendar_pilot"
     calendar_out.mkdir(parents=True)
     (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
-    (calendar_out / "earnings_calendar_report.json").write_text("{}")
+    (calendar_out / "earnings_calendar_report.json").write_text(
+        json.dumps(
+            _calendar_pipeline_params(
+                tickers=["AAPL"],
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 12, 31),
+            )
+        ),
+        encoding="utf-8",
+    )
     calendar_skip = run_data_pipeline(
         config,
         stage="calendar-pilot",
@@ -1436,7 +1853,11 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         universe_trailing_months=2,
     )
     assert _pipeline_steps(universe_resume)[0]["status"] == "skipped"
-    universe_blocked = run_data_pipeline(config, stage="universe", out_root=tmp_path / "blocked")
+    universe_blocked = run_data_pipeline(
+        replace(config, bronze_data_dir=tmp_path / "empty_bronze"),
+        stage="universe",
+        out_root=tmp_path / "blocked",
+    )
     assert universe_blocked["ok"] is False
     assert _pipeline_steps(universe_blocked)[0]["status"] == "blocked"
 
@@ -1479,6 +1900,555 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     assert "missing_option_day_agg_exit_price" in cast(
         dict[str, object], dry_run["exclusion_estimate"]
     )
+    assert dry_run["planned_stages"] == [
+        "options-day-aggs-bulk",
+        "universe",
+        "dynamic-calendar",
+        "pilot-panel",
+        "trade-proxy-panel",
+    ]
+    assert cast(dict[str, object], dry_run["bulk_day_aggs_date_range"])["start"] == "2025-07-01"
+
+
+def test_bulk_day_aggs_bronze_statuses_and_refresh(tmp_path: Path) -> None:
+    key_file = tmp_path / "flat_file_keys"
+    key_file.write_text("access\nsecret\n", encoding="utf-8")
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        massive_flat_file_key_file=key_file,
+    )
+
+    hit_path = data_pipeline._bronze_day_agg_path(
+        config, dataset="options_day_aggs", date_value=date(2025, 1, 2)
+    )
+    hit_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {"ticker": ["O:AAPL250117C00100000"], "close": [1.0], "volume": [10]}
+    ).write_parquet(hit_path)
+    hit = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 2),
+        refresh_bronze=False,
+    )
+    assert hit["status"] == "hit"
+
+    def ok_runner(
+        command: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> MassiveCommandResult:
+        destination = Path(command[4])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(destination, "wt", encoding="utf-8") as file:
+            file.write("ticker,close,volume,vwap\nO:AAPL250117C00100000,1.5,10,1.4\n")
+        return MassiveCommandResult(returncode=0, stdout="", stderr="")
+
+    corrupt_path = data_pipeline._bronze_day_agg_path(
+        config, dataset="options_day_aggs", date_value=date(2025, 1, 3)
+    )
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text("not parquet", encoding="utf-8")
+    repaired = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 3),
+        refresh_bronze=False,
+        runner=ok_runner,
+    )
+    assert repaired["status"] == "repaired"
+
+    downloaded = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="underlying_day_aggs",
+        date_value=date(2025, 1, 6),
+        refresh_bronze=False,
+        runner=ok_runner,
+    )
+    assert downloaded["status"] == "downloaded"
+
+    refreshed = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 2),
+        refresh_bronze=True,
+        runner=ok_runner,
+    )
+    assert refreshed["status"] == "downloaded"
+
+    def missing_runner(
+        command: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> MassiveCommandResult:
+        return MassiveCommandResult(returncode=1, stdout="", stderr="NoSuchKey: not found")
+
+    missing = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 7),
+        refresh_bronze=False,
+        runner=missing_runner,
+    )
+    assert missing["status"] == "missing_flat_file"
+
+    def failed_runner(
+        command: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> MassiveCommandResult:
+        return MassiveCommandResult(returncode=127, stdout="", stderr="aws missing")
+
+    failed = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 8),
+        refresh_bronze=False,
+        runner=failed_runner,
+    )
+    assert failed["status"] == "failed"
+
+
+def test_data_pipeline_source_readers_and_massive_probe_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completed = data_pipeline._run_command_with_progress(
+        [sys.executable, "-c", "print('hello-progress')"],
+        cwd=tmp_path,
+        label="progress-test",
+    )
+    assert completed.returncode == 0
+    assert "hello-progress" in completed.stdout
+
+    csv_dir = tmp_path / "csv_dir"
+    csv_dir.mkdir()
+    (csv_dir / "part.csv").write_text("ticker,quote_date,option_close,volume\nA,2025-01-01,1,1\n")
+    assert data_pipeline._read_universe_source(csv_dir)["ticker"].tolist() == ["A"]
+
+    parquet_dir = tmp_path / "parquet_dir"
+    parquet_dir.mkdir()
+    pl.DataFrame(
+        {"ticker": ["B"], "quote_date": ["2025-01-01"], "option_close": [2.0], "volume": [2]}
+    ).write_parquet(parquet_dir / "part.parquet")
+    assert data_pipeline._read_universe_source(parquet_dir)["ticker"].tolist() == ["B"]
+
+    parquet_file = tmp_path / "single.parquet"
+    pl.DataFrame(
+        {"ticker": ["C"], "quote_date": ["2025-01-01"], "option_close": [3.0], "volume": [3]}
+    ).write_parquet(parquet_file)
+    assert data_pipeline._read_universe_source(parquet_file)["ticker"].tolist() == ["C"]
+
+    with pytest.raises(FileNotFoundError):
+        data_pipeline._read_universe_source(tmp_path / "empty_dir")
+
+    blocked = data_pipeline._massive_probe_steps(
+        load_project_config(),
+        out_root=tmp_path / "probe",
+        dates=[],
+        force=False,
+        jobs=2,
+        download_samples=False,
+    )
+    assert blocked[0].status == "blocked"
+
+    def fake_probe_one_date(
+        config: object,
+        *,
+        out_root: Path,
+        probe_date: date,
+        force: bool,
+        download_samples: bool,
+    ) -> DataPipelineStep:
+        return DataPipelineStep(f"massive-probe:{probe_date.isoformat()}", "ran")
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._massive_probe_one_date", fake_probe_one_date
+    )
+    parallel = data_pipeline._massive_probe_steps(
+        load_project_config(),
+        out_root=tmp_path / "probe",
+        dates=[date(2025, 1, 2), date(2025, 1, 3)],
+        force=False,
+        jobs=2,
+        download_samples=False,
+    )
+    assert [step.name for step in parallel] == [
+        "massive-probe:2025-01-02",
+        "massive-probe:2025-01-03",
+    ]
+
+
+def test_bulk_day_aggs_stage_manifest_resume_and_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
+    out_root = tmp_path / "pipeline"
+
+    def successful_partition(
+        config: object,
+        *,
+        dataset: str,
+        date_value: date,
+        refresh_bronze: bool,
+    ) -> dict[str, object]:
+        status = "hit" if dataset == "options_day_aggs" else "missing_flat_file"
+        return {
+            "date": date_value.isoformat(),
+            "dataset": dataset,
+            "status": status,
+            "path": f"/fake/{dataset}/{date_value.isoformat()}",
+        }
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._ensure_bulk_day_agg_partition",
+        successful_partition,
+    )
+    step = data_pipeline._options_day_aggs_bulk_step(
+        config,
+        out_root=out_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 3),
+        trailing_months=1,
+        force=False,
+        refresh_bronze=False,
+        jobs=3,
+    )
+    assert step.status == "ran"
+    assert (out_root / "options_day_aggs_bulk" / "day_agg_fetch_report.csv").exists()
+    assert isinstance(step.metadata["weekdays"], int)
+    assert step.metadata["weekdays"] > 0
+
+    skipped = data_pipeline._options_day_aggs_bulk_step(
+        config,
+        out_root=out_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 3),
+        trailing_months=1,
+        force=False,
+        refresh_bronze=False,
+        jobs=1,
+    )
+    assert skipped.status == "skipped"
+
+    manifest_path = out_root / "options_day_aggs_bulk" / "options_day_aggs_bulk_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status_counts"]["failed"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    rerun_after_failed_manifest = data_pipeline._options_day_aggs_bulk_step(
+        config,
+        out_root=out_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 3),
+        trailing_months=1,
+        force=False,
+        refresh_bronze=False,
+        jobs=1,
+    )
+    assert rerun_after_failed_manifest.status == "ran"
+
+    def failed_partition(
+        config: object,
+        *,
+        dataset: str,
+        date_value: date,
+        refresh_bronze: bool,
+    ) -> dict[str, object]:
+        return {"date": date_value.isoformat(), "dataset": dataset, "status": "failed"}
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._ensure_bulk_day_agg_partition",
+        failed_partition,
+    )
+    failed = data_pipeline._options_day_aggs_bulk_step(
+        config,
+        out_root=tmp_path / "failed",
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 1),
+        trailing_months=1,
+        force=False,
+        refresh_bronze=False,
+        jobs=2,
+    )
+    assert failed.status == "blocked"
+    assert failed.reason == "bulk_day_agg_failures"
+
+    def missing_partition(
+        config: object,
+        *,
+        dataset: str,
+        date_value: date,
+        refresh_bronze: bool,
+    ) -> dict[str, object]:
+        return {
+            "date": date_value.isoformat(),
+            "dataset": dataset,
+            "status": "missing_flat_file",
+        }
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._ensure_bulk_day_agg_partition",
+        missing_partition,
+    )
+    missing = data_pipeline._options_day_aggs_bulk_step(
+        config,
+        out_root=tmp_path / "missing",
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 1),
+        trailing_months=1,
+        force=False,
+        refresh_bronze=False,
+        jobs=2,
+    )
+    assert missing.status == "blocked"
+    assert missing.reason == "no_options_day_aggs_available"
+
+
+def test_universe_stage_reads_partitioned_options_day_aggs(tmp_path: Path) -> None:
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
+    options_dir = tmp_path / "bronze" / "massive" / "options_day_aggs"
+    first = options_dir / "date=2025-01-15" / "part.parquet"
+    second = options_dir / "date=2025-02-14" / "part.parquet"
+    outside = options_dir / "date=2025-04-01" / "part.parquet"
+    for path, frame in [
+        (
+            first,
+            pl.DataFrame(
+                {
+                    "ticker": ["O:AAPL250117C00100000", "O:MSFT250117C00100000"],
+                    "volume": [10.0, 2.0],
+                    "vwap": [2.0, 1.0],
+                    "close": [1.8, 1.1],
+                }
+            ),
+        ),
+        (
+            second,
+            pl.DataFrame(
+                {
+                    "ticker": ["O:MSFT250321C00300000"],
+                    "volume": [20.0],
+                    "option_close": [3.0],
+                    "close": [3.0],
+                }
+            ),
+        ),
+        (
+            outside,
+            pl.DataFrame(
+                {
+                    "ticker": ["O:TSLA250516C00200000"],
+                    "volume": [1000.0],
+                    "vwap": [10.0],
+                    "close": [10.0],
+                }
+            ),
+        ),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.write_parquet(path)
+
+    result = run_data_pipeline(
+        config,
+        stage="universe",
+        out_root=tmp_path / "pipeline",
+        options_day_aggs_path=options_dir,
+        start_date=date(2025, 3, 1),
+        end_date=date(2025, 3, 31),
+        universe_top_n=1,
+        universe_trailing_months=2,
+    )
+    assert result["ok"] is True
+    universe = pl.read_parquet(
+        tmp_path / "pipeline" / "universe" / "monthly_top50_universe.parquet"
+    ).to_pandas()
+    assert universe["ticker"].tolist() == ["MSFT"]
+    assert universe["rank"].tolist() == [1]
+
+
+def test_dynamic_calendar_filters_by_latest_prior_universe_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
+    out_root = tmp_path / "pipeline"
+    universe_path = out_root / "universe" / "monthly_top50_universe.parquet"
+    universe_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "universe_month": ["2025-01-01", "2025-02-01"],
+            "ticker": ["AAPL", "MSFT"],
+            "rank": [1, 2],
+            "trailing_months": [6, 6],
+            "top_n": [50, 50],
+            "trailing_option_premium_dollar_volume": [1000.0, 900.0],
+            "telemetry_bucket": ["steady_proxy", "steady_proxy"],
+        }
+    ).write_parquet(universe_path)
+
+    def fake_calendar(**kwargs: object) -> tuple[pd.DataFrame, dict[str, object]]:
+        assert kwargs["tickers"] == ["AAPL", "MSFT"]
+        assert kwargs["fail_on_missing_tickers"] is False
+        return (
+            pd.DataFrame(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "announcement_date": "2025-01-30",
+                        "announcement_timing": "AMC",
+                        "source": "sec",
+                        "is_main_sample_candidate": True,
+                    },
+                    {
+                        "ticker": "MSFT",
+                        "announcement_date": "2025-03-01",
+                        "announcement_timing": "BMO",
+                        "source": "sec",
+                        "is_main_sample_candidate": True,
+                    },
+                    {
+                        "ticker": "TSLA",
+                        "announcement_date": "2025-01-30",
+                        "announcement_timing": "AMC",
+                        "source": "sec",
+                        "is_main_sample_candidate": True,
+                    },
+                ]
+            ),
+            {"row_count": 3, "main_sample_candidate_rows": 3},
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.build_earnings_calendar_candidates",
+        fake_calendar,
+    )
+    step = data_pipeline._dynamic_calendar_step(
+        config,
+        out_root=out_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 12, 31),
+        sec_submissions_dir=None,
+        massive_8k_text_dir=None,
+        validate_with_massive=True,
+        force=False,
+    )
+    assert step.status == "ran"
+    output = pd.read_csv(out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv")
+    assert output["ticker"].tolist() == ["AAPL", "MSFT"]
+    assert output["universe_rank"].tolist() == [1, 2]
+    assert output["universe_filter_status"].eq("in_universe").all()
+
+    skipped = data_pipeline._dynamic_calendar_step(
+        config,
+        out_root=out_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 12, 31),
+        sec_submissions_dir=None,
+        massive_8k_text_dir=None,
+        validate_with_massive=True,
+        force=False,
+    )
+    assert skipped.status == "skipped"
+
+
+def test_dynamic_calendar_blocks_and_membership_edge_cases(tmp_path: Path) -> None:
+    config = load_project_config()
+    assert data_pipeline._path_signature(tmp_path / "does_not_exist") == {
+        "path": str(tmp_path / "does_not_exist"),
+        "exists": False,
+    }
+    missing_universe = data_pipeline._dynamic_calendar_step(
+        config,
+        out_root=tmp_path / "missing",
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 12, 31),
+        sec_submissions_dir=None,
+        massive_8k_text_dir=None,
+        validate_with_massive=True,
+        force=False,
+    )
+    assert missing_universe.status == "blocked"
+    assert missing_universe.reason == "requires universe/monthly_top50_universe.parquet"
+
+    empty_root = tmp_path / "empty"
+    empty_path = empty_root / "universe" / "monthly_top50_universe.parquet"
+    empty_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"universe_month": ["2025-01-01"], "ticker": [""], "rank": [1]}).write_parquet(
+        empty_path
+    )
+    empty_step = data_pipeline._dynamic_calendar_step(
+        config,
+        out_root=empty_root,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 12, 31),
+        sec_submissions_dir=None,
+        massive_8k_text_dir=None,
+        validate_with_massive=True,
+        force=False,
+    )
+    assert empty_step.status == "blocked"
+    assert empty_step.reason == "monthly universe has no tickers"
+
+    empty_membership, empty_counts = data_pipeline._apply_dynamic_universe_membership(
+        pd.DataFrame(),
+        pd.DataFrame({"ticker": ["AAPL"], "universe_month": ["2025-01-01"], "rank": [1]}),
+    )
+    assert empty_membership.empty
+    assert empty_counts == {"no_universe_membership": 0, "bad_event_month": 0}
+
+    with pytest.raises(ValueError, match="monthly universe missing required columns"):
+        data_pipeline._apply_dynamic_universe_membership(
+            pd.DataFrame([{"ticker": "AAPL", "announcement_date": "2025-01-01"}]),
+            pd.DataFrame({"ticker": ["AAPL"]}),
+        )
+
+    annotated, counts = data_pipeline._apply_dynamic_universe_membership(
+        pd.DataFrame(
+            [
+                {"ticker": "AAPL", "announcement_date": "not-a-date"},
+                {"ticker": "MSFT", "announcement_date": "2025-01-30"},
+            ]
+        ),
+        pd.DataFrame({"ticker": ["AAPL"], "universe_month": ["2025-01-01"], "rank": [1]}),
+    )
+    assert annotated["universe_filter_status"].tolist() == [
+        "bad_event_month",
+        "no_universe_membership",
+    ]
+    assert counts == {"bad_event_month": 1, "no_universe_membership": 1}
+
+
+def test_calendar_pilot_step_runs_static_debug_calendar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_project_config()
+    out_root = tmp_path / "pipeline"
+
+    def fake_calendar(**kwargs: object) -> tuple[pd.DataFrame, dict[str, object]]:
+        return (
+            pd.DataFrame(
+                [
+                    {
+                        "ticker": "AAPL",
+                        "announcement_date": "2025-01-30",
+                        "announcement_timing": "AMC",
+                        "is_main_sample_candidate": True,
+                    }
+                ]
+            ),
+            {"row_count": 1, "main_sample_candidate_rows": 1},
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.build_earnings_calendar_candidates",
+        fake_calendar,
+    )
+    step = data_pipeline._calendar_pilot_step(
+        config,
+        out_root=out_root,
+        tickers=["AAPL"],
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 12, 31),
+        sec_submissions_dir=None,
+        massive_8k_text_dir=None,
+        validate_with_massive=True,
+        force=False,
+    )
+    assert step.status == "ran"
+    assert (out_root / "earnings_calendar_pilot" / "earnings_calendar_candidates.csv").exists()
 
 
 def test_data_pipeline_contracts_and_panel_stages(tmp_path: Path) -> None:
@@ -1570,7 +2540,24 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
         gold_output.parent.mkdir(parents=True, exist_ok=True)
         report.parent.mkdir(parents=True, exist_ok=True)
         gold_output.write_text("parquet-placeholder", encoding="utf-8")
-        report.write_text("{}", encoding="utf-8")
+        report.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": {
+                        "stage": "pilot-panel",
+                        "calendar": str(
+                            out_root
+                            / "earnings_calendar_pilot"
+                            / "earnings_calendar_candidates.csv"
+                        ),
+                        "dte_min": 3,
+                        "dte_max": 21,
+                        "max_events": 7,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(command, 0, stdout="pilot ok", stderr="")
 
     monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
@@ -1592,12 +2579,20 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
     assert str(config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet") in outputs
     command = cast(list[str], captured["command"])
     assert command[-3:] == ["--force", "--max-events", "7"]
+    assert "--calendar" in command
     assert "--dte-min" in command
     assert "--dte-max" in command
     assert captured["cwd"] == tmp_path
     assert captured["label"] == "pilot-panel"
 
-    skipped = run_data_pipeline(config, stage="pilot-panel", out_root=out_root)
+    skipped = run_data_pipeline(
+        config,
+        stage="pilot-panel",
+        out_root=out_root,
+        dte_min=3,
+        dte_max=21,
+        max_events=7,
+    )
     assert _pipeline_steps(skipped)[0]["status"] == "skipped"
 
 
@@ -1627,7 +2622,21 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
         gold_output.parent.mkdir(parents=True, exist_ok=True)
         report.parent.mkdir(parents=True, exist_ok=True)
         gold_output.write_text("parquet-placeholder", encoding="utf-8")
-        report.write_text("{}", encoding="utf-8")
+        report.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": {
+                        "stage": "trade-proxy-panel",
+                        "max_events": 2,
+                        "max_contracts": 12,
+                        "lookback_seconds": 600,
+                        "second_agg_buffer_minutes": 60,
+                        "price_field": "option_close",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(command, 0, stdout="trade proxy ok", stderr="")
 
     monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
@@ -1658,11 +2667,19 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
     assert captured["cwd"] == tmp_path
     assert captured["label"] == "trade-proxy-panel"
 
-    skipped = run_data_pipeline(config, stage="trade-proxy-panel", out_root=out_root)
+    skipped = run_data_pipeline(
+        config,
+        stage="trade-proxy-panel",
+        out_root=out_root,
+        max_events=2,
+        max_contracts=12,
+        lookback_seconds=600,
+        price_field="option_close",
+    )
     assert _pipeline_steps(skipped)[0]["status"] == "skipped"
 
 
-def test_data_pipeline_proxy_all_orchestrates_calendar_pilot_and_trade_proxy(
+def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1672,11 +2689,45 @@ def test_data_pipeline_proxy_all_orchestrates_calendar_pilot_and_trade_proxy(
         gold_data_dir=tmp_path / "data" / "gold",
     )
     out_root = tmp_path / "artifacts" / "data_pipeline"
-    calendar_out = out_root / "earnings_calendar_pilot"
-    calendar_out.mkdir(parents=True)
-    (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
-    (calendar_out / "earnings_calendar_report.json").write_text("{}")
     captured_commands: list[list[str]] = []
+
+    def fake_bulk(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("options-day-aggs-bulk", "ran")
+
+    def fake_universe(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("universe", "ran")
+
+    def fake_dynamic_calendar(*args: object, **kwargs: object) -> DataPipelineStep:
+        dynamic_out = out_root / "dynamic_calendar"
+        dynamic_out.mkdir(parents=True, exist_ok=True)
+        csv_path = dynamic_out / "earnings_calendar_candidates.csv"
+        parquet_path = dynamic_out / "earnings_calendar_candidates.parquet"
+        report_path = dynamic_out / "earnings_calendar_report.json"
+        pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "announcement_date": "2025-01-30",
+                    "announcement_timing": "AMC",
+                    "source": "sec_edgar_submissions_archive",
+                    "is_main_sample_candidate": True,
+                    "universe_month": "2025-01-01",
+                    "universe_rank": 1,
+                    "in_universe": True,
+                    "universe_filter_status": "in_universe",
+                }
+            ]
+        ).to_csv(csv_path, index=False)
+        parquet_path.write_text("parquet-placeholder", encoding="utf-8")
+        report_path.write_text("{}", encoding="utf-8")
+        return DataPipelineStep(
+            "dynamic-calendar",
+            "ran",
+            (csv_path, parquet_path, report_path),
+        )
+
+    def fail_calendar_pilot(*args: object, **kwargs: object) -> DataPipelineStep:
+        raise AssertionError("calendar-pilot must not run inside proxy-all")
 
     def fake_run(
         command: Sequence[str],
@@ -1695,9 +2746,35 @@ def test_data_pipeline_proxy_all_orchestrates_calendar_pilot_and_trade_proxy(
         gold_output.parent.mkdir(parents=True, exist_ok=True)
         report.parent.mkdir(parents=True, exist_ok=True)
         gold_output.write_text("parquet-placeholder", encoding="utf-8")
-        report.write_text("{}", encoding="utf-8")
+        if "build_pilot_panel.py" in command[1]:
+            report.write_text(
+                json.dumps(
+                    {
+                        "pipeline_params": {
+                            "stage": "pilot-panel",
+                            "calendar": str(
+                                out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
+                            ),
+                            "dte_min": 3,
+                            "dte_max": 21,
+                            "max_events": 5,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            report.write_text("{}", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._options_day_aggs_bulk_step", fake_bulk)
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._universe_step", fake_universe)
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._dynamic_calendar_step", fake_dynamic_calendar
+    )
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._calendar_pilot_step", fail_calendar_pilot
+    )
     monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
 
     result = run_data_pipeline(
@@ -1714,15 +2791,18 @@ def test_data_pipeline_proxy_all_orchestrates_calendar_pilot_and_trade_proxy(
     steps = _pipeline_steps(result)
     assert result["ok"] is True
     assert [step["name"] for step in steps] == [
-        "calendar-pilot",
+        "options-day-aggs-bulk",
+        "universe",
+        "dynamic-calendar",
         "pilot-panel",
         "trade-proxy-panel",
     ]
-    assert [step["status"] for step in steps] == ["skipped", "ran", "ran"]
+    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran"]
     assert len(captured_commands) == 2
     pilot_command, trade_command = captured_commands
     assert "build_pilot_panel.py" in pilot_command[1]
     assert "build_trade_proxy_panel.py" in trade_command[1]
+    assert str(out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv") in pilot_command
     assert "--dte-min" in pilot_command
     assert "--dte-max" in pilot_command
     assert "--max-contracts" in trade_command
@@ -1734,22 +2814,15 @@ def test_data_pipeline_proxy_all_stops_after_blocked_upstream_stage(
 ) -> None:
     config = replace(load_project_config(), repo_root=tmp_path)
     out_root = tmp_path / "artifacts" / "data_pipeline"
-    calendar_out = out_root / "earnings_calendar_pilot"
-    calendar_out.mkdir(parents=True)
-    (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
-    (calendar_out / "earnings_calendar_report.json").write_text("{}", encoding="utf-8")
-    captured_commands: list[list[str]] = []
 
-    def fake_run(
-        command: Sequence[str],
-        *,
-        cwd: Path,
-        label: str,
-    ) -> subprocess.CompletedProcess[str]:
-        captured_commands.append(list(command))
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="pilot failed")
+    def fake_bulk(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("options-day-aggs-bulk", "ran")
 
-    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
+    def blocked_universe(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("universe", "blocked", reason="missing bulk artifact")
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._options_day_aggs_bulk_step", fake_bulk)
+    monkeypatch.setattr("earnings_event_vol.data_pipeline._universe_step", blocked_universe)
 
     result = run_data_pipeline(
         config,
@@ -1760,10 +2833,8 @@ def test_data_pipeline_proxy_all_stops_after_blocked_upstream_stage(
 
     steps = _pipeline_steps(result)
     assert result["ok"] is False
-    assert [step["name"] for step in steps] == ["calendar-pilot", "pilot-panel"]
-    assert [step["status"] for step in steps] == ["skipped", "blocked"]
-    assert len(captured_commands) == 1
-    assert "build_pilot_panel.py" in captured_commands[0][1]
+    assert [step["name"] for step in steps] == ["options-day-aggs-bulk", "universe"]
+    assert [step["status"] for step in steps] == ["ran", "blocked"]
 
 
 def test_trade_proxy_second_aggregates_are_cached_in_bronze_parquet(

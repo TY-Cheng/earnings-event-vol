@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -33,6 +34,16 @@ PARQUET_COMPRESSION = "zstd"
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(payload.get("pipeline_params") == dict(expected))
 
 
 def _write_parquet(path: Path, frame: pd.DataFrame | pl.DataFrame) -> None:
@@ -617,6 +628,13 @@ def build_pilot_panel(
     }
     _write_json(out_root / "quote_readiness" / "quote_route_report.json", quote_report)
     panel_report = {
+        "pipeline_params": {
+            "stage": "pilot-panel",
+            "calendar": str(calendar_path),
+            "dte_min": dte_min,
+            "dte_max": dte_max,
+            "max_events": max_events,
+        },
         "events": int(len(panel)),
         "events_with_rvar": int(panel["rvar_event"].notna().sum()),
         "events_with_ivar": int(panel["ivar_event"].notna().sum()),
@@ -671,12 +689,19 @@ def main() -> int:
     config = load_project_config()
     output = config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet"
     report = args.out_root / "event_panel" / "pilot_panel_report.json"
-    if not args.force and output.exists() and report.exists():
+    params = {
+        "stage": "pilot-panel",
+        "calendar": str(args.calendar),
+        "dte_min": args.dte_min,
+        "dte_max": args.dte_max,
+        "max_events": args.max_events,
+    }
+    if not args.force and output.exists() and _json_params_match(report, params):
         print(
             json.dumps(
                 {
                     "status": "skipped",
-                    "reason": "outputs_exist",
+                    "reason": "outputs_exist_params_match",
                     "pilot_event_panel": str(output),
                     "pilot_panel_report": str(report),
                 },

@@ -112,8 +112,10 @@ First-version source plan:
   candidate route: use 8-K / 8-K/A Item 2.02 filings, SEC acceptance timestamps,
   and explicit BMO, AMC, DMH, and unknown timing flags derived from
   America/New_York market hours.
-- Massive 8-K text as the validation route for parsed Item 2.02 content and
-  non-earnings Item 2.02 exclusions.
+- SEC EDGAR primary filing documents as the default validation route for parsed
+  Item 2.02 content and non-earnings Item 2.02 exclusions.
+- Massive 8-K text only as optional auxiliary fallback when official SEC
+  document text is unavailable or inconclusive.
 - Nasdaq earnings calendar only as auxiliary expected-calendar metadata; it is
   not the primary historical timing source unless a later audit shows stable
   historical BMO/AMC coverage.
@@ -121,8 +123,8 @@ First-version source plan:
   actions where available.
 
 The current code can already produce an auditable SEC-first candidate table with
-Massive 8-K text validation. That table is a source-quality gate, not yet the
-final paper event panel.
+SEC primary filing text validation. That table is a source-quality gate, not yet
+the final paper event panel.
 
 Target sample:
 

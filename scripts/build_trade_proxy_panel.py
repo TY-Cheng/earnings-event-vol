@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from collections import Counter
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Literal
@@ -53,6 +54,16 @@ def _progress(message: str) -> None:
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(payload.get("pipeline_params") == dict(expected))
 
 
 def _write_parquet(path: Path, frame: pd.DataFrame | pl.DataFrame) -> None:
@@ -421,6 +432,7 @@ def build_trade_proxy_panel(
     jobs: int,
     rest_limit: int,
     haircut_fraction: float,
+    refresh_bronze: bool,
 ) -> dict[str, object]:
     windows_path = config.silver_data_dir / "event_windows" / "event_windows.parquet"
     contracts_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
@@ -437,10 +449,18 @@ def build_trade_proxy_panel(
     ivar_inputs_path = silver_proxy_dir / "trade_proxy_ivar_inputs.parquet"
     panel_path = gold_panel_dir / "trade_proxy_event_panel.parquet"
     diagnostics_path = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
-    if not force and panel_path.exists() and diagnostics_path.exists():
+    params = {
+        "stage": "trade-proxy-panel",
+        "max_events": max_events,
+        "max_contracts": max_contracts,
+        "lookback_seconds": lookback_seconds,
+        "second_agg_buffer_minutes": second_agg_buffer_minutes,
+        "price_field": price_field,
+    }
+    if not force and panel_path.exists() and _json_params_match(diagnostics_path, params):
         return {
             "status": "skipped",
-            "reason": "outputs_exist",
+            "reason": "outputs_exist_params_match",
             "panel_grade": TRADE_PROXY_PANEL_GRADE,
             "outputs": {
                 "trade_proxy_event_panel": str(panel_path),
@@ -469,7 +489,7 @@ def build_trade_proxy_panel(
         jobs=jobs,
         limit=rest_limit,
         buffer_minutes=second_agg_buffer_minutes,
-        force=force,
+        force=refresh_bronze,
     )
     proxy_prices = build_trade_proxy_price_frame(
         contracts,
@@ -506,6 +526,7 @@ def build_trade_proxy_panel(
         lookback_seconds=lookback_seconds,
         price_field=price_field,
     )
+    report["pipeline_params"] = params
     report["second_agg_buffer_minutes"] = second_agg_buffer_minutes
     report["bronze_second_aggregate_cache"] = {
         "dataset": "options_second_aggs",
@@ -548,6 +569,11 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--rest-limit", type=int, default=50_000)
     parser.add_argument("--haircut-fraction", type=float, default=0.10)
+    parser.add_argument(
+        "--refresh-bronze",
+        action="store_true",
+        help="Re-fetch second-agg bronze caches instead of reusing valid cached Parquet.",
+    )
     args = parser.parse_args()
 
     if args.jobs <= 0:
@@ -571,6 +597,7 @@ def main() -> int:
         jobs=args.jobs,
         rest_limit=args.rest_limit,
         haircut_fraction=args.haircut_fraction,
+        refresh_bronze=args.refresh_bronze,
     )
     print(json.dumps(report, indent=2, default=str))
     return 0

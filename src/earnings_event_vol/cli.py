@@ -362,6 +362,7 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         dry_run=args.dry_run,
         universe_top_n=args.universe_top_n,
         universe_trailing_months=args.universe_trailing_months,
+        refresh_bronze=args.refresh_bronze,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -466,7 +467,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_calendar = subparsers.add_parser(
         "build-earnings-calendar",
-        help="Build SEC-first earnings candidates and optional Massive text validation.",
+        help=(
+            "Build SEC-first earnings candidates with SEC primary-document text "
+            "validation and optional Massive auxiliary text fallback."
+        ),
     )
     build_calendar.add_argument("--tickers", nargs="+", required=True)
     build_calendar.add_argument("--start", required=True, help="Start date in YYYY-MM-DD format.")
@@ -474,7 +478,14 @@ def build_parser() -> argparse.ArgumentParser:
     build_calendar.add_argument("--out", type=Path, required=True)
     build_calendar.add_argument("--sec-submissions-dir", type=Path)
     build_calendar.add_argument("--massive-8k-text-dir", type=Path)
-    build_calendar.add_argument("--skip-massive-validation", action="store_true")
+    build_calendar.add_argument(
+        "--skip-massive-validation",
+        action="store_true",
+        help=(
+            "Skip Massive auxiliary text fallback; live SEC primary-document validation "
+            "still runs when SEC HTTP sources are used."
+        ),
+    )
 
     align_events = subparsers.add_parser(
         "align-events", help="Align BMO/AMC events to EOD windows."
@@ -520,14 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
             "proxy-all",
             "fixture-audit",
             "massive-probe",
+            "options-day-aggs-bulk",
             "universe",
+            "dynamic-calendar",
             "calendar-pilot",
             "contracts",
             "panel",
             "pilot-panel",
             "trade-proxy-panel",
         ],
-        default="calendar-pilot",
+        default="proxy-all",
     )
     data.add_argument("--out-root", type=Path, default=Path("artifacts/data_pipeline"))
     data.add_argument("--force", action="store_true")
@@ -538,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_PILOT_TICKERS),
         help="Ticker list; accepts repeated, comma-separated, or space-separated values.",
     )
-    data.add_argument("--start", default="2025-01-01")
+    data.add_argument("--start", default="2013-01-01")
     data.add_argument("--end", default="2025-12-31")
     data.add_argument("--dates", nargs="*", default=[])
     data.add_argument("--events", type=Path)
@@ -548,13 +561,25 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--ex-dividends", type=Path)
     data.add_argument("--sec-submissions-dir", type=Path)
     data.add_argument("--massive-8k-text-dir", type=Path)
-    data.add_argument("--skip-massive-validation", action="store_true")
+    data.add_argument(
+        "--skip-massive-validation",
+        action="store_true",
+        help=(
+            "Skip Massive auxiliary 8-K text fallback; live SEC primary-document "
+            "validation remains the default calendar route."
+        ),
+    )
     data.add_argument("--dte-min", type=int, default=5)
     data.add_argument("--dte-max", type=int, default=14)
     data.add_argument("--max-events", type=int)
     data.add_argument("--max-contracts", type=int)
     data.add_argument("--download-samples", action="store_true")
     data.add_argument("--dry-run", action="store_true")
+    data.add_argument(
+        "--refresh-bronze",
+        action="store_true",
+        help="Re-fetch bronze second-agg caches instead of reusing valid cached Parquet.",
+    )
     data.add_argument("--lookback-seconds", type=int, default=900)
     data.add_argument("--second-agg-buffer-minutes", type=int, default=60)
     data.add_argument("--universe-top-n", type=int, default=50)

@@ -7,6 +7,15 @@ premium-space expected edge, not raw variance edge.
 
 ## Protocol Defaults
 
+- Final proxy data-engineering entrypoint:
+  - The public command remains `just data` / `proxy-all`.
+  - `proxy-all` runs `options-day-aggs-bulk -> universe ->
+    dynamic-calendar -> pilot-panel -> trade-proxy-panel`.
+  - Study window defaults to 2013-01-01 through 2025-12-31.
+  - Universe construction downloads the trailing six-month lookback beginning
+    2012-07-01 for the January 2013 universe.
+  - `calendar-pilot` is a static ticker smoke/debug stage and is not part of the
+    default final proxy DAG.
 - Main event move is close-to-close:
   - AMC: `S_before = close_d`, `S_after = close_{d+1}`.
   - BMO: `S_before = close_{d-1}`, `S_after = close_d`.
@@ -68,14 +77,24 @@ premium-space expected edge, not raw variance edge.
   company metadata plus an options-chain reality check; missing or ambiguous
   mappings must be surfaced as manifest exclusions such as `ticker_not_found`,
   `ticker_mapping_ambiguous`, or `no_active_option_chain`, not guessed.
+- External academic crosswalks such as GVKEY-CIK link tables may be used only as
+  optional curated mapping inputs. They can connect SEC CIKs to Compustat-style
+  firm identifiers, but they do not replace point-in-time ticker or options
+  chain validation for the market-data route.
+- SEC EDGAR event discovery must normalize both `filings.recent` and archived
+  `filings.files` submission JSON. Archive fetch failures are diagnostics, not
+  hard failures for the whole universe ticker set, and accessions are deduped
+  across recent and archived payloads.
 
 ## V1 Boundaries
 
 - Massive is the v1 data route, subject to field audit.
 - Earnings calendar input must provide explicit BMO/AMC/DMH/UNKNOWN timing.
-  The active candidate route is SEC EDGAR 8-K Item 2.02 metadata plus Massive
-  8-K text validation; unresolved or ambiguous timing stays outside the main
-  sample.
+  The active candidate route is SEC EDGAR 8-K Item 2.02 metadata plus SEC
+  primary filing document text validation. Massive 8-K text may be used only as
+  auxiliary fallback when official SEC document text is unavailable or
+  inconclusive; it is not a required calendar dependency. Unresolved or
+  ambiguous timing stays outside the main sample.
 - No inferred timestamp fallback.
 - No calendar spread, intraday simulator, surface projection, GNN/GNO, or full
   deep-model training in this pass.

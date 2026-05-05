@@ -20,37 +20,51 @@ Active and current:
   --fix`, strict mypy, pytest, MkDocs strict, status, and Massive credential
   probes.
 - Test coverage floor: 93% on the active package. Current local test gate:
-  57 tests passed with 93.55% total coverage.
+  65 tests passed with 93.10% total coverage.
 - Data-audit gate: `just audit` for fixtures; `just audit date=YYYY-MM-DD` for
   a narrow Massive flat-file sample gate.
 - Data-engineering gate: `just data` for resumable stages. The current stages
-  are `fixture-audit`, `massive-probe`, `universe`, `calendar-pilot`,
-  `contracts`, `panel`, `pilot-panel`, `trade-proxy-panel`, and `proxy-all`;
-  outputs are skipped when present unless `--force` is passed through `args`.
+  are `fixture-audit`, `massive-probe`, `options-day-aggs-bulk`, `universe`,
+  `dynamic-calendar`, `calendar-pilot`, `contracts`, `panel`, `pilot-panel`,
+  `trade-proxy-panel`, and `proxy-all`;
+  outputs are skipped only when present and when their saved parameter signature
+  matches the requested run.
 - `just data` defaults to `proxy-all`, which runs
-  `calendar-pilot -> pilot-panel -> trade-proxy-panel` over the Phase 1
-  `2020-2025` range with a 10-event smoke cap, 4 workers, a 900-second pricing
-  lookback, a 60-minute resolved-close pre-cutoff buffer, and DTE `3-21`
-  contract discovery. Explicit stage names are still available for rebuilding
-  the calendar, pilot panel, fixture audit, and legacy fixture panel smoke
-  paths. It prints stage-level progress plus second-agg and exit day-agg
-  count/status updates during long runs.
+  `options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel ->
+  trade-proxy-panel` over the final proxy study range `2013-2025`; the universe
+  lookback begins at `2012-07-01`, with 4 workers by default, a 900-second
+  pricing lookback, a 60-minute resolved-close pre-cutoff buffer, monthly top
+  50 by trailing six-month option premium dollar volume, and DTE `3-21`
+  contract discovery. Use `args="--max-events 10"` for a downstream smoke run;
+  it does not shrink the universe/calendar build. `--force` rebuilds derived
+  outputs while reusing valid bronze caches; `--refresh-bronze` explicitly
+  re-fetches flat-file and second-aggregate bronze partitions. Explicit stage
+  names are still available for rebuilding the calendar, pilot panel, fixture
+  audit, and legacy fixture panel smoke paths. It prints stage-level progress
+  plus bulk day-agg, second-agg, and exit day-agg count/status updates during
+  long runs.
 - Data lake layout: Massive flat-file downloads are temporary transfer files.
   They are converted immediately into compressed Parquet under `data/bronze/`;
-  second-aggregate trade-proxy bars are cached under
+  full-market option/underlying day aggregates are cached under
+  `data/bronze/massive/options_day_aggs/` and
+  `data/bronze/massive/underlying_day_aggs/`; second-aggregate trade-proxy bars
+  are cached under
   `data/bronze/massive/options_second_aggs/` for entry/pre-cutoff diagnostics
   only; exit option prices come from exit-date `options_day_aggs` closes.
   Cached Parquet partitions are reused if readable with the expected schema;
-  corrupt second-agg or exit day-agg caches are repaired by deleting and
-  re-fetching the affected partition.
+  corrupt flat-file, second-agg, or exit day-agg caches are repaired by deleting
+  and re-fetching the affected partition.
   Cleaned intermediate tables go to `data/silver/`; analysis-ready panels go to
   `data/gold/`. `artifacts/` is reserved for manifests, readiness reports, and
   audit summaries.
-- Dynamic universe scaffolding now exists as `just data universe
-  args="--options-day-aggs PATH"`: it builds monthly ticker liquidity from
-  normalized option day aggregates and top-50 trailing six-month option premium
-  dollar-volume snapshots, with Phase 1 telemetry split into `covid_shock` and
-  `steady_proxy`.
+- Dynamic universe and calendar scaffolding now sit in the default proxy DAG.
+  `universe` builds monthly ticker liquidity from normalized option day
+  aggregates and top-50 trailing six-month option premium dollar-volume
+  snapshots; `dynamic-calendar` queries SEC EDGAR submissions plus official
+  SEC primary filing documents for the universe ticker union and filters events
+  by latest prior universe membership, writing `universe_month`,
+  `universe_rank`, `in_universe`, and `universe_filter_status`. Massive 8-K
+  text is optional auxiliary fallback, not a required calendar dependency.
 - First real Massive flat-file probe: `just audit date=2025-02-05` succeeded
   for option day aggregates, option quotes metadata, and underlying day
   aggregates. Outputs are in `artifacts/massive_flat_file_probe/`. The
@@ -64,15 +78,16 @@ Active and current:
   A later paper-grade route would need `options_quotes_v1` or another
   historical bid/ask/NBBO source plus IV/Greeks/OI or local IV from mids.
 - First earnings-source probe: `artifacts/earnings_calendar_source_probe/`
-  compares Nasdaq calendar rows, SEC EDGAR company submissions, and Massive
-  8-K text for AAPL, AMZN, MSFT, NVDA, and TSLA. SEC EDGAR submissions are the
-  most reliable primary candidate generator tested so far because they provide
-  official 8-K metadata, Item 2.02 tags, and SEC acceptance timestamps. Massive
-  8-K text is used as the text-validation layer. Nasdaq calendar rows are not
+  compares Nasdaq calendar rows, SEC EDGAR company submissions, SEC primary
+  filing documents, and Massive 8-K text for AAPL, AMZN, MSFT, NVDA, and TSLA.
+  SEC EDGAR is the primary candidate and validation route because it provides
+  official 8-K metadata, Item 2.02 tags, acceptance timestamps, and filing text.
+  Massive 8-K text remains auxiliary fallback. Nasdaq calendar rows are not
   reliable enough as the primary historical timing source in the current probe
   because the matched SEC-confirmed sample had zero known Nasdaq timing flags.
 - Earnings calendar builder: `build-earnings-calendar` now creates SEC-first
-  candidate tables and can validate accessions against Massive 8-K text. A live
+  candidate tables and validates accessions against SEC primary filing text by
+  default, with Massive 8-K text available only as fallback. A live
   AAPL/MSFT/TSLA sample for 2026-01-01 through 2026-04-30 wrote
   `artifacts/earnings_calendar_sample/`: 8 SEC Item 2.02 candidates and 5
   main-sample candidates after timing and text validation.
@@ -91,8 +106,9 @@ Not yet paper evidence:
   closes by default and record `option_exit_price_status` plus
   `used_intrinsic_fallback` when intrinsic payoff is needed. This is useful for
   screening, not paper-grade execution claims.
-- No paper-grade Massive `options_quotes_v1` ingestion or final top-50 earnings
-  panel has been implemented yet.
+- No paper-grade Massive `options_quotes_v1` ingestion has been implemented.
+  The final top-50 proxy pipeline is implemented, but the full 2013-2025 data
+  lake and paper-facing result tables/figures have not yet been produced.
 - The active implementation is still deterministic/pilot plumbing: event
   alignment, variance extraction, leakage checks, data audit, contract
   discovery, local-IV diagnostics, and backtest smoke paths. It is not yet a
@@ -112,11 +128,11 @@ Not yet paper evidence:
 
 Latest local pilot-panel run:
 
-- Command: `just data pilot-panel args="--force --max-events 10"`.
+- Command: `just data args="--force --max-events 50 --jobs 4"`.
 - Gold panel: `data/gold/event_panel/pilot_event_panel.parquet`.
-- Rows: 10 events, all AMC in the current local pilot slice.
-- RVAR/IVAR coverage: 10/10 events with RVAR and 10/10 with provisional IVAR.
-- Contract candidates: 180 selected near-ATM contracts; 180 local IV estimates
+- Rows: 50 events in the current local calibration slice.
+- RVAR/IVAR coverage: 50/50 events with RVAR and 44/50 with provisional IVAR.
+- Contract candidates: 1146 selected near-ATM contracts; 1146 local IV estimates
   solved.
 - Limitation: every row is `panel_grade = provisional_no_nbbo`; this is an
   engineering panel, not empirical evidence for the paper.
@@ -124,17 +140,17 @@ Latest local pilot-panel run:
 Latest local trade-proxy run:
 
 - Command:
-  `just data args="--force --max-events 10 --jobs 4"`.
+  `just data args="--force --max-events 50 --jobs 4"`.
 - Gold panel: `data/gold/event_panel/trade_proxy_event_panel.parquet`.
-- Rows: 10 events.
-- Contract proxy prices: 239/240 contracts had pre-cutoff second-aggregate
-  prices and local IV estimates; 1 contract had
+- Rows: 50 events.
+- Contract proxy prices: 1125/1146 contracts had pre-cutoff second-aggregate
+  prices and local IV estimates; 21 contracts had
   `no_trade_in_cutoff_window`.
-- Trade-proxy IVAR coverage: 10/10 events.
-- Gross proxy straddle diagnostics: 10 rows. Mean gross proxy PnL is about
-  `-268.61` USD and mean haircut PnL is about `-370.37` USD in this tiny
+- Trade-proxy IVAR coverage: 44/50 events.
+- Gross proxy straddle diagnostics: 44 rows. Mean gross proxy PnL is about
+  `-117.93` USD and mean haircut PnL is about `-234.17` USD in this
   screening slice.
-- Bronze second-agg cache: 240 contract partitions written under
+- Bronze second-agg cache: 1146 contract partitions written under
   `data/bronze/massive/options_second_aggs/`.
 - Limitation: every row is `panel_grade = no_nbbo_trade_proxy`; this is a
   screening panel based on trade-price OHLCV bars, not a bid/ask executable
@@ -154,16 +170,19 @@ The current rule is:
 
 ## Next Gate
 
-The next implementation gate is larger trade-proxy calibration, not quote/NBBO
-ingestion. The recommended sequence is:
+The next implementation gate is the uncapped 2013-2025 dynamic top-50 proxy
+pass, not quote/NBBO ingestion. The recommended sequence is:
 
-1. Run `just data args="--force --max-events 50 --jobs 4"` and inspect
-   `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` for
-   coverage, repair status, fallback usage, stale contracts, and IVAR failures.
-2. If coverage is healthy, run `just data args="--force --max-events 200 --jobs
-   4"` to estimate Phase 1 storage/API/coverage telemetry.
-3. Use that telemetry to decide whether the full 2020-2025 Phase 1 proxy lake
-   stays on WSL ext4 or moves `DATA_DIR` to a larger NVMe/external path.
+1. Run bare `just data` and inspect
+   `artifacts/data_pipeline/options_day_aggs_bulk/options_day_aggs_bulk_manifest.json`,
+   `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json`,
+   and `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json`
+   for coverage, repair status, fallback usage, stale contracts, and IVAR
+   failures.
+2. Use `just data args="--max-events 10"` only when a smoke run is desired.
+3. Use `just data args="--dry-run"` before the full fetch, then use real run
+   telemetry to decide whether the full 2013-2025 proxy lake stays on WSL ext4
+   or moves `DATA_DIR` to a larger NVMe/external path.
 4. Only after the proxy lake is stable, build the feature matrix and model
    baselines. Paper-grade quote/NBBO ingestion remains a later route, not a
    current dependency for the proxy data-engineering pass.

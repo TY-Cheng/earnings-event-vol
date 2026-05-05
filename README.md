@@ -62,7 +62,8 @@ Implemented now:
   backtest smoke.
 - Integrity guards for timezone-aware event timestamps, IVAR expiry coverage,
   explicit model implementation claims, and fail-closed audit outputs.
-- SEC-first earnings-candidate builder with optional Massive 8-K text validation.
+- SEC-first earnings-candidate builder with SEC primary-document text validation
+  and optional Massive 8-K text fallback.
 - Contract discovery that excludes non-standard OCC deliverables before option
   proxy-price pooling.
 - Event-panel diagnostics for PCP-vs-spot forward source, ATM selection method,
@@ -76,7 +77,7 @@ Implemented now:
 Not yet implemented:
 
 - Paper-grade historical bid/ask or NBBO ingestion.
-- Full top-50 proxy event panel construction with coverage/fallback diagnostics.
+- Downloaded full 2013-2025 top-50 proxy panel results and coverage tables.
 - Production model training for LightGBM, FT-Transformer, and Mamba.
 - Paper-grade empirical results.
 
@@ -118,33 +119,41 @@ availability/size only; it is not part of the current proxy pipeline.
 
 `just data` is the resumable data-engineering entrypoint. By default it runs the
 V1.5 Massive second-aggregate proxy route end to end:
-`calendar-pilot -> pilot-panel -> trade-proxy-panel`. The default smoke scope is
-`--start 2020-01-01`, `--end 2025-12-31`, `--max-events 10`, `--jobs 4`,
-`--lookback-seconds 900`, `--second-agg-buffer-minutes 60`,
-`--price-field option_vwap`, and DTE `3-21` so one contract-discovery pass can
-support the main `5-14` sample and the robustness window. Existing outputs are
-skipped unless `--force` is passed through `args`. Use `--dry-run` to print the
+`options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel ->
+trade-proxy-panel`. The default scope is the final proxy data-engineering pass:
+study dates `2013-01-01` through `2025-12-31`, automatic universe lookback from
+`2012-07-01`, monthly top-50 liquid U.S. single-name option stocks, trailing
+six-month option premium dollar volume, `--jobs 4`, `--lookback-seconds 900`,
+`--second-agg-buffer-minutes 60`, `--price-field option_vwap`, and DTE `3-21`
+so one contract-discovery pass can support the main `5-14` sample and the
+robustness window. Use `args="--max-events 10"` for a downstream smoke run; it
+does not shrink the universe/calendar build. Existing outputs are skipped only
+when the saved parameter signature matches the requested run; parameter changes
+trigger a rebuild. `--force` rebuilds derived silver/gold outputs while still
+reusing valid bronze caches, and `--refresh-bronze` explicitly re-fetches
+flat-file and second-aggregate bronze partitions. Use `--dry-run` to print the
 storage/API/exclusion estimate without writing data outputs. The explicit stage
-names remain available for rebuilding or resuming individual steps. Long-running
-stages print start/end progress, second-aggregate counts, and exit day-agg
-download/cache statuses. Cached Parquet files are reused when readable with the
-expected schema; corrupt second-agg or exit day-agg caches are repaired by
-deleting and re-fetching the affected partition.
+names remain available for rebuilding or resuming individual steps.
+Long-running stages print start/end progress, second-aggregate counts, and exit
+day-agg download/cache statuses. Cached Parquet files are reused when readable
+with the expected schema; corrupt flat-file, second-agg, or exit day-agg caches
+are repaired by deleting and re-fetching the affected partition.
 
-The dynamic-universe stage is available behind the same command surface:
-`just data universe args="--options-day-aggs PATH"`. It builds
-`ticker_month_liquidity.parquet` from normalized option day aggregates and then
-monthly top-50 snapshots using trailing six-month option premium dollar volume
-with a VWAP-first, close-fallback rule.
+`calendar-pilot` remains available as a static ticker smoke/debug stage. The
+final route uses `dynamic-calendar`, which reads the monthly top-50 universe,
+queries SEC EDGAR submissions and official SEC primary filing documents for the
+ticker union, and keeps only events that belong to the latest prior universe
+snapshot. Massive 8-K text is auxiliary fallback only when official filing text
+is missing or inconclusive.
 
 The market-data path is lake-first. Massive `.csv.gz` downloads are temporary
 transfer files; they are converted immediately to compressed Parquet and then
 removed. The working layout is:
 
 - `data/bronze/`: source-preserving Massive tables partitioned by date,
-  including cached option second aggregates used only for entry pricing and
-  pre-cutoff feature/liquidity diagnostics. Post-cutoff second-aggregate bars
-  are not retained.
+  including full-market option/underlying day aggregates and cached option
+  second aggregates used only for entry pricing and pre-cutoff feature/liquidity
+  diagnostics. Post-cutoff second-aggregate bars are not retained.
 - `data/silver/`: cleaned calendar, event-window, contract, and IVAR input
   tables.
 - `data/gold/`: analysis-ready event panels and later feature/model inputs.
@@ -157,8 +166,10 @@ for tiny fixtures and small in-memory orchestration.
 just data
 just data args="--dry-run"
 just data args="--force"
+just data options-day-aggs-bulk args="--start 2013-01-01 --end 2025-12-31 --jobs 8"
 just data massive-probe args="--dates 2025-02-05 2025-02-06 --jobs 2"
 just data universe args="--options-day-aggs data/bronze/massive/options_day_aggs"
+just data dynamic-calendar args="--force"
 just data calendar-pilot args="--force --start 2025-01-01 --end 2025-12-31"
 just data pilot-panel args="--max-events 3 --force"
 just data trade-proxy-panel args="--max-events 3 --jobs 2 --force"
@@ -176,7 +187,9 @@ Primary first-version source:
 - Massive flat files and APIs for U.S. options and underlying equity data.
 - SEC EDGAR company submissions for official historical 8-K Item 2.02 event
   candidates and acceptance timestamps.
-- Massive 8-K text for parsed filing-text validation.
+- SEC EDGAR primary filing documents for parsed Item 2.02 text validation.
+- Massive 8-K text only as optional auxiliary fallback for text validation when
+  official SEC document text is unavailable or inconclusive.
 
 Research design data requirements:
 
@@ -192,6 +205,9 @@ Research design data requirements:
   implemented in the current data route.
 - Contract metadata with multiplier, contract size, deliverable status, and
   corporate-action flags so non-standard OCC contracts can be excluded.
+- Optional curated crosswalks such as GVKEY-CIK link tables may connect SEC CIKs
+  to Compustat-style firm identifiers, but they are not used as the primary
+  point-in-time ticker or option-chain mapping source.
 - Earnings event calendar with announcement date, accession/source id,
   source timestamp, text-validation status, and BMO/AMC/DMH/unknown timing.
 - Market controls such as SPY returns, VIX, sector ETF returns, rates, dividends,
@@ -211,7 +227,9 @@ PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli build-ear
 ```
 
 This writes `earnings_calendar_candidates.csv` and `earnings_calendar_report.json`.
-The output is an auditable candidate table, not yet the final paper panel.
+The live route fetches SEC submissions plus SEC primary filing documents; Massive
+8-K text is queried only as auxiliary fallback. The output is an auditable
+candidate table, not yet the final paper panel.
 
 First paper universe:
 
