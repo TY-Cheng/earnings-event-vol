@@ -65,11 +65,9 @@ extra_javascript:
   - assets/javascripts/mermaid-init.js
 nav:
   - Home: index.md
-  - Research Overview: research_overview.md
-  - V1 Spec: spec.md
   - Results Snapshot: results_snapshot.md
   - Paper Plan: paper_plan.md
-  - Audit Briefs:
+  - Audit Prompts:
       - Development Audit: development_audit_prompt.md
       - Manuscript Audit: manuscript_audit_prompt.md
   - Future Work: future_work.md

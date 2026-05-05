@@ -215,13 +215,14 @@ Credential policy:
 
 ## Documentation
 
-- [Paper Plan](https://ty-cheng.github.io/earnings-event-vol/paper_plan/):
-  binding research design, target definition, features, model order, and
-  backtest gates.
-- [Research Overview](https://ty-cheng.github.io/earnings-event-vol/research_overview/):
-  plain-language overview of the data, models, metrics, and current readiness.
+- [Home](https://ty-cheng.github.io/earnings-event-vol/): project object,
+  current status, local workflow, data route, and claim boundaries.
 - [Results Snapshot](https://ty-cheng.github.io/earnings-event-vol/results_snapshot/):
   current implementation state and readiness boundaries.
+- [Paper Plan](https://ty-cheng.github.io/earnings-event-vol/paper_plan/):
+  research design, related literature, target definition, features, model order,
+  and backtest gates. The repo-level `SPEC.md` remains the implementation
+  contract, but it is not a separate reader-facing navigation entry.
 - [Future Work](https://ty-cheng.github.io/earnings-event-vol/future_work/):
   deferred extensions beyond the first paper.
 - [Development Audit](https://ty-cheng.github.io/earnings-event-vol/development_audit_prompt/):

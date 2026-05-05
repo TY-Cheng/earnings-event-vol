@@ -50,7 +50,18 @@ def test_docs_front_door_matches_project() -> None:
     assert mkdocs["site_name"] == "Earnings Event Vol"
     assert mkdocs["repo_name"] == "TY-Cheng/earnings-event-vol"
     assert home.strip().endswith('--8<-- "README.md:docs-home"')
-    assert "hide:" in home
+    assert mkdocs["nav"] == [
+        {"Home": "index.md"},
+        {"Results Snapshot": "results_snapshot.md"},
+        {"Paper Plan": "paper_plan.md"},
+        {
+            "Audit Prompts": [
+                {"Development Audit": "development_audit_prompt.md"},
+                {"Manuscript Audit": "manuscript_audit_prompt.md"},
+            ]
+        },
+        {"Future Work": "future_work.md"},
+    ]
 
 
 def test_config_loads_project_identity(monkeypatch: pytest.MonkeyPatch) -> None:
