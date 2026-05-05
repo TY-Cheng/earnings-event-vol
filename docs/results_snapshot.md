@@ -101,10 +101,15 @@ Latest local pilot-panel run:
 Latest local trade-proxy run:
 
 - Command:
-  `just data trade-proxy-panel args="--force --max-events 1 --max-contracts 20 --jobs 4 --lookback-seconds 900"`.
+  `just data trade-proxy-panel args="--force --max-events 20 --max-contracts 180 --jobs 8 --lookback-seconds 900"`.
 - Gold panel: `data/gold/event_panel/trade_proxy_event_panel.parquet`.
-- Rows: 1 AMC event, with `trade_proxy_ivar_event` successfully extracted.
-- Contract proxy prices: 18/18 contracts had pre-cutoff second-aggregate prices.
+- Rows: 10 events.
+- Contract proxy prices: 180/180 contracts had pre-cutoff second-aggregate prices
+  and local IV estimates.
+- Trade-proxy IVAR coverage: 10/10 events.
+- Gross proxy straddle diagnostics: 10 rows. Mean gross proxy PnL is about
+  `-577.44` USD and mean haircut PnL is about `-720.62` USD in this tiny
+  screening slice.
 - Limitation: every row is `panel_grade = no_nbbo_trade_proxy`; this is a
   screening panel based on trade-price OHLCV bars, not a bid/ask executable
   strategy result.

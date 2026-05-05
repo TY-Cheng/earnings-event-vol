@@ -1892,12 +1892,18 @@ def test_trade_proxy_ivar_and_gross_straddle_diagnostics_are_no_nbbo() -> None:
     ivar_inputs = build_trade_proxy_ivar_inputs(iv_estimates, windows)
     panel = extract_trade_proxy_event_panel(ivar_inputs, windows)
     straddles = build_proxy_straddle_diagnostics(iv_estimates, windows)
+    empty_input_panel = extract_trade_proxy_event_panel(
+        build_trade_proxy_ivar_inputs(pd.DataFrame(), windows),
+        windows,
+    )
 
     assert proxy_prices["panel_grade"].eq(TRADE_PROXY_PANEL_GRADE).all()
     assert ivar_inputs["atm_selection_method"].eq("trade_proxy_call_put_average").all()
     assert panel["panel_grade"].iloc[0] == TRADE_PROXY_PANEL_GRADE
     assert panel["ivar_failure_reason"].iloc[0] is None
     assert panel["trade_proxy_ivar_event"].iloc[0] > 0
+    assert empty_input_panel["trade_proxy_ivar_event"].isna().all()
+    assert empty_input_panel["ivar_failure_reason"].iloc[0] == "no_two_event_covering_expiries"
     assert straddles["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(-380.0)
     assert straddles["haircut_pnl_usd"].iloc[0] < straddles["gross_proxy_pnl_usd"].iloc[0]
 

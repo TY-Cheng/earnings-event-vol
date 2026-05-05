@@ -390,6 +390,11 @@ def extract_trade_proxy_event_panel(
     for event in windows.to_dict("records"):
         event_id = event["event_id"]
         group = input_by_event.get(event_id, pd.DataFrame())
+        group_records = (
+            []
+            if group.empty or "expiration" not in group.columns
+            else group.sort_values("expiration").to_dict("records")
+        )
         points = [
             TotalVariancePoint(
                 expiration=_to_date(row["expiration"]),
@@ -397,7 +402,7 @@ def extract_trade_proxy_event_panel(
                 dte_days=int(row["dte_days"]),
                 moneyness=float(row["moneyness"]) if pd.notna(row["moneyness"]) else None,
             )
-            for row in group.sort_values("expiration").to_dict("records")
+            for row in group_records
         ]
         extraction = extract_implied_event_variance(
             points,
