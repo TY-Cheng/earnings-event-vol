@@ -66,6 +66,20 @@ premium-space expected edge, not raw variance edge.
   - Report gross proxy PnL and haircut PnL only as screening diagnostics.
   - Do not use this route for full-spread crossing or paper-grade execution
     claims.
+- Optional SPY/QQQ market-state controls use the same proxy discipline:
+  - `market-second-covariates` fetches SPY and QQQ option one-second aggregates
+    plus SPY/QQQ underlying one-second aggregates at the event entry cutoff.
+  - It produces event-level ATM IV, term slope, skew, butterfly,
+    straddle-premium-to-spot, option activity, and underlying pre-cutoff return
+    proxies.
+  - These features are trade OHLCV aggregates, not bid/ask, quote, or NBBO
+    surfaces.
+- The 20-day Mamba path is daily-frequency. Each timestep is one allowed
+  pre-entry trading day with close-trade-implied single-name option-surface
+  summaries, SPY/QQQ daily surface summaries when available, market ETF returns,
+  and daily VIX state. One-second data enter the current research package as
+  event-entry covariates and entry proxy prices, not as a full intraday sequence
+  model.
 - ATMF forward selection can use put-call parity only as a short-DTE,
   no-dividend, near-ATM approximation for American single-name options. Weak or
   dividend-contaminated pairs fall back to nearest-spot ATM and record
@@ -95,6 +109,38 @@ premium-space expected edge, not raw variance edge.
   `filings.files` submission JSON. Archive fetch failures are diagnostics, not
   hard failures for the whole universe ticker set, and accessions are deduped
   across recent and archived payloads.
+
+## Market Covariate Alignment
+
+VIX is a daily market-state covariate and regime control, not execution data.
+The default source route is the public FRED graph CSV:
+`https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS`. The raw copy is
+cached as `data/bronze/market_covariates/fred_vixcls.csv`; normalized fields are
+written to `data/silver/market_covariates/daily_market_covariates.parquet` with
+`source_dataset`, `source_url`, `source_snapshot_date`, and `schema_version`.
+
+The headline alignment is `vix_alignment = prior_close_default`.
+`feature_asof_date` is the trading date whose close marks the event entry
+timestamp: BMO maps to the trading day immediately before the announcement,
+while AMC maps to the announcement trading date. Headline VIX lookup requires
+`vix_date < feature_asof_date` for both BMO and AMC, with
+`max_vix_lag_days = 5`. Same-day VIX may be allowed only in the
+`same_day_close_for_amc` robustness specification, where AMC permits
+`vix_date <= feature_asof_date` and BMO remains strict prior-close.
+
+VIX feature construction resolves `resolved_vix_date` first. Changes use valid
+VIX observations rather than calendar-day offsets:
+
+```text
+vix_change_1d = VIX(resolved_vix_date) - VIX(previous valid VIX date)
+vix_change_5d = VIX(resolved_vix_date) - VIX(5th previous valid VIX observation)
+```
+
+`vix_percentile_252d` and `vix_regime_tercile` use only valid observations with
+`vix_date < resolved_vix_date`; the resolved date itself is excluded from the
+rolling cutpoint history. Regime construction requires at least 40 prior valid
+observations. `vix_above_30` may use the resolved VIX value directly because it
+does not estimate a rolling cutpoint.
 
 ## V1 Boundaries
 

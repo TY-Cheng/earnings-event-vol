@@ -26,7 +26,7 @@ bid/ask or NBBO quotes.
 
 ## Data and Backtest Setup
 
-The current proxy route uses three market-data inputs:
+The current proxy route uses three required market-data inputs:
 
 - **Options day aggregates** for dynamic-universe liquidity ranking, contract
   discovery, local IV/IVAR proxy inputs, same-contract option exit closes, and
@@ -41,6 +41,13 @@ The current proxy route uses three market-data inputs:
 
 The one-second aggregates are trade OHLCV bars. They are not quote midpoints,
 bid/ask records, or NBBO.
+
+Optional market-state controls can be added with `just data
+market-second-covariates`: SPY/QQQ option one-second aggregates and SPY/QQQ
+underlying one-second aggregates at the event entry cutoff. Those controls add
+entry-as-of ATM IV proxy, term slope, skew, butterfly, straddle premium over
+spot, option activity, and underlying pre-cutoff return. They follow the same
+`no_nbbo_trade_proxy` caveat.
 
 The underlying universe is dynamic rather than a fixed ticker list:
 
@@ -108,7 +115,8 @@ event-covering expiries, followed by smaller term-structure extraction failures.
 The feature matrix has 810 rows. The current chronological proxy split trains on
 567 rows, validates on 121 rows, and tests on 122 rows for tabular models. Mamba
 uses the sequence-eligible subset: 475 train rows, 103 validation rows, and 100
-test rows.
+test rows. The Mamba sequence is daily-frequency: each row contributes one
+20-trading-day path, not thousands of second-level observations.
 
 Selected forecast metrics:
 

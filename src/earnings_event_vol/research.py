@@ -18,6 +18,11 @@ from scipy.optimize import brentq
 from earnings_event_vol.backtest import black_scholes_price, build_proxy_strategy_frame
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.features import build_model_feature_matrix
+from earnings_event_vol.market_covariates import (
+    VIX_ALIGNMENT_PRIOR_CLOSE,
+    build_vix_features,
+)
+from earnings_event_vol.market_index_proxy import MARKET_INDEX_DAILY_SURFACE_FEATURES
 from earnings_event_vol.massive import parse_massive_option_ticker
 from earnings_event_vol.metrics import (
     breakdown_metrics,
@@ -45,7 +50,7 @@ DEFAULT_CONTRACTS = 1.0
 LOOKBACK_DAYS = 20
 MAMBA_MIN_VALID_DAYS = 12
 MAMBA_LATEST_DAYS = 5
-SEQUENCE_FEATURE_NAMES = [
+BASE_OPTION_SURFACE_FEATURE_NAMES = [
     "atm_iv_proxy",
     "iv_skew_proxy",
     "iv_butterfly_proxy",
@@ -58,9 +63,22 @@ SEQUENCE_FEATURE_NAMES = [
     "option_transactions_sum",
     "underlying_return_1d",
     "rv5",
+]
+MARKET_INDEX_DAILY_SEQUENCE_FEATURE_NAMES = [
+    f"{symbol.lower()}_{feature}"
+    for symbol in ("SPY", "QQQ")
+    for feature in MARKET_INDEX_DAILY_SURFACE_FEATURES
+]
+SEQUENCE_FEATURE_NAMES = [
+    *BASE_OPTION_SURFACE_FEATURE_NAMES,
     "spy_return_1d",
+    "qqq_return_1d",
+    *MARKET_INDEX_DAILY_SEQUENCE_FEATURE_NAMES,
     "vix_level",
     "vix_change_1d",
+    "vix_change_5d",
+    "vix_percentile_252d",
+    "vix_above_30",
 ]
 MODEL_IDS = [
     "market_implied_event_variance",
@@ -361,7 +379,13 @@ def _daily_underlying_features(underlying: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"underlying_return_1d": "spy_return_1d"})
         .drop_duplicates("source_date")
     )
+    qqq = (
+        out.loc[out["ticker"].eq("QQQ"), ["source_date", "underlying_return_1d"]]
+        .rename(columns={"underlying_return_1d": "qqq_return_1d"})
+        .drop_duplicates("source_date")
+    )
     out = out.merge(spy, on="source_date", how="left")
+    out = out.merge(qqq, on="source_date", how="left")
     return out
 
 
@@ -383,7 +407,7 @@ def _compute_daily_surface(
     if options.empty or not np.isfinite(spot) or spot <= 0:
         return {
             **base,
-            **{feature: np.nan for feature in SEQUENCE_FEATURE_NAMES},
+            **{feature: np.nan for feature in BASE_OPTION_SURFACE_FEATURE_NAMES},
             "is_valid_sequence_day": False,
         }
     frame = options.loc[
@@ -393,7 +417,7 @@ def _compute_daily_surface(
     if frame.empty:
         return {
             **base,
-            **{feature: np.nan for feature in SEQUENCE_FEATURE_NAMES},
+            **{feature: np.nan for feature in BASE_OPTION_SURFACE_FEATURE_NAMES},
             "option_volume_sum": 0.0,
             "option_transactions_sum": 0.0,
             "valid_pair_count": 0,
@@ -425,7 +449,7 @@ def _compute_daily_surface(
     if selected.empty or valid_pair_count == 0:
         return {
             **base,
-            **{feature: np.nan for feature in SEQUENCE_FEATURE_NAMES},
+            **{feature: np.nan for feature in BASE_OPTION_SURFACE_FEATURE_NAMES},
             "option_volume_sum": float(frame["option_volume"].sum()),
             "option_transactions_sum": float(frame["option_transactions"].sum()),
             "valid_pair_count": valid_pair_count,
@@ -504,6 +528,36 @@ def _read_parquet_if_exists(path: Path, columns: Sequence[str] | None = None) ->
     return pd.read_parquet(path, columns=list(columns) if columns else None)
 
 
+def _read_market_covariates(config: ProjectConfig) -> pd.DataFrame:
+    path = config.silver_data_dir / "market_covariates" / "daily_market_covariates.parquet"
+    if not path.exists() or path.stat().st_size <= 0:
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def _read_market_second_covariates(config: ProjectConfig) -> pd.DataFrame:
+    path = config.silver_data_dir / "market_covariates" / "market_second_covariates.parquet"
+    if not path.exists() or path.stat().st_size <= 0:
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def _vix_columns_for_merge() -> list[str]:
+    return [
+        "resolved_vix_date",
+        "vix_lag_days",
+        "vix_level",
+        "vix_change_1d",
+        "vix_change_5d",
+        "vix_percentile_252d",
+        "vix_regime_tercile",
+        "vix_above_30",
+        "vix_available",
+        "vix_alignment",
+        "max_vix_lag_days",
+    ]
+
+
 def _scan_filtered_parquet(
     path: Path,
     *,
@@ -519,6 +573,50 @@ def _scan_filtered_parquet(
         .collect()
         .to_pandas()
     )
+
+
+def _scan_market_index_options(
+    path: Path,
+    *,
+    symbols: Sequence[str],
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    if not path.exists() or not symbols:
+        return pd.DataFrame(columns=list(columns))
+    pattern = r"^O:(" + "|".join(re.escape(symbol) for symbol in symbols) + r")\d{6}[CP]\d{8}$"
+    return (
+        pl.scan_parquet(path, cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
+        .filter(pl.col("ticker").str.contains(pattern))
+        .select(list(columns))
+        .collect()
+        .to_pandas()
+    )
+
+
+def _market_index_daily_surface_rows(
+    raw_options: pd.DataFrame,
+    *,
+    source_date: date,
+    spots: Mapping[str, float],
+) -> dict[str, dict[str, object]]:
+    if raw_options.empty:
+        return {}
+    parsed = _parse_filtered_options(raw_options, source_date=source_date)
+    out: dict[str, dict[str, object]] = {}
+    for symbol in ("SPY", "QQQ"):
+        spot = spots.get(symbol, np.nan)
+        surface = _compute_daily_surface(
+            parsed,
+            ticker=symbol,
+            source_date=source_date,
+            spot=float(spot) if spot is not None and pd.notna(spot) else np.nan,
+            event_entry_date=source_date,
+        )
+        prefixed: dict[str, object] = {}
+        for feature in MARKET_INDEX_DAILY_SURFACE_FEATURES:
+            prefixed[f"{symbol.lower()}_{feature}"] = surface.get(feature, np.nan)
+        out[symbol] = prefixed
+    return out
 
 
 def _load_sequence_contract_candidates(
@@ -577,7 +675,7 @@ def build_option_surface_sequence_long(
         day_events = by_event_date.loc[by_event_date["source_date"].eq(source_date)]
         underlying = _scan_filtered_parquet(
             underlying_root / f"date={source_date.isoformat()}" / "part.parquet",
-            ticker_values=needed_tickers + ["SPY"],
+            ticker_values=needed_tickers + ["SPY", "QQQ"],
             columns=["ticker", "close", "source_date", "volume", "transactions"],
         )
         if not underlying.empty:
@@ -606,6 +704,20 @@ def build_option_surface_sequence_long(
             options_root / f"date={source_date.isoformat()}" / "part.parquet",
             ticker_values=needed_options,
             columns=["ticker", "close", "volume", "transactions"],
+        )
+        market_index_raw_options = _scan_market_index_options(
+            options_root / f"date={source_date.isoformat()}" / "part.parquet",
+            symbols=["SPY", "QQQ"],
+            columns=["ticker", "close", "volume", "transactions"],
+        )
+        market_index_surfaces = _market_index_daily_surface_rows(
+            market_index_raw_options,
+            source_date=source_date,
+            spots={
+                symbol: float(spot_by_ticker.get(symbol, np.nan))
+                for symbol in ("SPY", "QQQ")
+                if spot_by_ticker.get(symbol) is not None
+            },
         )
         if not raw_options.empty and not day_candidates.empty:
             options = day_candidates.merge(
@@ -644,6 +756,8 @@ def build_option_surface_sequence_long(
                 event_entry_date=cast(date, record["entry_date"]),
             )
             row["event_id"] = event_id
+            for surface in market_index_surfaces.values():
+                row.update(surface)
             surface_rows.append(row)
     surface = pd.DataFrame(surface_rows)
     underlying_features = (
@@ -657,18 +771,41 @@ def build_option_surface_sequence_long(
                 "underlying_return_1d",
                 "rv5",
                 "spy_return_1d",
+                "qqq_return_1d",
             ]
         )
     )
     long_rows = plan.merge(surface, on=["event_id", "ticker", "source_date"], how="left")
     long_rows = long_rows.merge(
         underlying_features[
-            ["ticker", "source_date", "close", "underlying_return_1d", "rv5", "spy_return_1d"]
+            [
+                "ticker",
+                "source_date",
+                "close",
+                "underlying_return_1d",
+                "rv5",
+                "spy_return_1d",
+                "qqq_return_1d",
+            ]
         ].rename(columns={"close": "underlying_close"}),
         on=["ticker", "source_date"],
         how="left",
     )
-    for column in ("vix_level", "vix_change_1d"):
+    market_covariates = _read_market_covariates(config)
+    if not market_covariates.empty:
+        vix_lookup = (
+            long_rows.reset_index(names="_vix_row_id")[["_vix_row_id", "source_date"]]
+            .rename(columns={"source_date": "feature_asof_date"})
+            .copy()
+        )
+        vix_features = build_vix_features(
+            market_covariates,
+            vix_lookup,
+            alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
+        ).set_index("_vix_row_id")
+        for column in _vix_columns_for_merge():
+            long_rows[column] = vix_features[column].reindex(range(len(long_rows))).to_numpy()
+    for column in _vix_columns_for_merge():
         if column not in long_rows.columns:
             long_rows[column] = np.nan
     long_rows["is_valid_sequence_day"] = (
@@ -684,6 +821,13 @@ def build_option_surface_sequence_long(
     long_rows = long_rows.sort_values(["event_id", "seq_index"]).reset_index(drop=True)
     by_event = sequence_coverage_by_event(long_rows, total_sequence_days=lookback_days)
     report = sequence_coverage_report(by_event, total_events=events["event_id"].nunique())
+    report["vix_available"] = bool(
+        "vix_available" in long_rows and long_rows["vix_available"].fillna(False).astype(bool).any()
+    )
+    report["vix_regime_unavailable"] = not bool(
+        "vix_regime_tercile" in long_rows and long_rows["vix_regime_tercile"].notna().any()
+    )
+    report["vix_alignment"] = VIX_ALIGNMENT_PRIOR_CLOSE
     return long_rows, by_event, report
 
 
@@ -2034,8 +2178,9 @@ def write_proxy_research_report(
             "event-level features; GBDT models also receive sequence aggregates."
         ),
         (
-            "- Sequence model: proxy-Mamba uses a 20 x 15 tensor with time and feature "
-            "masks; mask-only Mamba is the missingness ablation."
+            f"- Sequence model: proxy-Mamba uses a 20 x {len(SEQUENCE_FEATURE_NAMES)} "
+            "tensor with time and feature masks; mask-only Mamba is the missingness "
+            "ablation."
         ),
         (
             "- proxy-Mamba loss: q=0.5 quantile loss on "
@@ -2384,6 +2529,36 @@ def run_research_features(
         split_design=split_design,
         split_date=split_date,
     )
+    market_covariates = _read_market_covariates(config)
+    if not market_covariates.empty and "entry_date" in features.columns:
+        vix_input_columns = ["event_id", "entry_date"]
+        if "announcement_timing" in features.columns:
+            vix_input_columns.append("announcement_timing")
+        vix_input = features[vix_input_columns].rename(columns={"entry_date": "feature_asof_date"})
+        vix_features = build_vix_features(
+            market_covariates,
+            vix_input,
+            alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
+        )
+        merge_columns = ["event_id", *_vix_columns_for_merge()]
+        features = features.drop(
+            columns=[column for column in _vix_columns_for_merge() if column in features.columns]
+        ).merge(vix_features[merge_columns], on="event_id", how="left")
+    market_second = _read_market_second_covariates(config)
+    market_second_columns = 0
+    if not market_second.empty and "event_id" in market_second.columns:
+        keep = [
+            column
+            for column in market_second.columns
+            if column == "event_id"
+            or column.startswith("spy_second_")
+            or column.startswith("qqq_second_")
+            or column.startswith("market_second_")
+        ]
+        market_second_columns = len(keep) - 1
+        features = features.drop(
+            columns=[column for column in keep if column != "event_id" and column in features]
+        ).merge(market_second[keep].drop_duplicates("event_id"), on="event_id", how="left")
     if "universe_rank" in features.columns:
         rank = pd.to_numeric(features["universe_rank"], errors="coerce")
         features["liquidity_bucket"] = pd.qcut(
@@ -2413,7 +2588,12 @@ def run_research_features(
                 paths.modeling_artifacts_dir / "sequence_coverage_report.json"
             ),
         },
-        diagnostics={**report, "tensor": tensor_report, "feature_rows": int(len(features))},
+        diagnostics={
+            **report,
+            "tensor": tensor_report,
+            "feature_rows": int(len(features)),
+            "market_second_covariate_columns": int(market_second_columns),
+        },
     )
 
 

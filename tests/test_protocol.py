@@ -88,6 +88,23 @@ from earnings_event_vol.features import (
     universe_by_trailing_option_dollar_volume,
 )
 from earnings_event_vol.leakage_audit import audit_feature_leakage, make_feature_timestamps
+from earnings_event_vol.market_covariates import (
+    FRED_VIXCLS_URL,
+    VIX_ALIGNMENT_PRIOR_CLOSE,
+    VIX_ALIGNMENT_SAME_DAY_AMC,
+    build_vix_features,
+    normalize_fred_vixcls_csv,
+)
+from earnings_event_vol.market_index_proxy import (
+    _implied_volatility as market_index_implied_volatility,
+)
+from earnings_event_vol.market_index_proxy import (
+    market_index_surface_features,
+    normalize_underlying_second_aggregates,
+    prefix_market_index_features,
+    select_market_index_option_candidates,
+    select_underlying_second_features,
+)
 from earnings_event_vol.massive import (
     MassiveCommandResult,
     build_head_object_command,
@@ -140,6 +157,7 @@ from earnings_event_vol.models import (
 )
 from earnings_event_vol.research import (
     FORECAST_FLOOR,
+    SEQUENCE_FEATURE_NAMES,
     aggregate_sequence_features,
     assign_event_splits,
     build_sequence_tensor,
@@ -1984,6 +2002,32 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     )
     assert universe_blocked["ok"] is False
     assert _pipeline_steps(universe_blocked)[0]["status"] == "blocked"
+
+    market_config = replace(
+        config,
+        bronze_data_dir=tmp_path / "market_bronze",
+        silver_data_dir=tmp_path / "market_silver",
+    )
+    market_raw = market_config.bronze_data_dir / "market_covariates" / "fred_vixcls.csv"
+    market_raw.parent.mkdir(parents=True)
+    market_raw.write_text("DATE,VIXCLS\n2024-01-02,12.5\n2024-01-03,.\n", encoding="utf-8")
+    market_run = run_data_pipeline(
+        market_config,
+        stage="market-covariates",
+        out_root=out_root,
+    )
+    assert market_run["ok"] is True
+    assert _pipeline_steps(market_run)[0]["status"] == "ran"
+    market_silver = (
+        market_config.silver_data_dir / "market_covariates" / "daily_market_covariates.parquet"
+    )
+    assert market_silver.exists()
+    market_resume = run_data_pipeline(
+        market_config,
+        stage="market-covariates",
+        out_root=out_root,
+    )
+    assert _pipeline_steps(market_resume)[0]["status"] == "skipped"
 
     with pytest.raises(ValueError, match="unsupported data stage"):
         run_data_pipeline(config, stage="bad-stage", out_root=out_root)
@@ -4342,23 +4386,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
                 "has_underlying_close": True,
                 "missing_options_day_aggs": False,
             }
-            for feature in (
-                "atm_iv_proxy",
-                "iv_skew_proxy",
-                "iv_butterfly_proxy",
-                "term_slope_proxy",
-                "event_ivar_proxy",
-                "straddle_premium_to_spot",
-                "valid_pair_count",
-                "surface_missing_rate",
-                "option_volume_sum",
-                "option_transactions_sum",
-                "underlying_return_1d",
-                "rv5",
-                "spy_return_1d",
-                "vix_level",
-                "vix_change_1d",
-            ):
+            for feature in SEQUENCE_FEATURE_NAMES:
                 row[feature] = 0.01 * (event_idx + 1) + 0.001 * seq_idx
             rows.append(row)
     long_rows = pd.DataFrame(rows)
@@ -4378,9 +4406,9 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     tensor_path = tmp_path / "sequence_tensor.npz"
     tensor_report = build_sequence_tensor(long_rows, features, out_path=tensor_path)
     payload = np.load(tensor_path, allow_pickle=True)
-    assert tensor_report["shape"] == [40, 20, 15]
+    assert tensor_report["shape"] == [40, 20, len(SEQUENCE_FEATURE_NAMES)]
     assert payload["time_mask"].shape == (40, 20)
-    assert payload["feature_mask"].shape == (40, 20, 15)
+    assert payload["feature_mask"].shape == (40, 20, len(SEQUENCE_FEATURE_NAMES))
 
     predictions, diagnostics = run_proxy_model_suite(
         features,
@@ -4431,6 +4459,363 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         forecast_columns={"mamba_sequence_encoder": "forecast_mamba_sequence_encoder"},
     )
     assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
+
+
+def test_market_index_second_surface_and_underlying_features() -> None:
+    cutoff = pd.Timestamp("2025-01-03 16:00:00", tz="America/New_York")
+    assert (
+        market_index_implied_volatility(
+            spot=0.0,
+            strike=100.0,
+            time_to_expiry=0.1,
+            option_price=1.0,
+            right="call",
+        )
+        is None
+    )
+    assert (
+        market_index_implied_volatility(
+            spot=100.0,
+            strike=90.0,
+            time_to_expiry=0.1,
+            option_price=1.0,
+            right="call",
+        )
+        is None
+    )
+    assert (
+        market_index_implied_volatility(
+            spot=100.0,
+            strike=100.0,
+            time_to_expiry=0.1,
+            option_price=1_000.0,
+            right="put",
+        )
+        is None
+    )
+    assert normalize_underlying_second_aggregates(pd.DataFrame(), ticker="SPY").empty
+    with pytest.raises(ValueError, match="missing required columns"):
+        normalize_underlying_second_aggregates(pd.DataFrame({"t": [1]}), ticker="SPY")
+    assert (
+        select_underlying_second_features(
+            pd.DataFrame(),
+            cutoff_timestamp=cutoff.to_pydatetime(),
+            buffer_minutes=60,
+            lookback_seconds=900,
+        ).status
+        == "no_second_bars"
+    )
+    raw_underlying = pd.DataFrame(
+        {
+            "t": [
+                int(pd.Timestamp("2025-01-03 20:40:00", tz="UTC").timestamp() * 1000),
+                int(pd.Timestamp("2025-01-03 20:50:00", tz="UTC").timestamp() * 1000),
+                int(pd.Timestamp("2025-01-03 20:59:00", tz="UTC").timestamp() * 1000),
+            ],
+            "o": [498.0, 499.0, 500.0],
+            "h": [499.0, 500.0, 501.0],
+            "l": [497.5, 498.5, 499.5],
+            "c": [498.5, 499.5, 500.5],
+            "v": [100, 200, 300],
+            "vw": [498.4, 499.4, 500.4],
+            "n": [10, 20, 30],
+        }
+    )
+    underlying = normalize_underlying_second_aggregates(raw_underlying, ticker="SPY")
+    selected_underlying = select_underlying_second_features(
+        underlying,
+        cutoff_timestamp=cutoff.to_pydatetime(),
+        buffer_minutes=60,
+        lookback_seconds=900,
+    )
+    assert selected_underlying.status == "ok"
+    assert selected_underlying.close == pytest.approx(500.5)
+    assert selected_underlying.volume_sum == 500
+    assert selected_underlying.transactions_sum == 50
+    assert (
+        select_underlying_second_features(
+            underlying.head(1),
+            cutoff_timestamp=cutoff.to_pydatetime(),
+            buffer_minutes=5,
+            lookback_seconds=60,
+        ).status
+        == "no_bars_in_cutoff_buffer"
+    )
+    assert (
+        select_underlying_second_features(
+            underlying.head(1),
+            cutoff_timestamp=cutoff.to_pydatetime(),
+            buffer_minutes=60,
+            lookback_seconds=60,
+        ).status
+        == "no_bars_in_lookback"
+    )
+
+    source_date = date(2025, 1, 3)
+    spot = 500.0
+    assert select_market_index_option_candidates(
+        pd.DataFrame(), symbol="SPY", source_date=source_date, spot=spot
+    ).empty
+    assert select_market_index_option_candidates(
+        pd.DataFrame({"ticker": ["O:ABC250110C00500000"], "close": [1], "volume": [1]}),
+        symbol="SPY",
+        source_date=source_date,
+        spot=spot,
+    ).empty
+    assert select_market_index_option_candidates(
+        pd.DataFrame({"ticker": ["O:SPY250110C00500000"], "close": [1], "volume": [1]}),
+        symbol="SPY",
+        source_date=source_date,
+        spot=0.0,
+    ).empty
+    option_rows: list[dict[str, object]] = []
+    for expiry_text, vol in [("250110", 0.20), ("250117", 0.22), ("250131", 0.25)]:
+        expiry = pd.Timestamp(f"20{expiry_text[:2]}-{expiry_text[2:4]}-{expiry_text[4:6]}").date()
+        tte = (expiry - source_date).days / 365.0
+        for strike in (490.0, 500.0, 510.0):
+            strike_text = f"{int(strike * 1000):08d}"
+            for right_code, right in [("C", OptionRight.CALL), ("P", OptionRight.PUT)]:
+                price = black_scholes_price(
+                    spot=spot,
+                    strike=strike,
+                    time_to_expiry=tte,
+                    volatility=vol,
+                    right=right,
+                )
+                option_rows.append(
+                    {
+                        "ticker": f"O:SPY{expiry_text}{right_code}{strike_text}",
+                        "close": price,
+                        "volume": 100,
+                        "transactions": 20,
+                    }
+                )
+    day_options = pd.DataFrame(option_rows)
+    candidates = select_market_index_option_candidates(
+        day_options,
+        symbol="SPY",
+        source_date=source_date,
+        spot=spot,
+    )
+    assert not candidates.empty
+    bar_frames = {
+        str(row["options_ticker"]): pd.DataFrame(
+            {
+                "timestamp_et": [pd.Timestamp("2025-01-03 15:55:00", tz="America/New_York")],
+                "option_vwap": [float(row["option_close"])],
+                "option_close": [float(row["option_close"])],
+                "volume": [11],
+                "transactions": [3],
+            }
+        )
+        for row in candidates.to_dict("records")
+    }
+    surface = market_index_surface_features(
+        candidates,
+        bar_frames,
+        symbol="SPY",
+        spot=spot,
+        cutoff_timestamp=cutoff.to_pydatetime(),
+        lookback_seconds=900,
+    )
+    assert surface["market_surface_status"] == "ok"
+    assert surface["market_atm_iv_proxy"] == pytest.approx(0.22, abs=0.03)
+    assert cast(float, surface["market_straddle_premium_to_spot"]) > 0
+    assert cast(int, surface["market_valid_pair_count"]) > 0
+    assert cast(int, surface["market_option_transactions_sum"]) > 0
+    assert (
+        market_index_surface_features(
+            candidates.head(0),
+            {},
+            symbol="SPY",
+            spot=spot,
+            cutoff_timestamp=cutoff.to_pydatetime(),
+            lookback_seconds=900,
+        )["market_surface_status"]
+        == "no_candidates"
+    )
+    assert (
+        market_index_surface_features(
+            candidates,
+            {},
+            symbol="SPY",
+            spot=spot,
+            cutoff_timestamp=cutoff.to_pydatetime(),
+            lookback_seconds=900,
+        )["market_surface_status"]
+        == "no_prices"
+    )
+    prefixed = prefix_market_index_features(surface, symbol="SPY")
+    assert "spy_second_market_atm_iv_proxy" in prefixed
+    assert "spy_second_index_symbol" not in prefixed
+
+
+def test_vix_feature_construction_uses_valid_observation_lags_and_prior_history() -> None:
+    dates = pd.bdate_range("2024-01-02", periods=60)
+    raw = pd.DataFrame(
+        {
+            "DATE": [day.date().isoformat() for day in dates],
+            "VIXCLS": [str(10.0 + idx) for idx in range(len(dates))],
+        }
+    )
+    vix = normalize_fred_vixcls_csv(raw, source_snapshot_date=date(2024, 4, 1))
+    feature_date = dates[45].date()
+    resolved_date = dates[44].date()
+    features = build_vix_features(
+        vix,
+        pd.DataFrame(
+            {
+                "event_id": ["E1"],
+                "feature_asof_date": [feature_date],
+                "announcement_timing": ["AMC"],
+            }
+        ),
+        alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
+    )
+    assert features["resolved_vix_date"].iloc[0] == resolved_date
+    assert features["vix_change_1d"].iloc[0] == pytest.approx(1.0)
+    assert features["vix_change_5d"].iloc[0] == pytest.approx(5.0)
+    history = vix.loc[vix["vix_close_date"].lt(resolved_date), "vix_close"].tail(252)
+    expected_percentile = float((history <= features["vix_level"].iloc[0]).mean())
+    assert features["vix_percentile_252d"].iloc[0] == pytest.approx(expected_percentile)
+    assert features["vix_regime_tercile"].iloc[0] == "high"
+    assert bool(features["vix_above_30"].iloc[0]) is True
+
+
+def test_vix_alignment_same_day_amc_only_and_stale_observations_are_missing() -> None:
+    raw = pd.DataFrame(
+        {
+            "DATE": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-08"],
+            "VIXCLS": ["12", "13", "14", "15", "."],
+        }
+    )
+    vix = normalize_fred_vixcls_csv(
+        raw,
+        source_snapshot_date=date(2024, 1, 9),
+        source_url=FRED_VIXCLS_URL,
+    )
+    assert int(vix["is_holiday_or_missing"].sum()) == 1
+    assert vix["source_dataset"].iloc[0] == "fred_vixcls"
+    assert vix["source_url"].iloc[0] == FRED_VIXCLS_URL
+    assert vix["source_snapshot_date"].iloc[0] == "2024-01-09"
+
+    prior = build_vix_features(
+        vix,
+        pd.DataFrame(
+            {
+                "event_id": ["AMC", "BMO"],
+                "feature_asof_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "announcement_timing": ["AMC", "BMO"],
+            }
+        ),
+        alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
+    )
+    assert prior["resolved_vix_date"].tolist() == [date(2024, 1, 4), date(2024, 1, 4)]
+
+    robustness = build_vix_features(
+        vix,
+        pd.DataFrame(
+            {
+                "event_id": ["AMC", "BMO"],
+                "feature_asof_date": [date(2024, 1, 5), date(2024, 1, 5)],
+                "announcement_timing": ["AMC", "BMO"],
+            }
+        ),
+        alignment=VIX_ALIGNMENT_SAME_DAY_AMC,
+    )
+    assert robustness["resolved_vix_date"].tolist() == [date(2024, 1, 5), date(2024, 1, 4)]
+
+    stale = build_vix_features(
+        vix,
+        pd.DataFrame({"event_id": ["STALE"], "feature_asof_date": [date(2024, 1, 12)]}),
+        alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
+        max_lag_days=5,
+    )
+    assert bool(stale["vix_available"].iloc[0]) is False
+    assert pd.isna(stale["resolved_vix_date"].iloc[0])
+
+
+def test_vix_feature_edge_cases_and_validation_errors() -> None:
+    lower = normalize_fred_vixcls_csv(
+        pd.DataFrame({"observation_date": ["2024-01-02"], "vix_close": [22.0]}),
+        source_snapshot_date=date(2024, 1, 3),
+    )
+    assert lower["vix_close"].iloc[0] == pytest.approx(22.0)
+
+    with pytest.raises(ValueError, match="DATE"):
+        normalize_fred_vixcls_csv(
+            pd.DataFrame({"VIXCLS": [12]}),
+            source_snapshot_date=date(2024, 1, 3),
+        )
+    with pytest.raises(ValueError, match="VIXCLS"):
+        normalize_fred_vixcls_csv(
+            pd.DataFrame({"DATE": ["2024-01-02"]}),
+            source_snapshot_date=date(2024, 1, 3),
+        )
+    with pytest.raises(ValueError, match="vix_close"):
+        build_vix_features(
+            pd.DataFrame({"date": ["2024-01-02"]}),
+            pd.DataFrame({"feature_asof_date": [date(2024, 1, 3)]}),
+        )
+    with pytest.raises(ValueError, match="date"):
+        build_vix_features(
+            pd.DataFrame({"vix_close": [12]}),
+            pd.DataFrame({"feature_asof_date": [date(2024, 1, 3)]}),
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        build_vix_features(
+            lower,
+            pd.DataFrame({"feature_asof_date": [date(2024, 1, 3)]}),
+            alignment=cast(Any, "bad"),
+        )
+    with pytest.raises(ValueError, match="feature_asof_date"):
+        build_vix_features(lower, pd.DataFrame({"event_id": ["E1"]}))
+    with pytest.raises(ValueError, match="max_lag"):
+        build_vix_features(
+            lower,
+            pd.DataFrame({"feature_asof_date": [date(2024, 1, 3)]}),
+            max_lag_days=-1,
+        )
+    with pytest.raises(ValueError, match="percentile_window"):
+        build_vix_features(
+            lower,
+            pd.DataFrame({"feature_asof_date": [date(2024, 1, 3)]}),
+            percentile_window=0,
+        )
+
+    missing_date = build_vix_features(lower, pd.DataFrame({"feature_asof_date": [pd.NaT]}))
+    assert bool(missing_date["vix_available"].iloc[0]) is False
+    before_first = build_vix_features(
+        lower,
+        pd.DataFrame({"feature_asof_date": [date(2024, 1, 2)]}),
+    )
+    assert bool(before_first["vix_available"].iloc[0]) is False
+
+    low_raw = pd.DataFrame(
+        {
+            "DATE": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+            "VIXCLS": ["10", "20", "30", "15"],
+        }
+    )
+    low = build_vix_features(
+        normalize_fred_vixcls_csv(low_raw, source_snapshot_date=date(2024, 1, 6)),
+        pd.DataFrame({"feature_asof_date": [date(2024, 1, 8)]}),
+        min_regime_observations=3,
+    )
+    assert low["vix_regime_tercile"].iloc[0] == "low"
+
+    mid_raw = pd.DataFrame(
+        {
+            "DATE": ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
+            "VIXCLS": ["10", "20", "30", "25"],
+        }
+    )
+    mid = build_vix_features(
+        normalize_fred_vixcls_csv(mid_raw, source_snapshot_date=date(2024, 1, 6)),
+        pd.DataFrame({"feature_asof_date": [date(2024, 1, 8)]}),
+        min_regime_observations=3,
+    )
+    assert mid["vix_regime_tercile"].iloc[0] == "mid"
 
 
 def test_research_model_suite_and_error_paths() -> None:

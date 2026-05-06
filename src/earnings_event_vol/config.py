@@ -51,6 +51,7 @@ class ProjectConfig:
     sec_submissions_url_template: str
     sec_user_agent: str
     massive_8k_text_path: str
+    fred_vixcls_url: str
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -141,4 +142,8 @@ def load_project_config() -> ProjectConfig:
             "earnings-event-vol research contact no-reply@example.com",
         ),
         massive_8k_text_path=os.getenv("MASSIVE_8K_TEXT_PATH", "/stocks/filings/8-K/vX/text"),
+        fred_vixcls_url=os.getenv(
+            "FRED_VIXCLS_URL",
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS",
+        ),
     )

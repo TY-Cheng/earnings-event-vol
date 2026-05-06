@@ -19,6 +19,20 @@ from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.data_audit import audit_data_fields
 from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
+from earnings_event_vol.market_covariates import (
+    MARKET_COVARIATE_SCHEMA_VERSION,
+    normalize_fred_vixcls_csv,
+)
+from earnings_event_vol.market_index_proxy import (
+    MARKET_INDEX_SECOND_SCHEMA_VERSION,
+    MARKET_INDEX_SYMBOLS,
+    fetch_massive_underlying_second_aggregates,
+    market_index_surface_features,
+    normalize_underlying_second_aggregates,
+    prefix_market_index_features,
+    select_market_index_option_candidates,
+    select_underlying_second_features,
+)
 from earnings_event_vol.massive import (
     MassiveCommandResult,
     _run_head_object_command,
@@ -28,6 +42,11 @@ from earnings_event_vol.massive import (
     massive_flat_file_manifest,
     option_flat_file_key,
     underlying_flat_file_key,
+)
+from earnings_event_vol.trade_proxy import (
+    fetch_massive_option_second_aggregates,
+    filter_pre_cutoff_buffer,
+    normalize_second_aggregates,
 )
 from earnings_event_vol.universe import (
     ELIGIBLE_EQUITY_RULE_VERSION,
@@ -69,6 +88,8 @@ SUPPORTED_DATA_STAGES = {
     "fixture-audit",
     "massive-probe",
     "options-day-aggs-bulk",
+    "market-covariates",
+    "market-second-covariates",
     "universe",
     "dynamic-calendar",
     "calendar-pilot",
@@ -217,6 +238,647 @@ def _read_universe_source(path: Path) -> pd.DataFrame:
 def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pl.from_pandas(frame).write_parquet(path, compression="zstd")
+
+
+def _market_covariates_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+) -> DataPipelineStep:
+    raw_path = config.bronze_data_dir / "market_covariates" / "fred_vixcls.csv"
+    silver_path = config.silver_data_dir / "market_covariates" / "daily_market_covariates.parquet"
+    manifest_path = out_root / "market_covariates" / "market_covariates_manifest.json"
+    outputs = (raw_path, silver_path, manifest_path)
+    params = {
+        "stage": "market-covariates",
+        "source_dataset": "fred_vixcls",
+        "source_url": config.fred_vixcls_url,
+        "schema_version": MARKET_COVARIATE_SCHEMA_VERSION,
+    }
+    if not force and _complete_with_params(
+        outputs,
+        params_path=manifest_path,
+        expected_params=params,
+    ):
+        return DataPipelineStep(
+            "market-covariates",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if force or not raw_path.exists() or raw_path.stat().st_size <= 0:
+            with httpx.Client(timeout=config.massive_request_timeout_seconds) as client:
+                response = client.get(config.fred_vixcls_url)
+                response.raise_for_status()
+                raw_path.write_bytes(response.content)
+        raw = pd.read_csv(raw_path)
+        snapshot = date.today()
+        silver = normalize_fred_vixcls_csv(
+            raw,
+            source_snapshot_date=snapshot,
+            source_url=config.fred_vixcls_url,
+        )
+        _write_parquet(silver_path, silver)
+    except Exception as exc:
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": params,
+                    "status": "blocked",
+                    "reason": "market_covariates_failed",
+                    "error": str(exc),
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        return DataPipelineStep(
+            "market-covariates",
+            "blocked",
+            outputs,
+            reason="market_covariates_failed",
+            metadata={"error": str(exc)},
+        )
+
+    payload = {
+        "pipeline_params": params,
+        "status": "ran",
+        "rows": int(len(silver)),
+        "vix_rows": int(pd.to_numeric(silver["vix_close"], errors="coerce").notna().sum()),
+        "missing_rows": int(silver["is_holiday_or_missing"].sum()),
+        "source_snapshot_date": snapshot.isoformat(),
+        "outputs": {
+            "bronze_fred_vixcls_csv": str(raw_path),
+            "daily_market_covariates": str(silver_path),
+        },
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return DataPipelineStep(
+        "market-covariates",
+        "ran",
+        outputs,
+        metadata={
+            "rows": int(len(silver)),
+            "vix_rows": int(pd.to_numeric(silver["vix_close"], errors="coerce").notna().sum()),
+            "missing_rows": int(silver["is_holiday_or_missing"].sum()),
+        },
+    )
+
+
+MARKET_INDEX_OPTION_SECOND_COLUMNS = {
+    "options_ticker",
+    "timestamp_et",
+    "option_close",
+    "option_vwap",
+    "volume",
+    "transactions",
+}
+MARKET_INDEX_UNDERLYING_SECOND_COLUMNS = {
+    "ticker",
+    "timestamp_et",
+    "underlying_close",
+    "underlying_vwap",
+    "volume",
+    "transactions",
+}
+
+
+def _safe_timestamp(value: object) -> pd.Timestamp | None:  # pragma: no cover
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is None:
+        return None
+    return timestamp.tz_convert("America/New_York")
+
+
+def _cutoff_partition(cutoff_timestamp: pd.Timestamp) -> str:  # pragma: no cover
+    return str(cutoff_timestamp.strftime("%H%M%S"))
+
+
+def _safe_ticker_partition(value: str) -> str:  # pragma: no cover
+    return value.replace(":", "_").replace("/", "_")
+
+
+def _market_index_option_second_path(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    entry_date: date,
+    cutoff_timestamp: pd.Timestamp,
+    buffer_minutes: int,
+) -> Path:  # pragma: no cover
+    return (
+        config.bronze_data_dir
+        / "massive"
+        / "market_index_options_second_aggs"
+        / f"date={entry_date.isoformat()}"
+        / f"cutoff={_cutoff_partition(cutoff_timestamp)}"
+        / f"buffer_minutes={buffer_minutes}"
+        / f"options_ticker={_safe_ticker_partition(option_ticker)}"
+        / "part.parquet"
+    )
+
+
+def _market_index_underlying_second_path(
+    config: ProjectConfig,
+    *,
+    symbol: str,
+    entry_date: date,
+    cutoff_timestamp: pd.Timestamp,
+    buffer_minutes: int,
+) -> Path:  # pragma: no cover
+    return (
+        config.bronze_data_dir
+        / "massive"
+        / "market_index_underlying_second_aggs"
+        / f"date={entry_date.isoformat()}"
+        / f"cutoff={_cutoff_partition(cutoff_timestamp)}"
+        / f"buffer_minutes={buffer_minutes}"
+        / f"index_symbol={symbol.upper()}"
+        / "part.parquet"
+    )
+
+
+def _read_cached_parquet(  # pragma: no cover
+    path: Path, required_columns: set[str]
+) -> pd.DataFrame | None:
+    if not _parquet_has_columns(path, required_columns):
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
+
+
+def _write_pandas_parquet(path: Path, frame: pd.DataFrame) -> None:  # pragma: no cover
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+
+
+def _option_index_symbol(option_ticker: str) -> str:  # pragma: no cover
+    parsed = option_ticker.removeprefix("O:")
+    for symbol in MARKET_INDEX_SYMBOLS:
+        if parsed.startswith(symbol):
+            return symbol
+    return "UNKNOWN"
+
+
+def _read_market_index_spots(  # pragma: no cover
+    config: ProjectConfig, entry_date: date
+) -> dict[str, float]:
+    path = _bronze_day_agg_path(config, dataset="underlying_day_aggs", date_value=entry_date)
+    if not path.exists():
+        return {}
+    try:
+        frame = (
+            pl.scan_parquet(str(path), cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
+            .filter(pl.col("ticker").is_in(list(MARKET_INDEX_SYMBOLS)))
+            .select(["ticker", "close"])
+            .collect()
+            .to_pandas()
+        )
+    except Exception:
+        return {}
+    if frame.empty:
+        return {}
+    frame["ticker"] = frame["ticker"].astype(str).str.upper()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    return {
+        str(row["ticker"]): float(row["close"])
+        for row in frame.dropna(subset=["close"]).to_dict("records")
+    }
+
+
+def _read_market_index_options_day_aggs(
+    config: ProjectConfig,
+    entry_date: date,
+) -> pd.DataFrame:  # pragma: no cover
+    path = _bronze_day_agg_path(config, dataset="options_day_aggs", date_value=entry_date)
+    if not path.exists():
+        return pd.DataFrame()
+    pattern = r"^O:(" + "|".join(MARKET_INDEX_SYMBOLS) + r")\d{6}[CP]\d{8}$"
+    try:
+        schema = pl.scan_parquet(str(path)).collect_schema()
+        columns = [
+            column
+            for column in ("ticker", "close", "volume", "transactions")
+            if column in schema.names()
+        ]
+        frame = (
+            pl.scan_parquet(str(path), cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
+            .filter(pl.col("ticker").str.contains(pattern))
+            .select(columns)
+            .collect()
+            .to_pandas()
+        )
+    except Exception:
+        return pd.DataFrame()
+    if "transactions" not in frame.columns:
+        frame["transactions"] = 0
+    return frame
+
+
+def _fetch_or_load_market_underlying_second_bars(
+    config: ProjectConfig,
+    *,
+    symbol: str,
+    entry_date: date,
+    cutoff_timestamp: pd.Timestamp,
+    buffer_minutes: int,
+    refresh_bronze: bool,
+) -> tuple[pd.DataFrame, dict[str, object]]:  # pragma: no cover
+    path = _market_index_underlying_second_path(
+        config,
+        symbol=symbol,
+        entry_date=entry_date,
+        cutoff_timestamp=cutoff_timestamp,
+        buffer_minutes=buffer_minutes,
+    )
+    cached = (
+        None
+        if refresh_bronze
+        else _read_cached_parquet(path, MARKET_INDEX_UNDERLYING_SECOND_COLUMNS)
+    )
+    if cached is not None:
+        return cached, {
+            "ticker": symbol,
+            "status": "ok",
+            "cache_status": "hit",
+            "rows": int(len(cached)),
+            "bronze_path": str(path),
+        }
+    if path.exists():
+        path.unlink(missing_ok=True)
+    try:
+        raw = fetch_massive_underlying_second_aggregates(
+            config,
+            ticker=symbol,
+            trade_date=entry_date,
+        )
+        normalized = normalize_underlying_second_aggregates(raw, ticker=symbol)
+        buffered = filter_pre_cutoff_buffer(
+            normalized,
+            cutoff_timestamp=cutoff_timestamp.to_pydatetime(),
+            buffer_minutes=buffer_minutes,
+        )
+        _write_pandas_parquet(path, buffered)
+        return buffered, {
+            "ticker": symbol,
+            "status": "ok",
+            "cache_status": "written",
+            "rows": int(len(buffered)),
+            "raw_rows": int(len(normalized)),
+            "bronze_path": str(path),
+        }
+    except Exception as exc:
+        return pd.DataFrame(), {
+            "ticker": symbol,
+            "status": "fetch_failed",
+            "cache_status": "miss",
+            "rows": 0,
+            "bronze_path": str(path),
+            "error": str(exc)[:300],
+        }
+
+
+def _fetch_or_load_market_option_second_bars(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    entry_date: date,
+    cutoff_timestamp: pd.Timestamp,
+    buffer_minutes: int,
+    refresh_bronze: bool,
+) -> tuple[str, pd.DataFrame, dict[str, object]]:  # pragma: no cover
+    path = _market_index_option_second_path(
+        config,
+        option_ticker=option_ticker,
+        entry_date=entry_date,
+        cutoff_timestamp=cutoff_timestamp,
+        buffer_minutes=buffer_minutes,
+    )
+    cached = (
+        None if refresh_bronze else _read_cached_parquet(path, MARKET_INDEX_OPTION_SECOND_COLUMNS)
+    )
+    if cached is not None:
+        return (
+            option_ticker,
+            cached,
+            {
+                "options_ticker": option_ticker,
+                "index_symbol": _option_index_symbol(option_ticker),
+                "status": "ok",
+                "cache_status": "hit",
+                "rows": int(len(cached)),
+                "bronze_path": str(path),
+            },
+        )
+    if path.exists():
+        path.unlink(missing_ok=True)
+    try:
+        raw = fetch_massive_option_second_aggregates(
+            config,
+            option_ticker=option_ticker,
+            trade_date=entry_date,
+        )
+        normalized = normalize_second_aggregates(raw, option_ticker=option_ticker)
+        buffered = filter_pre_cutoff_buffer(
+            normalized,
+            cutoff_timestamp=cutoff_timestamp.to_pydatetime(),
+            buffer_minutes=buffer_minutes,
+        )
+        _write_pandas_parquet(path, buffered)
+        return (
+            option_ticker,
+            buffered,
+            {
+                "options_ticker": option_ticker,
+                "index_symbol": _option_index_symbol(option_ticker),
+                "status": "ok",
+                "cache_status": "written",
+                "rows": int(len(buffered)),
+                "raw_rows": int(len(normalized)),
+                "bronze_path": str(path),
+            },
+        )
+    except Exception as exc:
+        return (
+            option_ticker,
+            pd.DataFrame(),
+            {
+                "options_ticker": option_ticker,
+                "index_symbol": _option_index_symbol(option_ticker),
+                "status": "fetch_failed",
+                "cache_status": "miss",
+                "rows": 0,
+                "bronze_path": str(path),
+                "error": str(exc)[:300],
+            },
+        )
+
+
+def _market_second_event_row(
+    config: ProjectConfig,
+    *,
+    event: Mapping[str, object],
+    options_day_aggs: pd.DataFrame,
+    spots: Mapping[str, float],
+    jobs: int,
+    lookback_seconds: int,
+    buffer_minutes: int,
+    price_field: str,
+    refresh_bronze: bool,
+) -> tuple[dict[str, object], list[dict[str, object]]]:  # pragma: no cover
+    event_id = str(event.get("event_id") or "")
+    entry_date = pd.Timestamp(event.get("entry_date")).date()
+    cutoff_timestamp = _safe_timestamp(event.get("event_entry_timestamp"))
+    base: dict[str, object] = {
+        "event_id": event_id,
+        "entry_date": entry_date,
+        "event_entry_timestamp": event.get("event_entry_timestamp"),
+        "market_second_route": "massive_rest_second_aggs",
+        "market_second_panel_grade": "no_nbbo_trade_proxy",
+        "market_second_schema_version": MARKET_INDEX_SECOND_SCHEMA_VERSION,
+    }
+    reports: list[dict[str, object]] = []
+    if cutoff_timestamp is None:
+        base["market_second_status"] = "invalid_event_entry_timestamp"
+        return base, reports
+    if options_day_aggs.empty:
+        base["market_second_status"] = "missing_options_day_aggs"
+        return base, reports
+    base["market_second_status"] = "ok"
+    for symbol in MARKET_INDEX_SYMBOLS:
+        spot = spots.get(symbol)
+        if spot is None or not pd.notna(spot):
+            base[f"{symbol.lower()}_second_underlying_status"] = "missing_underlying_day_aggs"
+            continue
+        underlying_bars, underlying_report = _fetch_or_load_market_underlying_second_bars(
+            config,
+            symbol=symbol,
+            entry_date=entry_date,
+            cutoff_timestamp=cutoff_timestamp,
+            buffer_minutes=buffer_minutes,
+            refresh_bronze=refresh_bronze,
+        )
+        underlying_report.update({"event_id": event_id, "dataset": "underlying_second_aggs"})
+        reports.append(underlying_report)
+        underlying_features = select_underlying_second_features(
+            underlying_bars,
+            cutoff_timestamp=cutoff_timestamp.to_pydatetime(),
+            buffer_minutes=buffer_minutes,
+            lookback_seconds=lookback_seconds,
+        )
+        prefix = symbol.lower()
+        base.update(
+            {
+                f"{prefix}_second_underlying_status": underlying_features.status,
+                f"{prefix}_second_underlying_close": underlying_features.close,
+                f"{prefix}_second_underlying_vwap": underlying_features.vwap,
+                f"{prefix}_second_underlying_return_in_buffer": (
+                    underlying_features.return_in_buffer
+                ),
+                f"{prefix}_second_underlying_volume_sum": underlying_features.volume_sum,
+                f"{prefix}_second_underlying_transactions_sum": (
+                    underlying_features.transactions_sum
+                ),
+                f"{prefix}_second_underlying_rows": underlying_features.rows_in_buffer,
+            }
+        )
+        candidates = select_market_index_option_candidates(
+            options_day_aggs,
+            symbol=symbol,
+            source_date=entry_date,
+            spot=float(spot),
+        )
+        option_frames: dict[str, pd.DataFrame] = {}
+        requests = (
+            sorted(candidates["options_ticker"].astype(str).unique().tolist())
+            if not candidates.empty
+            else []
+        )
+        if requests:
+            if jobs <= 1:
+                results = [
+                    _fetch_or_load_market_option_second_bars(
+                        config,
+                        option_ticker=option_ticker,
+                        entry_date=entry_date,
+                        cutoff_timestamp=cutoff_timestamp,
+                        buffer_minutes=buffer_minutes,
+                        refresh_bronze=refresh_bronze,
+                    )
+                    for option_ticker in requests
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, jobs)) as executor:
+                    futures = [
+                        executor.submit(
+                            _fetch_or_load_market_option_second_bars,
+                            config,
+                            option_ticker=option_ticker,
+                            entry_date=entry_date,
+                            cutoff_timestamp=cutoff_timestamp,
+                            buffer_minutes=buffer_minutes,
+                            refresh_bronze=refresh_bronze,
+                        )
+                        for option_ticker in requests
+                    ]
+                    results = [future.result() for future in as_completed(futures)]
+            for option_ticker, frame, report in results:
+                option_frames[option_ticker] = frame
+                report.update({"event_id": event_id, "dataset": "options_second_aggs"})
+                reports.append(report)
+        surface = market_index_surface_features(
+            candidates,
+            option_frames,
+            symbol=symbol,
+            spot=float(spot),
+            cutoff_timestamp=cutoff_timestamp.to_pydatetime(),
+            lookback_seconds=lookback_seconds,
+            price_field=price_field,
+        )
+        base.update(prefix_market_index_features(surface, symbol=symbol))
+    return base, reports
+
+
+def _market_second_covariates_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+    refresh_bronze: bool,
+    jobs: int,
+    max_events: int | None,
+    lookback_seconds: int,
+    second_agg_buffer_minutes: int,
+    price_field: str,
+) -> DataPipelineStep:  # pragma: no cover
+    panel_path = config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
+    out = out_root / "market_second_covariates"
+    silver_path = config.silver_data_dir / "market_covariates" / "market_second_covariates.parquet"
+    report_path = out / "market_second_covariates_fetch_report.csv"
+    manifest_path = out / "market_second_covariates_manifest.json"
+    outputs = (silver_path, report_path, manifest_path)
+    params = {
+        "stage": "market-second-covariates",
+        "input_panel": _path_signature(panel_path),
+        "symbols": list(MARKET_INDEX_SYMBOLS),
+        "max_events": max_events,
+        "lookback_seconds": lookback_seconds,
+        "second_agg_buffer_minutes": second_agg_buffer_minutes,
+        "price_field": price_field,
+        "schema_version": MARKET_INDEX_SECOND_SCHEMA_VERSION,
+        "refresh_bronze": refresh_bronze,
+    }
+    if not panel_path.exists():
+        return DataPipelineStep(
+            "market-second-covariates",
+            "blocked",
+            outputs,
+            reason="requires data/gold/event_panel/trade_proxy_event_panel.parquet",
+        )
+    if (
+        not force
+        and not refresh_bronze
+        and _complete_with_params(
+            outputs,
+            params_path=manifest_path,
+            expected_params=params,
+        )
+    ):
+        return DataPipelineStep(
+            "market-second-covariates",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+    panel = pd.read_parquet(panel_path)
+    required = {"event_id", "entry_date", "event_entry_timestamp"}
+    missing = sorted(required - set(panel.columns))
+    if missing:
+        return DataPipelineStep(
+            "market-second-covariates",
+            "blocked",
+            outputs,
+            reason=f"panel_missing_columns:{','.join(missing)}",
+        )
+    events = (
+        panel[list(required)]
+        .dropna(subset=["event_id", "entry_date"])
+        .drop_duplicates("event_id")
+        .sort_values(["entry_date", "event_id"])
+        .reset_index(drop=True)
+    )
+    if max_events is not None:
+        events = events.head(max_events).copy()
+    _progress(
+        "market-second-covariates: "
+        f"events={len(events)} symbols={','.join(MARKET_INDEX_SYMBOLS)} jobs={jobs}"
+    )
+    rows: list[dict[str, object]] = []
+    reports: list[dict[str, object]] = []
+    for index, event in enumerate(events.to_dict("records"), start=1):
+        entry_date = pd.Timestamp(event["entry_date"]).date()
+        options_day = _read_market_index_options_day_aggs(config, entry_date)
+        spots = _read_market_index_spots(config, entry_date)
+        row, event_reports = _market_second_event_row(
+            config,
+            event=event,
+            options_day_aggs=options_day,
+            spots=spots,
+            jobs=jobs,
+            lookback_seconds=lookback_seconds,
+            buffer_minutes=second_agg_buffer_minutes,
+            price_field=price_field,
+            refresh_bronze=refresh_bronze,
+        )
+        rows.append(row)
+        reports.extend(event_reports)
+        if index == len(events) or index % max(1, len(events) // 10) == 0:
+            progress_counts = Counter(str(item.get("status")) for item in reports)
+            _progress(
+                "market-second-covariates progress: "
+                f"{index}/{len(events)} events reports={dict(progress_counts)}"
+            )
+    frame = pd.DataFrame(rows)
+    report = pd.DataFrame(reports)
+    _write_pandas_parquet(silver_path, frame)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report.to_csv(report_path, index=False)
+    status_counts = _frame_value_counts(frame, "market_second_status")
+    fetch_counts = _frame_value_counts(report, "status")
+    manifest = {
+        "pipeline_params": params,
+        "status": "ran",
+        "rows": int(len(frame)),
+        "fetch_rows": int(len(report)),
+        "status_counts": status_counts,
+        "fetch_status_counts": fetch_counts,
+        "outputs": {
+            "market_second_covariates": str(silver_path),
+            "fetch_report": str(report_path),
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    return DataPipelineStep(
+        "market-second-covariates",
+        "ran",
+        outputs,
+        metadata={
+            "rows": int(len(frame)),
+            "fetch_rows": int(len(report)),
+            "status_counts": status_counts,
+            "fetch_status_counts": fetch_counts,
+        },
+    )
 
 
 def _sec_company_ticker_rows(payload: object) -> list[dict[str, object]]:
@@ -1764,6 +2426,22 @@ def run_data_pipeline(
             jobs=jobs,
             download_samples=download_samples,
         ),
+        "market-covariates": lambda: [
+            _market_covariates_step(config, out_root=out_root, force=stage_force)
+        ],
+        "market-second-covariates": lambda: [
+            _market_second_covariates_step(
+                config,
+                out_root=out_root,
+                force=stage_force,
+                refresh_bronze=refresh_bronze,
+                jobs=jobs,
+                max_events=max_events,
+                lookback_seconds=lookback_seconds,
+                second_agg_buffer_minutes=second_agg_buffer_minutes,
+                price_field=price_field,
+            )
+        ],
         "options-day-aggs-bulk": lambda: [
             _options_day_aggs_bulk_step(
                 config,

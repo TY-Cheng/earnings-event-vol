@@ -722,6 +722,8 @@ def build_parser() -> argparse.ArgumentParser:
             "proxy-all",
             "fixture-audit",
             "massive-probe",
+            "market-covariates",
+            "market-second-covariates",
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
