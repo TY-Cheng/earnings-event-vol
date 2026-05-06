@@ -551,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_PILOT_TICKERS),
         help="Ticker list; accepts repeated, comma-separated, or space-separated values.",
     )
-    data.add_argument("--start", default="2013-01-01")
+    data.add_argument("--start", default="2022-12-01")
     data.add_argument("--end", default="2025-12-31")
     data.add_argument("--dates", nargs="*", default=[])
     data.add_argument("--events", type=Path)

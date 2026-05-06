@@ -31,11 +31,12 @@ Active and current:
   matches the requested run.
 - `just data` defaults to `proxy-all`, which runs
   `options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel ->
-  trade-proxy-panel` over the final proxy study range `2013-2025`; the universe
-  lookback begins at `2012-07-01`, with 4 workers by default, a 900-second
-  pricing lookback, a 60-minute resolved-close pre-cutoff buffer, monthly top
-  50 by trailing six-month option premium dollar volume, and DTE `3-21`
-  contract discovery. Use `args="--max-events 10"` for a downstream smoke run;
+  trade-proxy-panel` over the current Massive-entitlement proxy range
+  `2022-12-01` through `2025-12-31`; the universe lookback begins at
+  `2022-06-01`, with 4 workers by default, a 900-second pricing lookback, a
+  60-minute resolved-close pre-cutoff buffer, monthly top 50 by trailing
+  six-month option premium dollar volume, and DTE `3-21` contract discovery.
+  Use `args="--max-events 10"` for a downstream smoke run;
   it does not shrink the universe/calendar build. `--force` rebuilds derived
   outputs while reusing valid bronze caches; `--refresh-bronze` explicitly
   re-fetches flat-file and second-aggregate bronze partitions. Explicit stage
@@ -59,8 +60,10 @@ Active and current:
   audit summaries.
 - Dynamic universe and calendar scaffolding now sit in the default proxy DAG.
   `universe` builds monthly ticker liquidity from normalized option day
-  aggregates and top-50 trailing six-month option premium dollar-volume
-  snapshots; `dynamic-calendar` queries SEC EDGAR submissions plus official
+  aggregates, filters ETF/index/non-single-name symbols with an SEC
+  company/common-equity eligibility cache, and then writes top-50 trailing
+  six-month option premium dollar-volume snapshots; `dynamic-calendar` queries
+  SEC EDGAR submissions plus official
   SEC primary filing documents for the universe ticker union and filters events
   by latest prior universe membership, writing `universe_month`,
   `universe_rank`, `in_universe`, and `universe_filter_status`. Massive 8-K
@@ -107,8 +110,11 @@ Not yet paper evidence:
   `used_intrinsic_fallback` when intrinsic payoff is needed. This is useful for
   screening, not paper-grade execution claims.
 - No paper-grade Massive `options_quotes_v1` ingestion has been implemented.
-  The final top-50 proxy pipeline is implemented, but the full 2013-2025 data
-  lake and paper-facing result tables/figures have not yet been produced.
+  The top-50 proxy pipeline is implemented. The runnable default is
+  2022-12-01 through 2025-12-31 because the current Massive entitlement
+  observed in this workspace exposes option day aggregates from 2022-05-04;
+  full 2013-2025 dynamic-universe data still requires upgraded historical
+  options day-agg entitlement or another licensed options data route.
 - The active implementation is still deterministic/pilot plumbing: event
   alignment, variance extraction, leakage checks, data audit, contract
   discovery, local-IV diagnostics, and backtest smoke paths. It is not yet a
@@ -170,8 +176,9 @@ The current rule is:
 
 ## Next Gate
 
-The next implementation gate is the uncapped 2013-2025 dynamic top-50 proxy
-pass, not quote/NBBO ingestion. The recommended sequence is:
+The next implementation gate is the uncapped 2022-12-01 through 2025-12-31
+dynamic top-50 proxy pass under the current Massive entitlement, not quote/NBBO
+ingestion. The recommended sequence is:
 
 1. Run bare `just data` and inspect
    `artifacts/data_pipeline/options_day_aggs_bulk/options_day_aggs_bulk_manifest.json`,
@@ -180,9 +187,9 @@ pass, not quote/NBBO ingestion. The recommended sequence is:
    for coverage, repair status, fallback usage, stale contracts, and IVAR
    failures.
 2. Use `just data args="--max-events 10"` only when a smoke run is desired.
-3. Use `just data args="--dry-run"` before the full fetch, then use real run
-   telemetry to decide whether the full 2013-2025 proxy lake stays on WSL ext4
-   or moves `DATA_DIR` to a larger NVMe/external path.
+3. Use `just data args="--dry-run"` before larger fetches, then use real run
+   telemetry to decide whether any expanded proxy lake stays on WSL ext4 or
+   moves `DATA_DIR` to a larger NVMe/external path.
 4. Only after the proxy lake is stable, build the feature matrix and model
    baselines. Paper-grade quote/NBBO ingestion remains a later route, not a
    current dependency for the proxy data-engineering pass.

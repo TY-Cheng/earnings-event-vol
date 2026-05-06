@@ -129,6 +129,9 @@ the final paper event panel.
 Target sample:
 
 - Top 50 liquid U.S. single-name option stocks for the first paper run.
+- ETF, index, volatility, commodity trust, and other non-single-name tickers are
+  excluded before the liquidity ranking, rather than being removed only after
+  event discovery.
 - 2013-2025.
 - BMO and AMC only.
 - Event-expiry DTE 5-14 in the main sample.
@@ -139,6 +142,11 @@ Top 50 is the main-sample default because the first empirical gate should
 prioritize clean option-price/event alignment, storage telemetry, and API
 coverage over universe breadth. A top-150 expansion is deferred until the
 top-50 proxy data lake and later paper-grade quote/IV route are stable.
+Under the current Massive flat-file entitlement observed in this workspace, the
+runnable dynamic-universe proxy default is 2022-12-01 through 2025-12-31 because
+option day aggregates are available from 2022-05-04. The 2013-2025 paper target
+requires upgraded historical options day-agg entitlement or another licensed
+options data route for the dynamic universe.
 
 V1.5 is the active no-quote data route: Massive option second aggregates provide
 pre-cutoff trade-price OHLCV bars for entry pricing and diagnostics, while

@@ -121,8 +121,8 @@ availability/size only; it is not part of the current proxy pipeline.
 V1.5 Massive second-aggregate proxy route end to end:
 `options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel ->
 trade-proxy-panel`. The default scope is the final proxy data-engineering pass:
-study dates `2013-01-01` through `2025-12-31`, automatic universe lookback from
-`2012-07-01`, monthly top-50 liquid U.S. single-name option stocks, trailing
+study dates `2022-12-01` through `2025-12-31`, automatic universe lookback from
+`2022-06-01`, monthly top-50 liquid U.S. single-name option stocks, trailing
 six-month option premium dollar volume, `--jobs 4`, `--lookback-seconds 900`,
 `--second-agg-buffer-minutes 60`, `--price-field option_vwap`, and DTE `3-21`
 so one contract-discovery pass can support the main `5-14` sample and the
@@ -138,6 +138,10 @@ Long-running stages print start/end progress, second-aggregate counts, and exit
 day-agg download/cache statuses. Cached Parquet files are reused when readable
 with the expected schema; corrupt flat-file, second-agg, or exit day-agg caches
 are repaired by deleting and re-fetching the affected partition.
+The paper target remains 2013-2025, but the current Massive entitlement observed
+in this workspace exposes option day aggregates only from 2022-05-04; earlier
+dynamic-universe runs need upgraded historical options day-agg entitlement or a
+different licensed options data route.
 
 `calendar-pilot` remains available as a static ticker smoke/debug stage. The
 final route uses `dynamic-calendar`, which reads the monthly top-50 universe,
@@ -145,6 +149,14 @@ queries SEC EDGAR submissions and official SEC primary filing documents for the
 ticker union, and keeps only events that belong to the latest prior universe
 snapshot. Massive 8-K text is auxiliary fallback only when official filing text
 is missing or inconclusive.
+
+The top-50 universe is ranked only after an SEC company/common-equity
+eligibility filter. ETF, index, volatility, commodity trust, and other
+non-single-name symbols such as SPX, SPXW, SPY, QQQ, IWM, VIX, and GLD are
+excluded before ranking so they cannot consume liquid single-name slots. The
+cache is written as `artifacts/data_pipeline/universe/eligible_equity_tickers.parquet`
+with source, snapshot date, rule version, exchange/name filter reason, and
+manifest diagnostics.
 
 The market-data path is lake-first. Massive `.csv.gz` downloads are temporary
 transfer files; they are converted immediately to compressed Parquet and then
@@ -166,7 +178,7 @@ for tiny fixtures and small in-memory orchestration.
 just data
 just data args="--dry-run"
 just data args="--force"
-just data options-day-aggs-bulk args="--start 2013-01-01 --end 2025-12-31 --jobs 8"
+just data options-day-aggs-bulk args="--start 2022-12-01 --end 2025-12-31 --jobs 8"
 just data massive-probe args="--dates 2025-02-05 2025-02-06 --jobs 2"
 just data universe args="--options-day-aggs data/bronze/massive/options_day_aggs"
 just data dynamic-calendar args="--force"
@@ -234,6 +246,8 @@ candidate table, not yet the final paper panel.
 First paper universe:
 
 - Top 50 liquid U.S. single-name option stocks, 2013-2025, BMO/AMC only.
+- Ranking excludes ETF, index, volatility, commodity trust, and other
+  non-single-name tickers before selecting the top 50.
 - Top-150 expansion is deferred until the top-50 proxy data lake and later
   paper-grade quote/IV route are stable.
 

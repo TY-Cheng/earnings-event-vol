@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+import httpx
 import pandas as pd
 import polars as pl
 
@@ -29,8 +30,11 @@ from earnings_event_vol.massive import (
     underlying_flat_file_key,
 )
 from earnings_event_vol.universe import (
+    ELIGIBLE_EQUITY_RULE_VERSION,
+    build_eligible_equity_tickers,
     build_monthly_liquid_universe,
     build_ticker_month_liquidity,
+    eligible_equity_cache_matches_rule,
 )
 
 DEFAULT_PILOT_TICKERS: tuple[str, ...] = (
@@ -213,6 +217,94 @@ def _read_universe_source(path: Path) -> pd.DataFrame:
 def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pl.from_pandas(frame).write_parquet(path, compression="zstd")
+
+
+def _sec_company_ticker_rows(payload: object) -> list[dict[str, object]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    fields = payload.get("fields")
+    data = payload.get("data")
+    if isinstance(fields, list) and isinstance(data, list):
+        rows: list[dict[str, object]] = []
+        field_names = [str(field) for field in fields]
+        for values in data:
+            if not isinstance(values, list):
+                continue
+            rows.append(
+                {
+                    field: values[index] if index < len(values) else None
+                    for index, field in enumerate(field_names)
+                }
+            )
+        return rows
+
+    return [value for value in payload.values() if isinstance(value, dict)]
+
+
+def _read_valid_eligible_equity_cache(path: Path) -> pd.DataFrame | None:
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    try:
+        frame = pl.read_parquet(path).to_pandas()
+    except Exception:
+        return None
+    if not eligible_equity_cache_matches_rule(frame):
+        return None
+    return frame
+
+
+def _load_or_build_eligible_equity_cache(
+    config: ProjectConfig,
+    *,
+    path: Path,
+    source_snapshot_date: date,
+) -> tuple[pd.DataFrame, str]:
+    cached = _read_valid_eligible_equity_cache(path)
+    if cached is not None:
+        return cached, "hit"
+
+    with httpx.Client(timeout=config.massive_request_timeout_seconds) as client:
+        response = client.get(
+            config.sec_company_tickers_url,
+            headers={"User-Agent": config.sec_user_agent},
+        )
+        response.raise_for_status()
+        rows = _sec_company_ticker_rows(response.json())
+    frame = build_eligible_equity_tickers(
+        rows,
+        source_snapshot_date=source_snapshot_date,
+    )
+    if frame.empty:
+        raise ValueError("SEC company ticker metadata produced no eligible-equity rows")
+    _write_parquet(path, frame)
+    return frame, "written"
+
+
+def _eligible_ticker_set(frame: pd.DataFrame) -> set[str]:
+    if frame.empty or "ticker" not in frame.columns or "eligible" not in frame.columns:
+        return set()
+    eligible = frame["eligible"]
+    if pd.api.types.is_bool_dtype(eligible):
+        mask = eligible.astype(bool)
+    elif pd.api.types.is_numeric_dtype(eligible):
+        mask = pd.to_numeric(eligible, errors="coerce").fillna(0).ne(0)
+    else:
+        mask = eligible.astype(str).str.lower().isin({"1", "true", "yes"})
+    return {
+        str(ticker).upper()
+        for ticker in frame.loc[mask, "ticker"].dropna().tolist()
+        if str(ticker).strip()
+    }
+
+
+def _filter_reason_counts(frame: pd.DataFrame) -> dict[str, int]:
+    if frame.empty or "filter_reason" not in frame.columns:
+        return {}
+    counts = frame["filter_reason"].astype(str).value_counts().to_dict()
+    return {str(key): int(value) for key, value in counts.items()}
 
 
 def _month_start(value: date) -> date:
@@ -637,10 +729,15 @@ def _universe_step(
     force: bool,
 ) -> DataPipelineStep:
     out = out_root / "universe"
+    eligible_cache_path = out / "eligible_equity_tickers.parquet"
+    liquidity_path = out / "ticker_month_liquidity.parquet"
+    universe_path = out / "monthly_top50_universe.parquet"
+    manifest_path = out / "universe_manifest.json"
     outputs = (
-        out / "ticker_month_liquidity.parquet",
-        out / "monthly_top50_universe.parquet",
-        out / "universe_manifest.json",
+        eligible_cache_path,
+        liquidity_path,
+        universe_path,
+        manifest_path,
     )
     source_path = options_day_aggs_path or (config.bronze_data_dir / "massive" / "options_day_aggs")
     params = {
@@ -650,6 +747,8 @@ def _universe_step(
         "end_date": end_date.isoformat(),
         "top_n": top_n,
         "trailing_months": trailing_months,
+        "eligible_equity_rule_version": ELIGIBLE_EQUITY_RULE_VERSION,
+        "eligible_equity_source_url": config.sec_company_tickers_url,
     }
     if options_day_aggs_path is None:
         options_day_aggs_path = source_path
@@ -662,16 +761,48 @@ def _universe_step(
                 "requires options day aggregates from options-day-aggs-bulk or --options-day-aggs"
             ),
         )
-    if not force and _complete_with_params(
-        outputs,
-        params_path=outputs[2],
-        expected_params=params,
+    cached_eligible = _read_valid_eligible_equity_cache(eligible_cache_path)
+    if (
+        not force
+        and _complete_with_params(
+            outputs,
+            params_path=manifest_path,
+            expected_params=params,
+        )
+        and cached_eligible is not None
     ):
         return DataPipelineStep(
             "universe",
             "skipped",
             outputs,
             reason="outputs_exist_params_match",
+        )
+
+    try:
+        if cached_eligible is None:
+            eligible_frame, eligible_cache_status = _load_or_build_eligible_equity_cache(
+                config,
+                path=eligible_cache_path,
+                source_snapshot_date=date.today(),
+            )
+        else:
+            eligible_frame = cached_eligible
+            eligible_cache_status = "hit"
+    except Exception as exc:
+        return DataPipelineStep(
+            "universe",
+            "blocked",
+            outputs,
+            reason=f"eligible_equity_cache_unavailable: {exc}",
+        )
+    eligible_tickers = _eligible_ticker_set(eligible_frame)
+    if not eligible_tickers:
+        return DataPipelineStep(
+            "universe",
+            "blocked",
+            outputs,
+            reason="eligible_equity_cache_has_no_eligible_tickers",
+            metadata={"eligible_equity_cache_status": eligible_cache_status},
         )
 
     if options_day_aggs_path.is_dir() and list(options_day_aggs_path.rglob("*.parquet")):
@@ -701,18 +832,43 @@ def _universe_step(
         end_month=end_date,
         top_n=top_n,
         trailing_months=trailing_months,
+        eligible_tickers=sorted(eligible_tickers),
     )
-    _write_parquet(outputs[0], liquidity)
-    _write_parquet(outputs[1], universe)
+    if universe.empty:
+        return DataPipelineStep(
+            "universe",
+            "blocked",
+            outputs,
+            reason="no_eligible_liquidity_rows_after_single_name_filter",
+            metadata={
+                "ticker_month_rows": int(len(liquidity)),
+                "eligible_equity_tickers": int(len(eligible_tickers)),
+                "eligible_equity_cache_status": eligible_cache_status,
+            },
+        )
+    _write_parquet(liquidity_path, liquidity)
+    _write_parquet(universe_path, universe)
+    liquidity_tickers = {str(ticker).upper() for ticker in liquidity["ticker"].dropna().unique()}
+    excluded_liquidity_tickers = sorted(liquidity_tickers - eligible_tickers)
     manifest = {
         "pipeline_params": params,
+        "eligible_equity_cache": _path_signature(eligible_cache_path),
+        "eligible_equity_cache_status": eligible_cache_status,
+        "eligible_equity_rule_version": ELIGIBLE_EQUITY_RULE_VERSION,
+        "eligible_equity_rows": int(len(eligible_frame)),
+        "eligible_equity_tickers": int(len(eligible_tickers)),
+        "eligible_equity_filter_reason_counts": _filter_reason_counts(eligible_frame),
         "ticker_month_rows": int(len(liquidity)),
+        "liquidity_tickers": int(len(liquidity_tickers)),
+        "eligible_liquidity_tickers": int(len(liquidity_tickers & eligible_tickers)),
+        "excluded_liquidity_tickers": int(len(excluded_liquidity_tickers)),
+        "excluded_liquidity_ticker_examples": excluded_liquidity_tickers[:50],
         "universe_rows": int(len(universe)),
         "universe_months": int(universe["universe_month"].nunique())
         if "universe_month" in universe
         else 0,
     }
-    outputs[2].write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     return DataPipelineStep(
         "universe",
         "ran",
@@ -722,6 +878,9 @@ def _universe_step(
             "universe_rows": int(len(universe)),
             "top_n": top_n,
             "trailing_months": trailing_months,
+            "eligible_equity_tickers": int(len(eligible_tickers)),
+            "eligible_equity_cache_status": eligible_cache_status,
+            "excluded_liquidity_tickers": int(len(excluded_liquidity_tickers)),
         },
     )
 
@@ -994,6 +1153,13 @@ def _event_month(value: object) -> date | None:
     return date(int(parsed.year), int(parsed.month), 1)
 
 
+def _frame_value_counts(frame: pd.DataFrame, column: str) -> dict[str, int]:
+    if frame.empty or column not in frame.columns:
+        return {}
+    counts = frame[column].astype(str).value_counts().to_dict()
+    return {str(key): int(value) for key, value in counts.items()}
+
+
 def _apply_dynamic_universe_membership(
     calendar: pd.DataFrame,
     universe: pd.DataFrame,
@@ -1136,6 +1302,12 @@ def _dynamic_calendar_step(
                 filtered["is_main_sample_candidate"].sum()
                 if "is_main_sample_candidate" in filtered
                 else 0
+            ),
+            "rows_by_ticker": _frame_value_counts(filtered, "ticker"),
+            "timing_counts": _frame_value_counts(filtered, "announcement_timing"),
+            "text_validation_counts": _frame_value_counts(filtered, "text_validation_status"),
+            "text_validation_source_counts": _frame_value_counts(
+                filtered, "text_validation_source"
             ),
             "universe_filter_counts": universe_counts,
             "universe_ticker_count": len(tickers),
@@ -1435,7 +1607,7 @@ def _dry_run_estimate(
     estimated_contracts = max_contracts if max_contracts is not None else int(estimated_events * 18)
     exclusions = {
         "non_bmo_amc_timing": "estimated_after_calendar_stage",
-        "missing_sec_or_massive_validation": "estimated_after_calendar_stage",
+        "missing_sec_or_text_validation": "estimated_after_calendar_stage",
         "no_universe_membership": "estimated_after_universe_assignment",
         "missing_underlying_exit_price": "estimated_after_event_windows",
         "missing_contract_metadata": "estimated_after_contract_metadata",

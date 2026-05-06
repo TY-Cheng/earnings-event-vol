@@ -901,9 +901,15 @@ def build_earnings_calendar_candidates(
                         end_date=end_date,
                     )
                     massive_aux_status = "massive_8k_text_http"
+                except httpx.HTTPStatusError as exc:
+                    massive_payloads = None
+                    massive_aux_status = f"unavailable_http_{exc.response.status_code}"
                 except (OSError, ValueError):
                     massive_payloads = None
                     massive_aux_status = "unavailable_missing_key"
+                except httpx.HTTPError:
+                    massive_payloads = None
+                    massive_aux_status = "unavailable_fetch_failed"
 
         if sec_text_by_accession is not None:
             validated = apply_official_then_aux_text_validation(

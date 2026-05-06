@@ -160,6 +160,17 @@ def _pipeline_steps(payload: dict[str, object]) -> list[dict[str, object]]:
     return cast(list[dict[str, object]], payload["steps"])
 
 
+def _write_eligible_equity_cache(
+    out_root: Path,
+    rows: Sequence[Mapping[str, object]],
+) -> Path:
+    path = out_root / "universe" / "eligible_equity_tickers.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = build_eligible_equity_tickers(rows, source_snapshot_date=date(2026, 5, 6))
+    pl.from_pandas(frame).write_parquet(path)
+    return path
+
+
 def _calendar_pipeline_params(
     *,
     tickers: Sequence[str],
@@ -797,6 +808,59 @@ def test_earnings_calendar_soft_fails_when_auxiliary_massive_key_missing(
     assert frame["text_validation_source"].tolist() == ["sec_primary_document_text"]
     assert frame["text_validation_status"].tolist() == ["ambiguous_item_2_02_text"]
     assert report["massive_8k_aux_status"] == "unavailable_missing_key"
+
+
+def test_earnings_calendar_soft_fails_when_auxiliary_massive_unauthorized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_key = tmp_path / "massive_api_key"
+    api_key.write_text("redacted", encoding="utf-8")
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(api_key))
+    monkeypatch.setenv("MASSIVE_BASE_URL", "https://massive.example")
+    monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
+    monkeypatch.setenv(
+        "SEC_SUBMISSIONS_URL_TEMPLATE",
+        "https://sec.example/submissions/CIK{cik:010d}.json",
+    )
+    config = replace(load_project_config(), bronze_data_dir=tmp_path / "bronze")
+    sec_payload = _sec_submissions_payload(
+        [
+            {
+                "accessionNumber": "0000320193-26-000005",
+                "filingDate": "2026-01-29",
+                "acceptanceDateTime": "2026-01-29T21:30:33.000Z",
+                "form": "8-K",
+                "items": "2.02,9.01",
+                "primaryDocument": "aapl-20260129.htm",
+            }
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://sec.example/tickers.json":
+            return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
+        if str(request.url) == "https://sec.example/submissions/CIK0000320193.json":
+            return httpx.Response(200, json=sec_payload)
+        if str(request.url) == (
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/aapl-20260129.htm"
+        ):
+            return httpx.Response(200, text="Item 2.02 Results of Operations.")
+        if request.url.host == "massive.example":
+            return httpx.Response(401, json={"error": "unauthorized"})
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        frame, report = build_earnings_calendar_candidates(
+            config=config,
+            tickers=["AAPL"],
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+            http_client=client,
+        )
+
+    assert frame["text_validation_source"].tolist() == ["sec_primary_document_text"]
+    assert frame["text_validation_status"].tolist() == ["ambiguous_item_2_02_text"]
+    assert report["massive_8k_aux_status"] == "unavailable_http_401"
 
 
 def test_sec_primary_document_fetch_cache_and_failure_paths(tmp_path: Path) -> None:
@@ -1828,6 +1892,13 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+    _write_eligible_equity_cache(
+        out_root,
+        [
+            {"ticker": "AAA", "exchange": "NASDAQ", "title": "AAA Corporation"},
+            {"ticker": "BBB", "exchange": "NYSE", "title": "BBB Corporation"},
+        ],
+    )
     universe_run = run_data_pipeline(
         config,
         stage="universe",
@@ -2209,10 +2280,14 @@ def test_universe_stage_reads_partitioned_options_day_aggs(tmp_path: Path) -> No
             first,
             pl.DataFrame(
                 {
-                    "ticker": ["O:AAPL250117C00100000", "O:MSFT250117C00100000"],
-                    "volume": [10.0, 2.0],
-                    "vwap": [2.0, 1.0],
-                    "close": [1.8, 1.1],
+                    "ticker": [
+                        "O:AAPL250117C00100000",
+                        "O:MSFT250117C00100000",
+                        "O:SPY250117C00500000",
+                    ],
+                    "volume": [10.0, 2.0, 10000.0],
+                    "vwap": [2.0, 1.0, 20.0],
+                    "close": [1.8, 1.1, 20.0],
                 }
             ),
         ),
@@ -2242,6 +2317,14 @@ def test_universe_stage_reads_partitioned_options_day_aggs(tmp_path: Path) -> No
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.write_parquet(path)
 
+    _write_eligible_equity_cache(
+        tmp_path / "pipeline",
+        [
+            {"ticker": "AAPL", "exchange": "NASDAQ", "title": "Apple Inc."},
+            {"ticker": "MSFT", "exchange": "NASDAQ", "title": "Microsoft Corporation"},
+            {"ticker": "SPY", "exchange": "NYSE ArCA", "title": "SPDR S&P 500 ETF Trust"},
+        ],
+    )
     result = run_data_pipeline(
         config,
         stage="universe",
@@ -2290,6 +2373,8 @@ def test_dynamic_calendar_filters_by_latest_prior_universe_month(
                         "announcement_date": "2025-01-30",
                         "announcement_timing": "AMC",
                         "source": "sec",
+                        "text_validation_status": "validated_earnings_release",
+                        "text_validation_source": "sec_primary_document_text",
                         "is_main_sample_candidate": True,
                     },
                     {
@@ -2297,6 +2382,8 @@ def test_dynamic_calendar_filters_by_latest_prior_universe_month(
                         "announcement_date": "2025-03-01",
                         "announcement_timing": "BMO",
                         "source": "sec",
+                        "text_validation_status": "validated_earnings_release",
+                        "text_validation_source": "sec_primary_document_text",
                         "is_main_sample_candidate": True,
                     },
                     {
@@ -2304,6 +2391,8 @@ def test_dynamic_calendar_filters_by_latest_prior_universe_month(
                         "announcement_date": "2025-01-30",
                         "announcement_timing": "AMC",
                         "source": "sec",
+                        "text_validation_status": "validated_earnings_release",
+                        "text_validation_source": "sec_primary_document_text",
                         "is_main_sample_candidate": True,
                     },
                 ]
@@ -2330,6 +2419,15 @@ def test_dynamic_calendar_filters_by_latest_prior_universe_month(
     assert output["ticker"].tolist() == ["AAPL", "MSFT"]
     assert output["universe_rank"].tolist() == [1, 2]
     assert output["universe_filter_status"].eq("in_universe").all()
+    report = json.loads(
+        (out_root / "dynamic_calendar" / "earnings_calendar_report.json").read_text()
+    )
+    assert report["row_count"] == 2
+    assert report["main_sample_candidate_rows"] == 2
+    assert report["rows_by_ticker"] == {"AAPL": 1, "MSFT": 1}
+    assert report["timing_counts"] == {"AMC": 1, "BMO": 1}
+    assert report["text_validation_counts"] == {"validated_earnings_release": 2}
+    assert report["text_validation_source_counts"] == {"sec_primary_document_text": 2}
 
     skipped = data_pipeline._dynamic_calendar_step(
         config,
@@ -3657,6 +3755,103 @@ def test_eligible_equity_cache_version_and_ticker_mapping_soft_fail() -> None:
     )
     missing = ticker_mapping_diagnostics(["XYZ"], ["ABC"])
     assert missing["mapping_status"].iloc[0] == TICKER_NOT_FOUND
+
+
+def test_data_pipeline_eligible_equity_cache_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert data_pipeline._sec_company_ticker_rows("bad") == []
+    assert data_pipeline._sec_company_ticker_rows([{"ticker": "ABC"}, "bad"]) == [{"ticker": "ABC"}]
+    assert data_pipeline._sec_company_ticker_rows(
+        {
+            "fields": ["ticker", "title", "exchange"],
+            "data": [["ABC", "ABC Corporation", "NASDAQ"], "bad"],
+        }
+    ) == [{"ticker": "ABC", "title": "ABC Corporation", "exchange": "NASDAQ"}]
+
+    assert data_pipeline._eligible_ticker_set(
+        pd.DataFrame({"ticker": ["abc", "SPY", ""], "eligible": ["true", "false", "true"]})
+    ) == {"ABC"}
+    assert data_pipeline._eligible_ticker_set(
+        pd.DataFrame({"ticker": ["ABC", "SPY"], "eligible": [1, 0]})
+    ) == {"ABC"}
+    assert data_pipeline._eligible_ticker_set(pd.DataFrame({"ticker": ["ABC"]})) == set()
+    assert data_pipeline._filter_reason_counts(
+        pd.DataFrame({"filter_reason": ["eligible_common_equity", "eligible_common_equity"]})
+    ) == {"eligible_common_equity": 2}
+    assert data_pipeline._filter_reason_counts(pd.DataFrame()) == {}
+
+    missing_path = tmp_path / "missing.parquet"
+    assert data_pipeline._read_valid_eligible_equity_cache(missing_path) is None
+    corrupt = tmp_path / "corrupt.parquet"
+    corrupt.write_text("not parquet", encoding="utf-8")
+    assert data_pipeline._read_valid_eligible_equity_cache(corrupt) is None
+    stale = tmp_path / "stale.parquet"
+    pl.from_pandas(
+        build_eligible_equity_tickers(
+            [{"ticker": "ABC", "title": "ABC Corporation"}],
+            source_snapshot_date=date(2026, 5, 6),
+            rule_version="old",
+        )
+    ).write_parquet(stale)
+    assert data_pipeline._read_valid_eligible_equity_cache(stale) is None
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, dict[str, object]]:
+            return {
+                "0": {"ticker": "ABC", "title": "ABC Corporation", "cik_str": 1},
+                "1": {"ticker": "SPY", "title": "SPDR S&P 500 ETF Trust", "cik_str": 2},
+            }
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.requests: list[tuple[str, dict[str, str]]] = []
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, url: str, *, headers: dict[str, str]) -> FakeResponse:
+            self.requests.append((url, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    cache_path = tmp_path / "eligible.parquet"
+    frame, status = data_pipeline._load_or_build_eligible_equity_cache(
+        load_project_config(),
+        path=cache_path,
+        source_snapshot_date=date(2026, 5, 6),
+    )
+    assert status == "written"
+    assert data_pipeline._eligible_ticker_set(frame) == {"ABC"}
+    cached, cached_status = data_pipeline._load_or_build_eligible_equity_cache(
+        load_project_config(),
+        path=cache_path,
+        source_snapshot_date=date(2026, 5, 6),
+    )
+    assert cached_status == "hit"
+    assert data_pipeline._eligible_ticker_set(cached) == {"ABC"}
+
+    class EmptyResponse(FakeResponse):
+        def json(self) -> dict[str, dict[str, object]]:
+            return {}
+
+    class EmptyClient(FakeClient):
+        def get(self, url: str, *, headers: dict[str, str]) -> EmptyResponse:
+            return EmptyResponse()
+
+    monkeypatch.setattr(httpx, "Client", EmptyClient)
+    with pytest.raises(ValueError, match="no eligible-equity rows"):
+        data_pipeline._load_or_build_eligible_equity_cache(
+            load_project_config(),
+            path=tmp_path / "empty.parquet",
+            source_snapshot_date=date(2026, 5, 6),
+        )
 
 
 def test_monthly_universe_uses_trailing_option_premium_volume_only() -> None:

@@ -11,9 +11,19 @@ premium-space expected edge, not raw variance edge.
   - The public command remains `just data` / `proxy-all`.
   - `proxy-all` runs `options-day-aggs-bulk -> universe ->
     dynamic-calendar -> pilot-panel -> trade-proxy-panel`.
-  - Study window defaults to 2013-01-01 through 2025-12-31.
-  - Universe construction downloads the trailing six-month lookback beginning
-    2012-07-01 for the January 2013 universe.
+  - The runnable Massive-entitlement default is 2022-12-01 through
+    2025-12-31. Universe construction downloads the trailing six-month lookback
+    beginning 2022-06-01 for the December 2022 universe.
+  - The paper target remains 2013-2025, but the current Massive flat-file
+    entitlement observed in this workspace exposes option day aggregates only
+    from 2022-05-04. Earlier dynamic-universe runs require upgraded historical
+    options day-agg entitlement or another licensed options data route.
+  - Universe construction must filter to eligible SEC company/common-equity
+    tickers before the top-50 ranking. ETF, index, volatility, commodity trust,
+    and other non-single-name symbols such as SPX, SPXW, SPY, QQQ, IWM, VIX,
+    and GLD must not consume top-50 slots. The eligibility cache records source,
+    snapshot date, rule version, exchange/name filter reason, and cache
+    invalidation diagnostics.
   - `calendar-pilot` is a static ticker smoke/debug stage and is not part of the
     default final proxy DAG.
 - Main event move is close-to-close:
