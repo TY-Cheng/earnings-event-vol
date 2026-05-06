@@ -729,6 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
             "dynamic-calendar",
             "calendar-pilot",
             "contracts",
+            "contract-reference-validation",
             "panel",
             "pilot-panel",
             "trade-proxy-panel",

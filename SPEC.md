@@ -10,7 +10,8 @@ premium-space expected edge, not raw variance edge.
 - Final proxy data-engineering entrypoint:
   - The public command remains `just data` / `proxy-all`.
   - `proxy-all` runs `options-day-aggs-bulk -> universe ->
-    dynamic-calendar -> pilot-panel -> trade-proxy-panel`.
+    dynamic-calendar -> pilot-panel -> contract-reference-validation ->
+    trade-proxy-panel`.
   - The runnable Massive-entitlement default is 2022-12-01 through
     2025-12-31. Universe construction downloads the trailing six-month lookback
     beginning 2022-06-01 for the December 2022 universe.
@@ -37,10 +38,20 @@ premium-space expected edge, not raw variance edge.
   - Failure reports keep selected raw IVs, DTEs, expiries, spreads, and
     `expiry_gap_days`.
 - Contract discovery must run before proxy-price or paper-grade quote pooling.
-  Primary-sample contracts
-  require `option_multiplier == 100`, `contract_size == 100`, and
-  `deliverable_status == standard`; non-standard OCC deliverables are reported
-  as `non_standard_excluded`.
+  Primary-sample contracts require `option_multiplier == 100`,
+  `contract_size == 100`, and `deliverable_status == standard`; non-standard
+  OCC deliverables are reported as `non_standard_excluded`.
+- `contract-reference-validation` validates selected candidate option contracts
+  against Massive `/v3/reference/options/contracts` metadata before
+  second-aggregate entry fetching:
+  - Read `shares_per_contract`, `additional_underlyings`, `exercise_style`, and
+    `correction`.
+  - Override `option_multiplier`, `contract_size`, and `deliverable_status`
+    when reference metadata is available.
+  - Exclude contracts with non-100 `shares_per_contract` or adjusted
+    deliverables as `non_standard_excluded`.
+  - Reference-fetch failures are manifest diagnostics only. They do not make a
+    contract paper-grade and do not create bid/ask or NBBO claims.
 - V1.5 may build a trade-price proxy panel from Massive option second
   aggregates:
   - For each candidate contract, use the latest pre-cutoff VWAP or close inside

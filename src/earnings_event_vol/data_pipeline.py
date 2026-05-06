@@ -16,6 +16,12 @@ import pandas as pd
 import polars as pl
 
 from earnings_event_vol.config import ProjectConfig
+from earnings_event_vol.contract_reference import (
+    CONTRACT_REFERENCE_SCHEMA_VERSION,
+    REFERENCE_STATUS_VALIDATED,
+    apply_contract_reference_validation,
+    fetch_massive_option_contract_reference,
+)
 from earnings_event_vol.data_audit import audit_data_fields
 from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
@@ -94,6 +100,7 @@ SUPPORTED_DATA_STAGES = {
     "dynamic-calendar",
     "calendar-pilot",
     "contracts",
+    "contract-reference-validation",
     "panel",
     "pilot-panel",
     "trade-proxy-panel",
@@ -2156,6 +2163,181 @@ def _pilot_panel_step(
     )
 
 
+def _contract_reference_validation_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+    jobs: int,
+    max_contracts: int | None,
+    refresh_bronze: bool,
+) -> DataPipelineStep:
+    candidate_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    reference_path = config.silver_data_dir / "contracts" / "contract_reference_validation.parquet"
+    out = out_root / "contract_reference_validation"
+    report_path = out / "contract_reference_fetch_report.csv"
+    manifest_path = out / "contract_reference_validation_manifest.json"
+    outputs = (candidate_path, reference_path, report_path, manifest_path)
+    if not candidate_path.exists():
+        return DataPipelineStep(
+            "contract-reference-validation",
+            "blocked",
+            outputs,
+            reason="requires event_contract_candidates.parquet",
+        )
+
+    params = {
+        "stage": "contract-reference-validation",
+        "candidate_path": str(candidate_path),
+        "max_contracts": max_contracts,
+        "refresh_bronze": refresh_bronze,
+        "schema_version": CONTRACT_REFERENCE_SCHEMA_VERSION,
+    }
+    required_candidate_columns = {
+        "contract_reference_status",
+        "contract_reference_validated",
+        "contract_reference_source_dataset",
+    }
+    if (
+        not force
+        and not refresh_bronze
+        and _complete_with_params(
+            outputs,
+            params_path=manifest_path,
+            expected_params=params,
+        )
+        and _parquet_has_columns(candidate_path, required_candidate_columns)
+    ):
+        return DataPipelineStep(
+            "contract-reference-validation",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    candidates = pd.read_parquet(candidate_path)
+    if "options_ticker" not in candidates.columns:
+        return DataPipelineStep(
+            "contract-reference-validation",
+            "blocked",
+            outputs,
+            reason="candidate_contracts_missing_options_ticker",
+        )
+    unique_tickers = (
+        candidates["options_ticker"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .loc[lambda series: series.ne("")]
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+    if max_contracts is not None:
+        unique_tickers = unique_tickers[:max_contracts]
+    if not unique_tickers:
+        return DataPipelineStep(
+            "contract-reference-validation",
+            "blocked",
+            outputs,
+            reason="no_candidate_option_tickers",
+        )
+
+    _progress(
+        "contract-reference-validation: "
+        f"contracts={len(unique_tickers)} jobs={jobs} refresh_bronze={refresh_bronze}"
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    cache_root = config.bronze_data_dir / "massive" / "options_contract_reference"
+    rows: list[dict[str, object]] = []
+    completed = 0
+    with (
+        httpx.Client(timeout=config.massive_request_timeout_seconds) as client,
+        ThreadPoolExecutor(max_workers=max(1, jobs)) as executor,
+    ):
+        futures = {
+            executor.submit(
+                fetch_massive_option_contract_reference,
+                client,
+                config,
+                options_ticker=option_ticker,
+                cache_root=cache_root,
+                refresh_bronze=refresh_bronze,
+            ): option_ticker
+            for option_ticker in unique_tickers
+        }
+        for future in as_completed(futures):
+            option_ticker = futures[future]
+            try:
+                row = future.result().report_row()
+            except Exception as exc:
+                row = {
+                    "options_ticker": option_ticker,
+                    "fetch_status": "failed",
+                    "contract_reference_status": "fetch_failed",
+                    "contract_reference_error": str(exc),
+                }
+            rows.append(row)
+            completed += 1
+            if completed == len(unique_tickers) or completed % 25 == 0:
+                counts = Counter(str(item.get("fetch_status")) for item in rows)
+                _progress(
+                    "contract-reference-validation progress: "
+                    f"{completed}/{len(unique_tickers)} "
+                    + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+                )
+
+    reference_report = pd.DataFrame(rows).sort_values("options_ticker").reset_index(drop=True)
+    validated = apply_contract_reference_validation(candidates, reference_report)
+    _write_parquet(candidate_path, validated)
+    _write_parquet(reference_path, reference_report)
+    reference_report.to_csv(report_path, index=False)
+    fetch_counts = (
+        reference_report["fetch_status"].astype(str).value_counts().to_dict()
+        if "fetch_status" in reference_report
+        else {}
+    )
+    status_counts = (
+        reference_report["contract_reference_status"].astype(str).value_counts().to_dict()
+        if "contract_reference_status" in reference_report
+        else {}
+    )
+    non_standard_rows = int(
+        validated["contract_discovery_status"].astype(str).eq("non_standard_excluded").sum()
+    )
+    manifest = {
+        "pipeline_params": params,
+        "status_counts": {str(key): int(value) for key, value in status_counts.items()},
+        "fetch_status_counts": {str(key): int(value) for key, value in fetch_counts.items()},
+        "candidate_rows": int(len(candidates)),
+        "candidate_rows_after_validation": int(len(validated)),
+        "reference_contracts_requested": int(len(unique_tickers)),
+        "validated_contracts": int(
+            reference_report["contract_reference_status"]
+            .astype(str)
+            .eq(REFERENCE_STATUS_VALIDATED)
+            .sum()
+        )
+        if "contract_reference_status" in reference_report
+        else 0,
+        "non_standard_excluded_rows": non_standard_rows,
+        "outputs": [str(path) for path in outputs],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    return DataPipelineStep(
+        "contract-reference-validation",
+        "ran",
+        outputs,
+        metadata={
+            "reference_contracts_requested": int(len(unique_tickers)),
+            "status_counts": manifest["status_counts"],
+            "fetch_status_counts": manifest["fetch_status_counts"],
+            "non_standard_excluded_rows": non_standard_rows,
+        },
+    )
+
+
 def _trade_proxy_panel_step(
     config: ProjectConfig,
     *,
@@ -2293,6 +2475,7 @@ def _dry_run_estimate(
             "universe",
             "dynamic-calendar",
             "pilot-panel",
+            "contract-reference-validation",
             "trade-proxy-panel",
         ]
         if stage == "proxy-all"
@@ -2306,6 +2489,7 @@ def _dry_run_estimate(
             "tickers": ticker_count,
             "events": estimated_events,
             "contracts": estimated_contracts,
+            "contract_reference_rest_calls": estimated_contracts,
             "second_agg_rest_calls": estimated_contracts,
             "bulk_day_agg_partitions": estimated_trading_days * 2 if stage == "proxy-all" else None,
         },
@@ -2398,6 +2582,7 @@ def run_data_pipeline(
             "contracts",
             "panel",
             "pilot-panel",
+            "contract-reference-validation",
         ]
     elif normalized_stage == "proxy-all":
         stages = [
@@ -2405,6 +2590,7 @@ def run_data_pipeline(
             "universe",
             "dynamic-calendar",
             "pilot-panel",
+            "contract-reference-validation",
             "trade-proxy-panel",
         ]
     else:
@@ -2525,6 +2711,16 @@ def run_data_pipeline(
                     if normalized_stage == "proxy-all"
                     else None
                 ),
+            )
+        ],
+        "contract-reference-validation": lambda: [
+            _contract_reference_validation_step(
+                config,
+                out_root=out_root,
+                force=stage_force,
+                jobs=jobs,
+                max_contracts=max_contracts,
+                refresh_bronze=refresh_bronze,
             )
         ],
         "trade-proxy-panel": lambda: [

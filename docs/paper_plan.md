@@ -132,6 +132,11 @@ market data for prices:
 - **Massive options day aggregates** support universe liquidity ranking,
   contract discovery, local IV proxy inputs, same-contract exit option close,
   and 20-day close-trade-implied option-surface sequences.
+- **Massive option contract reference metadata** validates selected candidate
+  contracts before entry-price fetching. The pipeline reads
+  `shares_per_contract`, `additional_underlyings`, `exercise_style`, and
+  `correction` from `/v3/reference/options/contracts`; non-100 or adjusted
+  deliverables are excluded from proxy trading rows.
 - **Massive underlying day aggregates** support underlying closes, event returns,
   `RVAR_event`, exit spot, and daily market-return controls.
 - **Massive option one-second aggregates** support targeted pre-cutoff entry
@@ -215,6 +220,13 @@ deliverable_status == standard
 main sample: 5 <= event_expiry_DTE <= 14
 robustness: 3 <= event_expiry_DTE <= 21
 ```
+
+The `contract-reference-validation` stage runs after candidate discovery and
+before second-aggregate entry fetching. When reference metadata is available it
+overrides the day-agg placeholder multiplier and deliverable fields. Fetch
+failures are written to the manifest as diagnostics; they do not promote any
+contract to paper-grade status and do not change the `no_nbbo_trade_proxy`
+limitation.
 
 Appendix D will tabulate exclusions by reason, ticker, year, VIX regime, and
 BMO/AMC timing.

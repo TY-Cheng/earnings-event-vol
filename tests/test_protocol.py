@@ -18,6 +18,7 @@ import polars as pl
 import pytest
 import torch
 
+import earnings_event_vol.contract_reference as contract_reference
 import earnings_event_vol.data_pipeline as data_pipeline
 import scripts.build_trade_proxy_panel as trade_proxy_panel_script
 from earnings_event_vol.backtest import (
@@ -34,6 +35,7 @@ from earnings_event_vol.backtest import (
 )
 from earnings_event_vol.cli import main
 from earnings_event_vol.config import load_project_config
+from earnings_event_vol.contract_reference import apply_contract_reference_validation
 from earnings_event_vol.data_audit import audit_data_fields, vendor_local_iv_comparison
 from earnings_event_vol.data_pipeline import (
     DataPipelineStep,
@@ -1639,6 +1641,360 @@ def test_standard_contracts_enter_quote_pool() -> None:
     assert bool(discovered["covers_event_window"].iloc[0]) is True
 
 
+def test_contract_reference_validation_excludes_adjusted_deliverables() -> None:
+    candidates = pd.DataFrame(
+        {
+            "event_id": ["evt1", "evt1", "evt2"],
+            "options_ticker": [
+                "O:ABC260213C00100000",
+                "O:ABC260213P00100000",
+                "O:XYZ260213C00050000",
+            ],
+            "option_multiplier": [100, 100, 100],
+            "contract_size": [100, 100, 100],
+            "deliverable_status": ["standard", "standard", "standard"],
+            "corporate_action_flag": [False, False, False],
+            "contract_discovery_status": ["ok", "ok", "ok"],
+            "eligible_for_quote_pool": [True, True, True],
+            "is_main_dte_5_14": [True, True, True],
+            "is_robustness_dte_3_21": [True, True, True],
+        }
+    )
+    reference = pd.DataFrame(
+        {
+            "options_ticker": [
+                "O:ABC260213C00100000",
+                "O:ABC260213P00100000",
+                "O:XYZ260213C00050000",
+            ],
+            "contract_reference_status": ["validated", "validated", "fetch_failed"],
+            "contract_reference_error": [None, None, "HTTP 503"],
+            "contract_reference_shares_per_contract": [100, 150, pd.NA],
+            "contract_reference_additional_underlyings_count": [0, 1, 0],
+            "contract_reference_has_adjusted_deliverable": [False, True, False],
+            "contract_reference_exercise_style": ["american", "american", pd.NA],
+            "contract_reference_correction": [0, 1, pd.NA],
+        }
+    )
+
+    validated = apply_contract_reference_validation(candidates, reference)
+
+    assert validated.loc[0, "option_multiplier"] == 100
+    assert bool(validated.loc[0, "contract_reference_validated"]) is True
+    assert bool(validated.loc[0, "eligible_for_quote_pool"]) is True
+    assert validated.loc[1, "option_multiplier"] == 150
+    assert validated.loc[1, "contract_size"] == 150
+    assert validated.loc[1, "deliverable_status"] == "non_standard"
+    assert validated.loc[1, "contract_discovery_status"] == CONTRACT_STATUS_NON_STANDARD_EXCLUDED
+    assert bool(validated.loc[1, "eligible_for_quote_pool"]) is False
+    assert bool(validated.loc[1, "is_main_dte_5_14"]) is False
+    assert validated.loc[2, "contract_reference_status"] == "fetch_failed"
+    assert bool(validated.loc[2, "contract_reference_validated"]) is False
+    assert validated.loc[2, "contract_discovery_status"] == "ok"
+
+
+def test_contract_reference_helpers_parse_cache_and_fallback_endpoint(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "results": [
+            {"ticker": "O:OTHER", "shares_per_contract": 100},
+            {
+                "ticker": "O:ABC260213C00100000",
+                "shares_per_contract": 150,
+                "additional_underlyings": [{"ticker": "XYZ"}],
+                "exercise_style": "american",
+                "correction": 1,
+            },
+        ]
+    }
+    result = contract_reference.ContractReferenceFetchResult(
+        options_ticker="O:ABC260213C00100000",
+        fetch_status="hit",
+        contract_reference_status="validated",
+        payload=payload,
+        error=None,
+        cache_path="cache.json",
+    )
+
+    row = result.report_row()
+
+    assert row["contract_reference_shares_per_contract"] == 150
+    assert row["contract_reference_additional_underlyings_count"] == 1
+    assert row["contract_reference_has_adjusted_deliverable"] is True
+    assert (
+        contract_reference.contract_reference_cache_path(tmp_path, "O:ABC260213C00100000")
+        .as_posix()
+        .endswith("options_ticker=O_ABC260213C00100000/reference.json")
+    )
+    assert (
+        contract_reference.extract_contract_reference_fields("O:ABC", {})[
+            "contract_reference_has_adjusted_deliverable"
+        ]
+        is False
+    )
+
+    config = replace(
+        load_project_config(),
+        massive_api_key_file=tmp_path / "massive_api_key.txt",
+        massive_base_url="https://api.massive.test",
+    )
+    assert config.massive_api_key_file is not None
+    config.massive_api_key_file.write_text("key", encoding="utf-8")
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if request.url.path.rstrip("/") != "/v3/reference/options/contracts":
+            return httpx.Response(404, json={"status": "NOT_FOUND"})
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        fetched = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:ABC260213C00100000",
+            cache_root=tmp_path / "cache",
+        )
+
+    assert fetched.fetch_status == "downloaded"
+    assert fetched.contract_reference_status == "validated"
+    assert any("/v3/reference/options/contracts?" in url for url in seen_urls)
+    assert Path(str(fetched.cache_path)).exists()
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        cached = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:ABC260213C00100000",
+            cache_root=tmp_path / "cache",
+        )
+    assert cached.fetch_status == "hit"
+
+
+def test_contract_reference_handles_missing_parse_and_failed_fetch(
+    tmp_path: Path,
+) -> None:
+    assert (
+        contract_reference.extract_contract_reference_fields("O:ABC", None)[
+            "contract_reference_has_adjusted_deliverable"
+        ]
+        is False
+    )
+    missing_fields = contract_reference.extract_contract_reference_fields("O:ABC", {"results": []})
+    missing_shares = cast(float, missing_fields["contract_reference_shares_per_contract"])
+    assert np.isnan(missing_shares)
+    direct = contract_reference.extract_contract_reference_fields(
+        "O:ABC",
+        {"shares_per_contract": 100, "additional_underlyings": {"cash": 1}},
+    )
+    assert direct["contract_reference_additional_underlyings_count"] == 1
+    first_fallback = contract_reference.extract_contract_reference_fields(
+        "O:ABC",
+        {"results": [{"ticker": "O:OTHER", "shares_per_contract": 100}]},
+    )
+    assert first_fallback["contract_reference_shares_per_contract"] == 100
+    assert contract_reference._additional_underlyings_count(None) == 0
+    assert contract_reference._additional_underlyings_count([]) == 0
+    assert contract_reference._additional_underlyings_count("[]") == 0
+    assert contract_reference._additional_underlyings_count("cash") == 1
+
+    key_file = tmp_path / "massive_api_key.txt"
+    key_file.write_text("key", encoding="utf-8")
+    config = replace(
+        load_project_config(),
+        massive_api_key_file=key_file,
+        massive_base_url="https://api.massive.test",
+    )
+    cache_root = tmp_path / "cache"
+    missing_cache = contract_reference.contract_reference_cache_path(cache_root, "O:MISS")
+    missing_cache.parent.mkdir(parents=True)
+    missing_cache.write_text('{"results": []}', encoding="utf-8")
+    parse_cache = contract_reference.contract_reference_cache_path(cache_root, "O:PARSE")
+    parse_cache.parent.mkdir(parents=True)
+    parse_cache.write_text('{"results": {"ticker": "O:PARSE"}}', encoding="utf-8")
+    bad_cache = contract_reference.contract_reference_cache_path(cache_root, "O:BAD")
+    bad_cache.parent.mkdir(parents=True)
+    bad_cache.write_text("{bad-json", encoding="utf-8")
+
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(401))) as client:
+        missing = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:MISS",
+            cache_root=cache_root,
+        )
+        parse_failed = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:PARSE",
+            cache_root=cache_root,
+        )
+        failed = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:BAD",
+            cache_root=cache_root,
+        )
+
+    assert missing.contract_reference_status == "missing_reference"
+    assert parse_failed.contract_reference_status == "parse_failed"
+    assert failed.contract_reference_status == "fetch_failed"
+
+    no_key_config = replace(load_project_config(), massive_api_key_file=None)
+    ok_transport = httpx.MockTransport(lambda request: httpx.Response(200))
+    with (
+        pytest.raises(ValueError, match="MASSIVE_API_KEY_FILE"),
+        httpx.Client(transport=ok_transport) as client,
+    ):
+        contract_reference.fetch_massive_option_contract_reference(
+            client,
+            no_key_config,
+            options_ticker="O:NOKEY",
+            cache_root=tmp_path / "no_key_cache",
+            refresh_bronze=True,
+        )
+
+
+def test_contract_reference_validation_empty_and_invalid_reports() -> None:
+    candidates = pd.DataFrame({"options_ticker": ["O:ABC260213C00100000"]})
+
+    empty = apply_contract_reference_validation(candidates, pd.DataFrame())
+
+    assert empty["contract_reference_status"].tolist() == ["not_requested"]
+    assert empty["contract_discovery_status"].isna().all()
+    minimal = apply_contract_reference_validation(
+        candidates,
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_reference_status": ["validated"],
+                "contract_reference_shares_per_contract": [100],
+            }
+        ),
+    )
+    assert minimal["deliverable_status"].tolist() == ["standard"]
+    assert minimal["corporate_action_flag"].tolist() == [False]
+    with pytest.raises(ValueError, match="missing columns"):
+        apply_contract_reference_validation(
+            candidates,
+            pd.DataFrame({"options_ticker": ["O:ABC260213C00100000"]}),
+        )
+    with pytest.raises(ValueError, match="missing options_ticker"):
+        apply_contract_reference_validation(pd.DataFrame({"ticker": ["ABC"]}), pd.DataFrame())
+
+
+def test_contract_reference_validation_pipeline_step_updates_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        silver_data_dir=tmp_path / "silver",
+        bronze_data_dir=tmp_path / "bronze",
+    )
+    candidate_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    candidate_path.parent.mkdir(parents=True)
+    candidates = pd.DataFrame(
+        {
+            "event_id": ["evt1", "evt1"],
+            "options_ticker": ["O:AAA260213C00100000", "O:AAA260213P00100000"],
+            "option_multiplier": [100, 100],
+            "contract_size": [100, 100],
+            "deliverable_status": ["standard", "standard"],
+            "corporate_action_flag": [False, False],
+            "contract_discovery_status": ["ok", "ok"],
+            "eligible_for_quote_pool": [True, True],
+            "is_main_dte_5_14": [True, True],
+            "is_robustness_dte_3_21": [True, True],
+        }
+    )
+    pl.from_pandas(candidates).write_parquet(candidate_path)
+
+    def fake_fetch(
+        client: httpx.Client,
+        config: object,
+        *,
+        options_ticker: str,
+        cache_root: Path,
+        refresh_bronze: bool = False,
+    ) -> contract_reference.ContractReferenceFetchResult:
+        del client, config, cache_root, refresh_bronze
+        shares = 150 if options_ticker.endswith("P00100000") else 100
+        return contract_reference.ContractReferenceFetchResult(
+            options_ticker=options_ticker,
+            fetch_status="downloaded",
+            contract_reference_status="validated",
+            payload={
+                "results": {
+                    "ticker": options_ticker,
+                    "shares_per_contract": shares,
+                    "additional_underlyings": [{"ticker": "CASH"}] if shares != 100 else [],
+                    "exercise_style": "american",
+                    "correction": 0,
+                }
+            },
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.fetch_massive_option_contract_reference",
+        fake_fetch,
+    )
+
+    step = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=2,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+
+    assert step.status == "ran"
+    validated = pd.read_parquet(candidate_path)
+    assert validated["contract_reference_validated"].tolist() == [True, True]
+    assert validated["option_multiplier"].tolist() == [100, 150]
+    assert validated["contract_discovery_status"].tolist() == [
+        "ok",
+        CONTRACT_STATUS_NON_STANDARD_EXCLUDED,
+    ]
+    assert validated["eligible_for_quote_pool"].tolist() == [True, False]
+    assert (
+        tmp_path
+        / "artifacts"
+        / "contract_reference_validation"
+        / "contract_reference_validation_manifest.json"
+    ).exists()
+
+    resume = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=2,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+    assert resume.status == "skipped"
+
+
+def test_contract_reference_validation_pipeline_step_blocks_without_candidates(
+    tmp_path: Path,
+) -> None:
+    config = replace(load_project_config(), silver_data_dir=tmp_path / "silver")
+
+    step = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=1,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+
+    assert step.status == "blocked"
+    assert step.reason == "requires event_contract_candidates.parquet"
+
+
 def test_forward_parity_requires_no_dividend_window() -> None:
     quotes = pd.DataFrame(
         {
@@ -2073,6 +2429,7 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         "universe",
         "dynamic-calendar",
         "pilot-panel",
+        "contract-reference-validation",
         "trade-proxy-panel",
     ]
     assert cast(dict[str, object], dry_run["bulk_day_aggs_date_range"])["start"] == "2025-07-01"
@@ -2924,6 +3281,9 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
     def fail_calendar_pilot(*args: object, **kwargs: object) -> DataPipelineStep:
         raise AssertionError("calendar-pilot must not run inside proxy-all")
 
+    def fake_contract_reference(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("contract-reference-validation", "ran")
+
     def fake_run(
         command: Sequence[str],
         *,
@@ -2970,6 +3330,10 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
     monkeypatch.setattr(
         "earnings_event_vol.data_pipeline._calendar_pilot_step", fail_calendar_pilot
     )
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._contract_reference_validation_step",
+        fake_contract_reference,
+    )
     monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
 
     result = run_data_pipeline(
@@ -2990,9 +3354,10 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
         "universe",
         "dynamic-calendar",
         "pilot-panel",
+        "contract-reference-validation",
         "trade-proxy-panel",
     ]
-    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran"]
+    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran", "ran"]
     assert len(captured_commands) == 2
     pilot_command, trade_command = captured_commands
     assert "build_pilot_panel.py" in pilot_command[1]

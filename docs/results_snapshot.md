@@ -39,6 +39,11 @@ The current proxy route uses three required market-data inputs:
   before the event cutoff. Entry selection then uses the latest positive
   `option_vwap` or `option_close` in the final 900 seconds before cutoff.
 
+Candidate contracts are validated against Massive option reference metadata
+before entry proxy fetching. Non-100 or adjusted deliverables are marked
+`non_standard_excluded`; reference-fetch failures are diagnostics and do not
+create paper-grade execution claims.
+
 The one-second aggregates are trade OHLCV bars. They are not quote midpoints,
 bid/ask records, or NBBO.
 
