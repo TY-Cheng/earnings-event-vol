@@ -1,237 +1,209 @@
 # Results Snapshot
 
-## Current State
+This page is the curated reader-facing snapshot. Raw generated outputs live
+under ignored `artifacts/`, `data/`, and `reports/` paths; only selected
+results and figures are copied into `docs/` for publication.
 
-This repository is an early-stage research pipeline for the earnings event
-volatility project. The current implementation can build audited candidate
-events, provisional event panels, and a second-aggregate trade-price proxy
-panel, then build a feature matrix and run the first proxy forecast/ranking/
-strategy model suite. It does not yet produce paper-grade quote/NBBO backtest
-results. The active market-data route has no historical option quote rows:
-proxy entry marks come from Massive option second aggregates, and proxy exit
-marks come from exit-date option day-aggregate closes when available.
+## Status
 
-Active and current:
+Current local run state, verified on 2026-05-06:
 
-- Project name: `earnings-event-vol`.
-- Python package: `src/earnings_event_vol`.
-- Local environment: `UV_PROJECT_ENVIRONMENT="${HOME}/.venvs/earnings-event-vol"`.
-- Credential policy: Massive keys are file-only through `.env`.
-- Verification front door: `just check`, including `ruff format`, `ruff check
-  --fix`, strict mypy, pytest, MkDocs strict, status, and Massive credential
-  probes.
-- Test coverage floor: 93% on the active package. Current local test gate:
-  75 tests passed with 93.14% total coverage.
-- Data-audit gate: `just audit` for fixtures; `just audit date=YYYY-MM-DD` for
-  a narrow Massive flat-file sample gate.
-- Data-engineering gate: `just data` for resumable stages. The current stages
-  are `fixture-audit`, `massive-probe`, `options-day-aggs-bulk`, `universe`,
-  `dynamic-calendar`, `calendar-pilot`, `contracts`, `panel`, `pilot-panel`,
-  `trade-proxy-panel`, and `proxy-all`;
-  outputs are skipped only when present and when their saved parameter signature
-  matches the requested run.
-- `just data` defaults to `proxy-all`, which runs
-  `options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel ->
-  trade-proxy-panel` over the current Massive-entitlement proxy range
-  `2022-12-01` through `2025-12-31`; the universe lookback begins at
-  `2022-06-01`, with 4 workers by default, a 900-second pricing lookback, a
-  60-minute resolved-close pre-cutoff buffer, monthly top 50 by trailing
-  six-month option premium dollar volume, and DTE `3-21` contract discovery.
-  Use `args="--max-events 10"` for a downstream smoke run;
-  it does not shrink the universe/calendar build. `--force` rebuilds derived
-  outputs while reusing valid bronze caches; `--refresh-bronze` explicitly
-  re-fetches flat-file and second-aggregate bronze partitions. Explicit stage
-  names are still available for rebuilding the calendar, pilot panel, fixture
-  audit, and legacy fixture panel smoke paths. It prints stage-level progress
-  plus bulk day-agg, second-agg, and exit day-agg count/status updates during
-  long runs.
-- Research gate: `just research` builds
-  `data/gold/modeling/feature_matrix.parquet` from the current proxy event
-  panel and trains/evaluates market IVAR, last-four RVAR, last-four IVAR,
-  Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost,
-  FT-Transformer, and the Mamba sequence-encoder entrypoint. Mamba is marked
-  `skipped_no_sequence_features` when the feature matrix lacks 20-day
-  `seq_tXX_*` option-surface path columns.
-- Data lake layout: Massive flat-file downloads are temporary transfer files.
-  They are converted immediately into compressed Parquet under `data/bronze/`;
-  full-market option/underlying day aggregates are cached under
-  `data/bronze/massive/options_day_aggs/` and
-  `data/bronze/massive/underlying_day_aggs/`; second-aggregate trade-proxy bars
-  are cached under
-  `data/bronze/massive/options_second_aggs/` for entry/pre-cutoff diagnostics
-  only; exit option prices come from exit-date `options_day_aggs` closes.
-  Cached Parquet partitions are reused if readable with the expected schema;
-  corrupt flat-file, second-agg, or exit day-agg caches are repaired by deleting
-  and re-fetching the affected partition.
-  Cleaned intermediate tables go to `data/silver/`; analysis-ready panels go to
-  `data/gold/`. `artifacts/` is reserved for manifests, readiness reports, and
-  audit summaries.
-- Dynamic universe and calendar scaffolding now sit in the default proxy DAG.
-  `universe` builds monthly ticker liquidity from normalized option day
-  aggregates, filters ETF/index/non-single-name symbols with an SEC
-  company/common-equity eligibility cache, and then writes top-50 trailing
-  six-month option premium dollar-volume snapshots; `dynamic-calendar` queries
-  SEC EDGAR submissions plus official
-  SEC primary filing documents for the universe ticker union and filters events
-  by latest prior universe membership, writing `universe_month`,
-  `universe_rank`, `in_universe`, and `universe_filter_status`. Massive 8-K
-  text is optional auxiliary fallback, not a required calendar dependency.
-- First real Massive flat-file probe: `just audit date=2025-02-05` succeeded
-  for option day aggregates, option quotes metadata, and underlying day
-  aggregates. Outputs are in `artifacts/massive_flat_file_probe/`. The
-  `options_quotes_v1` observation is metadata/readiness only; current proxy data
-  engineering does not ingest that quote file.
-- Current data-readiness finding: `day_aggs_v1` supports contract parsing,
-  underlying close sampling, and a provisional local-IV route from option close
-  prices. It lacks bid/ask, open interest, quote condition, IV, and Greeks, so
-  it cannot support paper-grade IVAR extraction or transaction-cost backtests by
-  itself. The active near-term route therefore remains `no_nbbo_trade_proxy`.
-  A later paper-grade route would need `options_quotes_v1` or another
-  historical bid/ask/NBBO source plus IV/Greeks/OI or local IV from mids.
-- First earnings-source probe: `artifacts/earnings_calendar_source_probe/`
-  compares Nasdaq calendar rows, SEC EDGAR company submissions, SEC primary
-  filing documents, and Massive 8-K text for AAPL, AMZN, MSFT, NVDA, and TSLA.
-  SEC EDGAR is the primary candidate and validation route because it provides
-  official 8-K metadata, Item 2.02 tags, acceptance timestamps, and filing text.
-  Massive 8-K text remains auxiliary fallback. Nasdaq calendar rows are not
-  reliable enough as the primary historical timing source in the current probe
-  because the matched SEC-confirmed sample had zero known Nasdaq timing flags.
-- Earnings calendar builder: `build-earnings-calendar` now creates SEC-first
-  candidate tables and validates accessions against SEC primary filing text by
-  default, with Massive 8-K text available only as fallback. A live
-  AAPL/MSFT/TSLA sample for 2026-01-01 through 2026-04-30 wrote
-  `artifacts/earnings_calendar_sample/`: 8 SEC Item 2.02 candidates and 5
-  main-sample candidates after timing and text validation.
-- Active protocol file: `SPEC.md`.
+| Item | Current state |
+| --- | --- |
+| Data route | Massive option second aggregates plus option day aggregates |
+| Execution grade | `no_nbbo_trade_proxy`, `paper_grade=false` |
+| Study window in current run | 2022-12-01 to 2025-12-31 |
+| Target paper window | 2013-2025, pending historical quote/NBBO or equivalent data |
+| Universe | Monthly top 50 liquid U.S. single-name option underlyings |
+| Event source | SEC EDGAR submissions plus SEC primary filing document text |
+| Main timing sample | BMO and AMC only |
+| Research package | Feature matrix, model metrics, proxy strategy diagnostics, figures |
 
-Not yet paper evidence:
+The current evidence is useful for engineering validation and signal screening.
+It is not paper-grade execution evidence because it does not use historical
+bid/ask or NBBO quotes.
 
-- A provisional top-50 pilot panel exists through `just data pilot-panel`; it is
-  explicitly marked `provisional_no_nbbo` because it uses `options_day_aggs`
-  close prices rather than pre-event NBBO quote pools.
-- A V1.5 trade-price proxy route now exists through
-  `just data trade-proxy-panel`. It uses Massive option second aggregates to
-  take the latest pre-cutoff VWAP or close for candidate contracts, recompute
-  local IV, and write a `no_nbbo_trade_proxy` event panel plus gross/haircut
-  straddle diagnostics. Exit diagnostics use exit-date option day-aggregate
-  closes by default and record `option_exit_price_status` plus
-  `used_intrinsic_fallback` when intrinsic payoff is needed. This is useful for
-  screening, not paper-grade execution claims.
-- No paper-grade Massive `options_quotes_v1` ingestion has been implemented.
-  The top-50 proxy pipeline is implemented. The runnable default is
-  2022-12-01 through 2025-12-31 because the current Massive entitlement
-  observed in this workspace exposes option day aggregates from 2022-05-04;
-  full 2013-2025 dynamic-universe data still requires upgraded historical
-  options day-agg entitlement or another licensed options data route.
-- The active implementation now includes deterministic data plumbing plus a
-  train/test proxy modeling pipeline: event alignment, variance extraction,
-  leakage checks, data audit, contract discovery, local-IV diagnostics, feature
-  matrix construction, benchmark/model training, forecast metrics, ranking
-  diagnostics, and cost-aware proxy strategy summaries.
-- Integrity guards now fail closed on model-implementation claims, IVAR expiry
-  coverage, timezone mismatches, missing/duplicate event-price rows, and
-  vendor/local IV audit prerequisites.
-- Contract discovery now records multiplier, contract size, deliverable status,
-  corporate-action flags, and `contract_discovery_status`; non-standard OCC
-  contracts are excluded before proxy-price pooling.
-- Event-panel scaffolding now records `forward_source`, `forward_price`,
-  `atm_selection_method`, `american_forward_caveat_flag`, and
-  `possible_preannouncement_or_prior_guidance`.
-- IVAR extraction failures now keep selected raw IVs, DTEs, expiries, spreads,
-  and `expiry_gap_days` for diagnosis.
-- Proxy model outputs have been run locally. They are useful for engineering
-  diagnostics and first-pass signal screening, but they are not paper evidence
-  until robustness, cost sensitivity, and no-NBBO limitations are analyzed.
+## Data Coverage
 
-Latest local pilot-panel run:
+Latest proxy data pipeline outputs:
 
-- Command: `just data args="--force --max-events 50 --jobs 4"`.
-- Gold panel: `data/gold/event_panel/pilot_event_panel.parquet`.
-- Rows: 50 events in the current local calibration slice.
-- RVAR/IVAR coverage: 50/50 events with RVAR and 44/50 with provisional IVAR.
-- Contract candidates: 1146 selected near-ATM contracts; 1146 local IV estimates
-  solved.
-- Limitation: every row is `panel_grade = provisional_no_nbbo`; this is an
-  engineering panel, not empirical evidence for the paper.
+| Measure | Value |
+| --- | ---: |
+| Dynamic-calendar rows | 1,054 |
+| BMO/AMC main-sample candidates | 810 |
+| Trade-proxy event-panel rows | 810 |
+| Events with `RVAR_event` | 801 |
+| Events with trade-proxy `IVAR_event` | 690 |
+| Proxy contract candidates | 12,038 |
+| Contracts with usable pre-cutoff proxy price | 10,165 |
+| Contracts with no trade in cutoff window | 1,873 |
+| Main DTE 5-14 contracts | 5,098 |
+| Robustness DTE 3-21 contracts | 12,038 |
+| Proxy straddle diagnostic rows | 779 |
 
-Latest local trade-proxy run:
+IVAR failure diagnostics:
 
-- Command:
-  `just data args="--force --max-events 50 --jobs 4"`.
-- Gold panel: `data/gold/event_panel/trade_proxy_event_panel.parquet`.
-- Rows: 50 events.
-- Contract proxy prices: 1125/1146 contracts had pre-cutoff second-aggregate
-  prices and local IV estimates; 21 contracts had
-  `no_trade_in_cutoff_window`.
-- Trade-proxy IVAR coverage: 44/50 events.
-- Gross proxy straddle diagnostics: 44 rows. Mean gross proxy PnL is about
-  `-117.93` USD and mean haircut PnL is about `-234.17` USD in this
-  screening slice.
-- Bronze second-agg cache: 1146 contract partitions written under
-  `data/bronze/massive/options_second_aggs/`.
-- Limitation: every row is `panel_grade = no_nbbo_trade_proxy`; this is a
-  screening panel based on trade-price OHLCV bars, not a bid/ask executable
-  strategy result.
+| Failure reason | Events |
+| --- | ---: |
+| No two event-covering expiries | 103 |
+| Nonmonotone total variance | 10 |
+| Negative extracted IVAR | 7 |
 
-Latest local research run:
+Proxy straddle diagnostics:
 
-- Command:
-  `just research args="--split-date 2025-01-01"`.
-- Feature matrix: `data/gold/modeling/feature_matrix.parquet`.
-- Rows/columns: 810 events and 84 columns.
-- Outputs: `artifacts/modeling/forecast_metrics.csv`,
-  `ranking_metrics.csv`, `strategy_metrics.csv`,
-  `strategy_breakdowns.csv`, `model_fit_diagnostics.csv`,
-  `model_predictions.parquet`, per-model `edge_deciles_*.csv`, and per-model
-  `strategy_trades_*.csv`.
-- Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
-  Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost, and
-  FT-Transformer. Mamba is present in diagnostics as
-  `skipped_no_sequence_features` because the current proxy feature matrix does
-  not yet include 20-day option-surface path columns.
-- The best-looking proxy rows in this split are LightGBM/XGBoost, but these are
-  no-NBBO proxy results. They should be treated as a signal-quality smoke test,
-  not as a paper claim.
+| Measure | Value |
+| --- | ---: |
+| Mean gross proxy PnL | 12.41 USD |
+| Mean haircut proxy PnL | -159.98 USD |
 
-## Legacy Material
+Interpretation: the proxy route produces a usable event panel, but the IVAR
+coverage gap is still material. The main loss channel is missing a valid pair of
+event-covering expiries, followed by smaller term-structure extraction failures.
 
-Copied modules, scripts, data, generated site artifacts, and caches from earlier
-projects have been removed from the active tree.
+## Model Results
 
-The current rule is:
+The feature matrix has 810 rows. The current chronological proxy split trains on
+567 rows, validates on 121 rows, and tests on 122 rows for tabular models. Mamba
+uses the sequence-eligible subset: 475 train rows, 103 validation rows, and 100
+test rows.
 
-- Active code must live under `src/earnings_event_vol`.
-- Active tests must be migrated into the new test surface.
-- Old copied code should be removed or explicitly migrated before being cited in
-  docs or manuscript text.
+Selected forecast metrics:
 
-## Next Gate
+| Model | N | MAE | RMSE | OOS R2 vs IVAR |
+| --- | ---: | ---: | ---: | ---: |
+| Market IVAR | 99 | 0.0106 | 0.0167 | 0.000 |
+| Goyal-Saretto spread | 99 | 0.0105 | 0.0173 | -0.077 |
+| Elastic Net | 122 | 0.0113 | 0.0258 | 0.401 |
+| LightGBM | 122 | 0.0075 | 0.0194 | 0.677 |
+| XGBoost | 122 | 0.0066 | 0.0198 | 0.525 |
+| FT-Transformer | 122 | 0.0365 | 0.0406 | -3.857 |
+| Mamba sequence encoder | 100 | 0.0094 | 0.0174 | -0.005 |
 
-The next implementation gate is to regenerate the proxy data after any contract
-schema changes and then use the model outputs as diagnostics, not quote/NBBO
-paper evidence. The recommended sequence is:
+Selected ranking metrics:
 
-1. Run bare `just data` and inspect
-   `artifacts/data_pipeline/options_day_aggs_bulk/options_day_aggs_bulk_manifest.json`,
-   `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json`,
-   and `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json`
-   for coverage, repair status, fallback usage, stale contracts, and IVAR
-   failures.
-2. Use `just data args="--max-events 10"` only when a smoke run is desired.
-3. Use `just data args="--dry-run"` before larger fetches, then use real run
-   telemetry to decide whether any expanded proxy lake stays on WSL ext4 or
-   moves `DATA_DIR` to a larger NVMe/external path.
-4. Run `just research args="--split-date 2025-01-01"` to refresh the feature
-   matrix and model/strategy reports.
-5. Inspect `artifacts/modeling/model_fit_diagnostics.csv`,
-   `forecast_metrics.csv`, `ranking_metrics.csv`, `strategy_metrics.csv`, and
-   `strategy_breakdowns.csv` before writing any claims. Paper-grade quote/NBBO
-   ingestion remains a later route, not a current dependency for the proxy
-   data-engineering pass.
+| Model | N | Top-decile precision | AUC | Brier |
+| --- | ---: | ---: | ---: | ---: |
+| Market IVAR | 99 | 0.000 | 0.500 | 0.252 |
+| Last-four RVAR | 99 | 0.400 | 0.551 | 0.316 |
+| Goyal-Saretto spread | 99 | 0.400 | 0.571 | 0.308 |
+| Elastic Net | 99 | 0.900 | 0.822 | 0.211 |
+| LightGBM | 99 | 1.000 | 0.975 | 0.152 |
+| XGBoost | 99 | 0.900 | 0.959 | 0.158 |
+| FT-Transformer | 99 | 0.200 | 0.464 | 0.350 |
+| Mamba sequence encoder | 86 | 0.111 | 0.458 | 0.353 |
 
-Promotion criterion:
+Selected proxy strategy metrics:
 
-- a small, reproducible sample with at least one BMO and one AMC event;
-- no direct key leakage;
-- explicit timestamp and quote-date audit output;
-- docs updated with exact artifact paths and known limitations.
+| Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Last-four RVAR | 99 | 4,801.84 | 0.028 | 0.379 | -11,227.73 |
+| Last-four IVAR | 99 | -2,066.32 | -0.012 | -0.163 | -8,924.75 |
+| Goyal-Saretto spread | 99 | 3,169.84 | 0.019 | 0.250 | -20,002.03 |
+| Elastic Net | 99 | 51,678.28 | 0.306 | 4.511 | -1,330.81 |
+| LightGBM | 99 | 69,694.96 | 0.413 | 6.690 | -442.37 |
+| XGBoost | 99 | 64,352.96 | 0.381 | 5.975 | -1,191.77 |
+| FT-Transformer | 99 | 2,618.64 | 0.016 | 0.207 | -10,414.40 |
+| Mamba sequence encoder | 86 | -3,651.72 | -0.026 | -0.301 | -11,336.97 |
+
+Interpretation: in this no-NBBO proxy run, the strongest evidence is ranking,
+not generic variance RMSE. LightGBM and XGBoost dominate the market IVAR
+baseline and the simple historical baselines on top-decile precision and AUC.
+Mamba is implemented and has a sequence route, but it is not the headline model
+in the current run.
+
+The market-implied IVAR baseline is still the central benchmark. It generates no
+trades under the premium-edge rule because its forecast edge is zero by
+construction.
+
+## Figures
+
+Forecast error:
+
+![Forecast performance](assets/images/modeling/forecast_performance.png)
+
+Ranking quality:
+
+![AUC and top-decile precision](assets/images/modeling/auc_top_decile_precision.png)
+
+Proxy strategy PnL:
+
+![Strategy PnL by edge decile](assets/images/modeling/strategy_pnl_by_edge_decile.png)
+
+Cost sensitivity:
+
+![Cost sensitivity](assets/images/modeling/cost_sensitivity.png)
+
+Calibration:
+
+![Calibration plot](assets/images/modeling/calibration_plot.png)
+
+Realized mispricing by predicted edge decile:
+
+![Edge decile realized mispricing](assets/images/modeling/edge_decile_realized_mispricing.png)
+
+## What This Means
+
+Current proxy-stage takeaways:
+
+- The pipeline is now beyond toy smoke tests: it has a dynamic top-50 universe,
+  SEC-first event validation, an event panel, a feature matrix, model metrics,
+  proxy strategy diagnostics, and figures.
+- The signal-screening result is encouraging for tabular nonlinear models,
+  especially LightGBM and XGBoost.
+- The Mamba route is present but currently weaker than the tabular baselines.
+  It needs sequence-selection diagnostics and robustness before it can be a
+  paper claim.
+- No current result supports full-spread executable trading claims.
+
+The defensible near-term claim is:
+
+> In a no-NBBO proxy sample, state and event-history features show preliminary
+> cross-sectional ranking signal for earnings event-variance mispricing beyond
+> the market-implied IVAR baseline.
+
+The paper-grade claim requires:
+
+- historical bid/ask or NBBO-equivalent option data;
+- quote-based IVAR and leg-level strategy construction;
+- full bid-ask crossing as the main cost assumption;
+- robustness across DTE windows, years, liquidity regimes, and BMO/AMC timing;
+- clustered or bootstrap inference.
+
+## Artifact Map
+
+Local raw outputs:
+
+| Purpose | Path |
+| --- | --- |
+| Data pipeline manifest | `artifacts/data_pipeline/data_pipeline_manifest.json` |
+| Universe manifest | `artifacts/data_pipeline/universe/universe_manifest.json` |
+| Dynamic calendar report | `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json` |
+| Trade-proxy panel report | `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` |
+| Feature matrix | `data/gold/modeling/feature_matrix.parquet` |
+| Forecast metrics | `artifacts/modeling/forecast_metrics.csv` |
+| Ranking metrics | `artifacts/modeling/ranking_metrics.csv` |
+| Strategy metrics | `artifacts/modeling/strategy_metrics.csv` |
+| Model diagnostics | `artifacts/modeling/model_fit_diagnostics.csv` |
+| Proxy report | `reports/modeling/proxy_research_report.md` |
+
+Published docs assets:
+
+| Purpose | Path |
+| --- | --- |
+| Curated results page | `docs/results_snapshot.md` |
+| Published figure copies | `docs/assets/images/modeling/*.png` |
+
+## Docs Structure
+
+The reader-facing docs intentionally stay small:
+
+- Home: short project overview and current status.
+- Results Snapshot: current curated data/model/proxy-strategy results and
+  analysis.
+- Paper Plan: research protocol, target variables, model ladder, and evaluation
+  design.
+- Audit Prompts: implementation and manuscript review checklists.
+- Future Work: paper blockers and deferred extensions.
+
+`SPEC.md` remains the repo-root implementation contract and is not a separate
+nav page.
