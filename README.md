@@ -100,8 +100,19 @@ Default data parameters:
 - universe lookback: from `2022-06-01`;
 - monthly top 50 liquid U.S. single-name option underlyings;
 - DTE `3-21`, supporting the main `5-14` sample and robustness window;
-- entry proxy: Massive option second aggregates before the event cutoff;
-- exit proxy: same-contract option day-aggregate close when available.
+- market data route:
+  - options day aggregates for universe liquidity ranking, contract discovery,
+    local IV/IVAR proxy inputs, same-contract option exit closes, and the
+    20-day close-trade-implied option-surface sequence;
+  - underlying stock day aggregates for underlying closes, event returns,
+    `RVAR_event`, and exit spot;
+  - targeted Massive option second aggregates from
+    `/range/1/second/<date>/<date>` for the entry proxy.
+- entry proxy window: keep only bars in the resolved pre-cutoff buffer,
+  default 60 minutes before the event cutoff, then select the latest positive
+  `option_vwap` or `option_close` in the final 900 seconds.
+- second aggregates are trade OHLCV bars, not quote, bid/ask, or NBBO data;
+  exit proxy uses same-contract option day-aggregate close when available.
 
 `just research` does not download market data. It consumes the current proxy
 panel, builds features, trains/evaluates models, and writes metrics, figures,

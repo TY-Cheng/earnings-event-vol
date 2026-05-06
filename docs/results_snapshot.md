@@ -10,11 +10,12 @@ Current local run state, verified on 2026-05-06:
 
 | Item | Current state |
 | --- | --- |
-| Data route | Massive option second aggregates plus option day aggregates |
+| Data route | SEC-first event calendar plus Massive market-data proxy |
 | Execution grade | `no_nbbo_trade_proxy`, `paper_grade=false` |
 | Study window in current run | 2022-12-01 to 2025-12-31 |
 | Target paper window | 2013-2025, pending historical quote/NBBO or equivalent data |
 | Universe | Monthly top 50 liquid U.S. single-name option underlyings |
+| Market data route | Options day aggregates, underlying day aggregates, and targeted option one-second trade aggregates |
 | Event source | SEC EDGAR submissions plus SEC primary filing document text |
 | Main timing sample | BMO and AMC only |
 | Research package | Feature matrix, model metrics, proxy strategy diagnostics, figures |
@@ -22,6 +23,48 @@ Current local run state, verified on 2026-05-06:
 The current evidence is useful for engineering validation and signal screening.
 It is not paper-grade execution evidence because it does not use historical
 bid/ask or NBBO quotes.
+
+## Data and Backtest Setup
+
+The current proxy route uses three market-data inputs:
+
+- **Options day aggregates** for dynamic-universe liquidity ranking, contract
+  discovery, local IV/IVAR proxy inputs, same-contract option exit closes, and
+  the 20-day close-trade-implied option-surface sequence.
+- **Underlying stock day aggregates** for underlying closes, event returns,
+  `RVAR_event`, and exit spot.
+- **Option one-second trade aggregates** for targeted pre-cutoff entry proxies.
+  Massive REST is queried with `/range/1/second/<date>/<date>`. The bronze
+  cache keeps only bars in the resolved pre-cutoff buffer, default 60 minutes
+  before the event cutoff. Entry selection then uses the latest positive
+  `option_vwap` or `option_close` in the final 900 seconds before cutoff.
+
+The one-second aggregates are trade OHLCV bars. They are not quote midpoints,
+bid/ask records, or NBBO.
+
+The underlying universe is dynamic rather than a fixed ticker list:
+
+1. Start from SEC company ticker metadata and keep eligible U.S. common-equity
+   tickers on supported exchanges.
+2. Exclude ETF, fund, trust, ETN, index, volatility, commodity, and other
+   non-single-name-like symbols before liquidity ranking.
+3. Parse each option ticker to its underlying and compute monthly option
+   premium dollar volume:
+
+   ```text
+   option_premium_dollar_volume = option_price * contract_volume * 100
+   ```
+
+   where `option_price` uses VWAP when available and close as the fallback.
+4. For each universe month, rank underlyings by trailing six-month option
+   premium dollar volume, excluding the current month to avoid look-ahead.
+5. Keep the top 50 underlyings and pass their ticker union to the SEC-first
+   earnings-calendar stage. Each event is then annotated with
+   `universe_month`, `universe_rank`, and `universe_filter_status`.
+
+This setup is part of both the data construction and the model/backtest design:
+it defines the tradable sample, the entry/exit proxy, and which observations
+enter the feature matrix and strategy diagnostics.
 
 ## Data Coverage
 

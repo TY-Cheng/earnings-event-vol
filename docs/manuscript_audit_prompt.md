@@ -40,6 +40,13 @@ Data:
 - The options source and entitlement window are stated explicitly.
 - Current local proxy results use Massive option second aggregates and option
   day aggregates from the observed 2022-onward entitlement window.
+- Market-data inputs are stated precisely: options day aggregates for universe,
+  contract, IV proxy, exit, and sequence construction; underlying day
+  aggregates for closes and `RVAR_event`; targeted option one-second trade
+  aggregates for entry proxy pricing.
+- Entry second aggregates are restricted to the pre-cutoff buffer, default 60
+  minutes before event cutoff, and the selected entry price comes from the
+  latest positive VWAP or close in the final 900 seconds before cutoff.
 - The 2013-2025 sample is described as the target paper range unless historical
   option data for that range has actually been acquired and processed.
 - Earnings events come from SEC EDGAR submissions plus SEC primary filing

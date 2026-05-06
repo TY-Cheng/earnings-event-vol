@@ -148,17 +148,50 @@ option day aggregates are available from 2022-05-04. The 2013-2025 paper target
 requires upgraded historical options day-agg entitlement or another licensed
 options data route for the dynamic universe.
 
-V1.5 is the active no-quote data route: Massive option second aggregates provide
-pre-cutoff trade-price OHLCV bars for entry pricing and diagnostics, while
-exit-date option day aggregates provide same-contract exit closes when
-available. For each candidate contract, use the latest pre-entry VWAP or close
-inside the resolved market-close cutoff window, recompute local IV, and require
-paired call/put prices before constructing the event-expiry ATM input. These
-outputs are labeled `no_nbbo_trade_proxy`. They can test whether the event
-alignment, IVAR extraction, and edge-ranking pipeline has signal, but they do
-not support full-spread crossing claims because they lack bid/ask and NBBO.
-`options_quotes_v1` is a future paper-grade route/readiness probe, not an input
-to the current proxy pipeline.
+Dynamic universe construction:
+
+- The first filter is an eligible-common-equity screen using SEC company ticker
+  metadata. ETF, fund, trust, ETN, index, volatility, commodity, and other
+  non-single-name-like symbols are excluded before the liquidity ranking.
+- Liquidity is measured from options day aggregates, not quotes. Each option
+  ticker is parsed to its underlying, and the monthly underlying-level measure
+  is option premium dollar volume:
+
+  ```text
+  option_premium_dollar_volume = option_price * contract_volume * 100
+  ```
+
+  where `option_price` uses VWAP when available and close as the fallback.
+- For each universe month, underlyings are ranked by trailing six-month option
+  premium dollar volume, excluding the current month to avoid look-ahead. The
+  top 50 underlyings define the current proxy sample's tradable universe.
+- The dynamic-calendar stage queries SEC filings for the union of monthly
+  universe tickers, then annotates events with `universe_month`,
+  `universe_rank`, and `universe_filter_status`.
+
+V1.5 is the active no-quote data route. Market data enter through three inputs:
+
+- **Options day aggregates** support dynamic-universe liquidity ranking,
+  contract discovery, local IV/IVAR proxy inputs, same-contract option exit
+  closes, and the 20-day close-trade-implied option-surface sequence.
+- **Underlying stock day aggregates** support underlying closes, event returns,
+  `RVAR_event`, and exit spot.
+- **Option one-second trade aggregates** provide targeted pre-cutoff
+  trade-price OHLCV bars for entry pricing and diagnostics. Massive REST is
+  queried through `/range/1/second/<date>/<date>`.
+
+For each candidate contract, the bronze second-aggregate cache keeps only bars
+inside the resolved pre-cutoff buffer, default 60 minutes before event cutoff.
+Entry selection then uses the latest positive VWAP or close inside the final
+900 seconds before cutoff. The pipeline recomputes local IV and requires paired
+call/put prices before constructing the event-expiry ATM input.
+
+These outputs are labeled `no_nbbo_trade_proxy`. They can test whether the
+event alignment, IVAR extraction, and edge-ranking pipeline has signal, but they
+do not support full-spread crossing claims because the second aggregates are
+trade OHLCV bars, not quote, bid/ask, or NBBO records. `options_quotes_v1` is a
+future paper-grade route/readiness probe, not an input to the current proxy
+pipeline.
 
 ## Event Alignment
 

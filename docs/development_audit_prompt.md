@@ -43,6 +43,13 @@ Data route and labeling:
 - Current data outputs are labeled `no_nbbo_trade_proxy` and `paper_grade=false`.
 - Second aggregates are described as trade-price OHLCV bars, not bid/ask or
   NBBO quotes.
+- Market-data inputs are separated correctly: options day aggregates for
+  universe/contract/IV proxy/exit/sequence construction, underlying day
+  aggregates for closes and `RVAR_event`, and targeted option one-second
+  aggregates for entry proxy pricing.
+- Second-aggregate entry cache keeps only the pre-cutoff buffer, default 60
+  minutes before event cutoff; entry price selection then uses the latest
+  positive VWAP or close in the final 900 seconds before cutoff.
 - Exit diagnostics use same-contract option day-aggregate closes when available
   and flag intrinsic fallback use.
 - The current default proxy range is the observed entitlement range
