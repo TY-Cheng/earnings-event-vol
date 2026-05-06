@@ -119,6 +119,171 @@ mapping from each paper to implementation choices.
 
 ## 2. Materials and Methods
 
+### 2.0 Full Pipeline Map
+
+This diagram is the paper workflow in one place. It separates official event
+data from vendor market data, shows which data frequency is used where, and
+keeps the proxy execution caveat visible.
+
+```mermaid
+flowchart TB
+  %% Inputs
+  subgraph raw["Raw inputs"]
+    sec["SEC EDGAR filings\n8-K / 8-K/A Item 2.02\nacceptance timestamp\nprimary filing document text"]
+    sec_meta["SEC company ticker metadata\ncommon-equity eligibility\nexclude ETF / index / fund / trust"]
+    opt_day["Massive options day aggregates\ndaily trade OHLCV by option contract"]
+    stock_day["Massive underlying day aggregates\ndaily OHLCV by stock"]
+    opt_ref["Massive option reference\n/v3/reference/options/contracts\nshares_per_contract\nadditional_underlyings\nexercise_style\ncorrection"]
+    opt_sec["Massive option second aggregates\nrange/1/second\ntrade OHLCV bars\nnot quote, not bid/ask, not NBBO"]
+    index_sec["Optional SPY / QQQ second aggregates\noptions and underlying\nentry-as-of market controls"]
+    fred["FRED VIXCLS\ndaily VIX close\nprior-close aligned"]
+  end
+
+  %% Universe and event calendar
+  subgraph universe_calendar["Universe and earnings calendar"]
+    equity_filter["Eligible single-name universe filter\nNYSE / NASDAQ common-equity-like tickers\nremove SPY, QQQ, IWM, VIX, GLD, SPX, SPXW"]
+    liquidity["Monthly liquidity table\noption_premium_dollar_volume\n= option price * volume * 100\nVWAP if available, close fallback"]
+    top50["Dynamic monthly top 50\ntrailing six-month option premium dollar volume\ncurrent month excluded"]
+    sec_calendar["SEC-first event calendar\ncandidate discovery from Item 2.02\nvalidation from SEC primary document text\nMassive text only auxiliary"]
+    event_filter["Main event filters\nBMO / AMC only\nDMH and unknown timing excluded\nlatest prior universe month membership"]
+  end
+
+  sec_meta --> equity_filter
+  opt_day --> liquidity
+  equity_filter --> top50
+  liquidity --> top50
+  top50 --> sec_calendar
+  sec --> sec_calendar
+  sec_calendar --> event_filter
+
+  %% Event alignment
+  subgraph alignment["Event timing and target construction"]
+    bmo["BMO event on date d\nentry uses close d-1\nS_before = close d-1\nS_after = close d"]
+    amc["AMC event on date d\nentry uses close d\nS_before = close d\nS_after = close d+1"]
+    entry_cutoff["event_entry_timestamp\nresolved market close\nhandles early close days"]
+    rvar["Forecast target\nRVAR_event = log(S_after / S_before)^2"]
+    leak_gate["Leakage gate\nfeature_asof_timestamp <= event_entry_timestamp\nno exit date or post-event bars"]
+  end
+
+  event_filter --> bmo
+  event_filter --> amc
+  stock_day --> bmo
+  stock_day --> amc
+  bmo --> entry_cutoff
+  amc --> entry_cutoff
+  bmo --> rvar
+  amc --> rvar
+  entry_cutoff --> leak_gate
+
+  %% Contract and IV construction
+  subgraph contract_iv["Contracts, IVAR, and proxy entry prices"]
+    contract_discovery["Candidate option contracts\nDTE discovery 3-21\nmain flag 5-14\nmust cover event window"]
+    ref_validation["Contract reference validation\noverride multiplier / contract_size / deliverable_status\nnon-100 or adjusted deliverable -> non_standard_excluded\nfetch failure -> manifest diagnostic"]
+    iv_proxy["Daily local IV proxy\nfrom options day-agg close trade price\nclose_trade_implied\nnot NBBO-mid IV"]
+    ivar["Market baseline\nIVAR_event from two adjacent event-covering expiries\nfailure reasons: missing expiries, negative IVAR, nonmonotone variance"]
+    second_buffer["Entry proxy bars\noption second aggregates only before cutoff\ndefault buffer: 60 minutes before cutoff\nentry lookback: final 900 seconds"]
+    entry_price["Entry price proxy\nlatest positive option_vwap\noption_close fallback\ntrade-price proxy only"]
+    exit_price["Exit mark\nsame-contract options day-agg close\nintrinsic fallback only if exit close missing or 0DTE"]
+  end
+
+  event_filter --> contract_discovery
+  opt_day --> contract_discovery
+  opt_ref --> ref_validation
+  contract_discovery --> ref_validation
+  ref_validation --> iv_proxy
+  opt_day --> iv_proxy
+  iv_proxy --> ivar
+  ref_validation --> second_buffer
+  opt_sec --> second_buffer
+  entry_cutoff --> second_buffer
+  second_buffer --> entry_price
+  ref_validation --> exit_price
+  opt_day --> exit_price
+  rvar --> ivar
+
+  %% Feature engineering
+  subgraph features["Feature engineering"]
+    event_features["Event-level feature matrix\nIVAR_event\nATM IV / term spread / skew / butterfly\noption activity\nRV5 / RV20 / RV60\nlast-four earnings history\nBMO/AMC flag\nuniverse rank and liquidity bucket"]
+    daily_sequence["20-day daily sequence\nseq_t00 oldest allowed day\nseq_t19 latest allowed day\nsingle-name daily option-surface summaries\nunderlying return and RV5\nVIX daily state\nSPY / QQQ daily controls if available"]
+    market_second["Optional entry-as-of market controls\nSPY / QQQ ATM IV proxy\nterm slope\nskew / butterfly\nstraddle premium / spot\noption volume / transactions\nunderlying pre-cutoff return"]
+    vix_features["VIX features\nresolved_vix_date before feature_asof_date\nvix_level, 1d change, 5d change\n252d percentile, tercile regime, above 30 flag"]
+  end
+
+  ivar --> event_features
+  rvar --> event_features
+  stock_day --> event_features
+  ref_validation --> event_features
+  opt_day --> daily_sequence
+  stock_day --> daily_sequence
+  fred --> vix_features
+  vix_features --> event_features
+  vix_features --> daily_sequence
+  index_sec --> market_second
+  entry_cutoff --> market_second
+  market_second --> event_features
+
+  %% Splits and model inputs
+  subgraph splits_models["Splits and models"]
+    split_now["Current proxy split\nchronological event-level 70 / 15 / 15\nsplit unit = event_id\nno random split\nsame event never crosses splits"]
+    split_later["Final paper robustness when longer data exists\nrolling walk-forward\ntrain 5y, validate 1y, test 1y\npurge same-ticker adjacent leakage"]
+    baseline_models["Deterministic baselines\nIVAR market baseline\nlast-four RVAR\nlast-four IVAR\nGoyal-Saretto RV-IV spread\nPatell-Wolfson diagnostics"]
+    tabular_models["Tabular models\nElastic Net\nLightGBM\nXGBoost optional\nFT-Transformer V1"]
+    mamba_models["Sequence models\nproxy-Mamba on ordered 20-day tensor\nmask-only Mamba ablation\nuses close-trade-implied proxy surface, not NBBO-mid surface"]
+  end
+
+  event_features --> split_now
+  daily_sequence --> split_now
+  split_now --> baseline_models
+  split_now --> tabular_models
+  split_now --> mamba_models
+  split_now -. future paper check .-> split_later
+
+  %% Forecast to trade decision
+  subgraph backtest["Backtest logic and strategy assumptions"]
+    forecasts["Model output\nforecast_RVAR_event\npositive floor = 1e-6"]
+    var_edge["Variance edge\nforecast_RVAR_event - IVAR_event\nused for ranking and diagnostics"]
+    premium_edge["Premium-space edge\nexpected_strategy_value_usd - market_entry_cost_usd\nthis drives trade selection"]
+    long_straddle["Long ATM straddle\nused when event vol is predicted cheap"]
+    short_iron_fly["Short iron fly\nused when event vol is predicted rich\nrisk-defined short-vol proxy"]
+    cost_model["Proxy cost model\nproxy_cost_usd = 0.005 * entry_premium_usd\ncost multipliers: 0, 0.5, 1, 1.5, 2, 3, 5\nmultiplier 0 is diagnostic only"]
+    pnl["Proxy PnL\nentry from second bars\nexit from option day close\npaper_grade = false\npanel_grade = no_nbbo_trade_proxy"]
+  end
+
+  baseline_models --> forecasts
+  tabular_models --> forecasts
+  mamba_models --> forecasts
+  forecasts --> var_edge
+  ivar --> var_edge
+  forecasts --> premium_edge
+  entry_price --> premium_edge
+  premium_edge --> long_straddle
+  premium_edge --> short_iron_fly
+  cost_model --> premium_edge
+  long_straddle --> pnl
+  short_iron_fly --> pnl
+  entry_price --> pnl
+  exit_price --> pnl
+
+  %% Evaluation
+  subgraph evaluation["Evaluation outputs"]
+    forecast_metrics["Forecast metrics\nMAE\nRMSE\nQLIKE\nOOS R2 vs IVAR"]
+    ranking_metrics["Ranking and mispricing metrics\ntop-decile precision\nAUC and Brier for direction\ncalibration\nedge-decile monotonicity"]
+    strategy_metrics["Strategy metrics\ngross and net proxy PnL\nreturn on premium / capital\nSharpe / Sortino\nmax drawdown\nhit rate\naverage win / loss\ncost sensitivity"]
+    robustness["Breakdowns and inference\nDTE 5-14 vs 3-21\nBMO vs AMC\nliquidity buckets\nticker, year, regime\npaired loss differential\nclustered SE\nblock bootstrap"]
+    outputs["Paper outputs\ntables\nfigures\nproxy_research_report.md\nResults Snapshot"]
+  end
+
+  forecasts --> forecast_metrics
+  var_edge --> ranking_metrics
+  pnl --> strategy_metrics
+  forecast_metrics --> outputs
+  ranking_metrics --> outputs
+  strategy_metrics --> outputs
+  robustness --> outputs
+  split_now --> robustness
+  vix_features --> robustness
+```
+
 ### 2.1 Data Sources
 
 The current proxy route uses official sources for event discovery and vendor
