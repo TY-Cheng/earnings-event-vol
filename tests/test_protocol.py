@@ -138,6 +138,19 @@ from earnings_event_vol.models import (
     temporal_train_test_split,
     unimplemented_model_message,
 )
+from earnings_event_vol.research import (
+    FORECAST_FLOOR,
+    aggregate_sequence_features,
+    assign_event_splits,
+    build_sequence_tensor,
+    enrich_feature_matrix_for_research,
+    inference_table,
+    proxy_transaction_cost,
+    qlike_sanity_table,
+    run_proxy_model_suite,
+    sequence_coverage_by_event,
+    sequence_coverage_report,
+)
 from earnings_event_vol.schemas import (
     AnnouncementTiming,
     EarningsEvent,
@@ -4295,6 +4308,131 @@ def test_research_metrics_cover_empty_and_breakdown_paths() -> None:
     assert "announcement_timing" in bundle.breakdowns
 
 
+def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) -> None:
+    events = pd.DataFrame(
+        {
+            "event_id": [f"E{idx:02d}" for idx in range(40)],
+            "ticker": ["AAA" if idx % 2 == 0 else "BBB" for idx in range(40)],
+            "event_date": pd.date_range("2023-01-01", periods=40, freq="14D"),
+            "entry_date": pd.date_range("2023-01-01", periods=40, freq="14D"),
+            "exit_date": pd.date_range("2023-01-02", periods=40, freq="14D"),
+            "announcement_timing": ["AMC", "BMO"] * 20,
+            "rvar_event": np.linspace(0.010, 0.050, 40),
+            "ivar_event": np.linspace(0.012, 0.045, 40),
+            "dte_1": [8, 16] * 20,
+            "universe_rank": list(range(1, 41)),
+            "entry_premium_usd": np.linspace(300, 500, 40),
+            "gross_proxy_pnl_usd": np.linspace(-50, 80, 40),
+            "haircut_pnl_usd": np.linspace(-55, 70, 40),
+        }
+    )
+    rows: list[dict[str, object]] = []
+    for event_idx, event_id in enumerate(events["event_id"]):
+        for seq_idx in range(20):
+            row: dict[str, object] = {
+                "event_id": event_id,
+                "ticker": events.loc[event_idx, "ticker"],
+                "entry_date": events.loc[event_idx, "entry_date"].date(),
+                "exit_date": events.loc[event_idx, "exit_date"].date(),
+                "source_date": (
+                    pd.Timestamp("2022-01-01") + pd.Timedelta(days=seq_idx + event_idx * 14)
+                ).date(),
+                "seq_index": seq_idx,
+                "is_valid_sequence_day": True,
+                "has_underlying_close": True,
+                "missing_options_day_aggs": False,
+            }
+            for feature in (
+                "atm_iv_proxy",
+                "iv_skew_proxy",
+                "iv_butterfly_proxy",
+                "term_slope_proxy",
+                "event_ivar_proxy",
+                "straddle_premium_to_spot",
+                "valid_pair_count",
+                "surface_missing_rate",
+                "option_volume_sum",
+                "option_transactions_sum",
+                "underlying_return_1d",
+                "rv5",
+                "spy_return_1d",
+                "vix_level",
+                "vix_change_1d",
+            ):
+                row[feature] = 0.01 * (event_idx + 1) + 0.001 * seq_idx
+            rows.append(row)
+    long_rows = pd.DataFrame(rows)
+    by_event = sequence_coverage_by_event(long_rows)
+    report = sequence_coverage_report(by_event, total_events=len(events))
+    assert report["high_sequence_selection_risk"] is False
+    split_only = assign_event_splits(events)
+    assert split_only.groupby("event_id")["split"].nunique().max() == 1
+    aggregates = aggregate_sequence_features(long_rows)
+    features = enrich_feature_matrix_for_research(
+        events,
+        sequence_by_event=by_event,
+        sequence_aggregates=aggregates,
+    )
+    assert set(features["split"]) == {"train", "validation", "test"}
+    assert features.groupby("event_id")["split"].nunique().max() == 1
+    tensor_path = tmp_path / "sequence_tensor.npz"
+    tensor_report = build_sequence_tensor(long_rows, features, out_path=tensor_path)
+    payload = np.load(tensor_path, allow_pickle=True)
+    assert tensor_report["shape"] == [40, 20, 15]
+    assert payload["time_mask"].shape == (40, 20)
+    assert payload["feature_mask"].shape == (40, 20, 15)
+
+    predictions, diagnostics = run_proxy_model_suite(
+        features,
+        tensor_path=tensor_path,
+        model_ids=[
+            "market_implied_event_variance",
+            "linear_elastic_net",
+            "mamba_sequence_encoder",
+            "mask_only_mamba_sequence_encoder",
+        ],
+    )
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("market_implied_event_variance"), "status"].iloc[
+            0
+        ]
+        == "evaluated"
+    )
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("mamba_sequence_encoder"), "status"].iloc[0]
+        == "trained"
+    )
+    mamba_forecast = predictions["forecast_mamba_sequence_encoder"].dropna()
+    assert mamba_forecast.gt(0).all()
+    assert mamba_forecast.std() > 0
+
+    qlike, extremes = qlike_sanity_table(
+        predictions,
+        forecast_columns={"mamba_sequence_encoder": "forecast_mamba_sequence_encoder"},
+    )
+    assert qlike["floored_qlike"].notna().all()
+    assert set(
+        [
+            "model_id",
+            "event_id",
+            "ticker",
+            "event_date",
+            "forecast",
+            "label",
+            "ivar_event",
+            "qlike_contribution",
+            "percentile",
+        ]
+    ).issubset(extremes.columns)
+    assert proxy_transaction_cost([100.0])[0] == pytest.approx(0.5)
+    assert pytest.approx(1e-6) == FORECAST_FLOOR
+    inference = inference_table(
+        predictions,
+        forecast_columns={"mamba_sequence_encoder": "forecast_mamba_sequence_encoder"},
+    )
+    assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
+
+
 def test_research_model_suite_and_error_paths() -> None:
     feature_frame = pd.DataFrame(
         {
@@ -4337,7 +4475,20 @@ def test_research_model_suite_and_error_paths() -> None:
     assert "forecast_market_implied_event_variance" in predictions
     assert "forecast_linear_elastic_net" in predictions
     diagnostics = model_diagnostics_as_frame(results)
-    assert set(diagnostics["model_id"]) == {"linear_elastic_net", "mamba_sequence_encoder"}
+    assert set(diagnostics["model_id"]) == {
+        "market_implied_event_variance",
+        "last_four_rvar",
+        "last_four_ivar",
+        "goyal_saretto_rv_iv_spread",
+        "linear_elastic_net",
+        "mamba_sequence_encoder",
+    }
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("market_implied_event_variance"), "status"].iloc[
+            0
+        ]
+        == "evaluated"
+    )
     assert (
         diagnostics.loc[diagnostics["model_id"].eq("mamba_sequence_encoder"), "status"].iloc[0]
         == "skipped_no_sequence_features"

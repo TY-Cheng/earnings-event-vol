@@ -44,6 +44,7 @@ from earnings_event_vol.models import (
     prediction_column_for_model,
     run_model_suite,
 )
+from earnings_event_vol.research import run_proxy_research_package
 from earnings_event_vol.schemas import EarningsEvent, OptionRight, OptionSide, TradeLeg
 from earnings_event_vol.variance import (
     TotalVariancePoint,
@@ -60,7 +61,7 @@ def _path_status(path: Path | None) -> dict[str, object]:
 
 
 def _print_json(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
 def _status(config: ProjectConfig) -> int:
@@ -546,6 +547,18 @@ def _train_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
+    payload = run_proxy_research_package(
+        config,
+        stage=args.stage,
+        split_design=args.split_design,
+        split_date=args.split_date,
+        allow_high_sequence_risk=args.allow_high_sequence_risk,
+    )
+    _print_json(payload)
+    return 0 if bool(payload["ok"]) else 1
+
+
 def _leakage_audit(args: argparse.Namespace) -> int:
     frame = _read_csv(args.features)
     result = audit_feature_leakage(frame)
@@ -803,6 +816,23 @@ def build_parser() -> argparse.ArgumentParser:
     train_models.add_argument("--split-date", default=None)
     train_models.add_argument("--min-edge-var", type=float, default=0.0)
 
+    research = subparsers.add_parser(
+        "research",
+        help="Build the no-NBBO proxy research package without downloading market data.",
+    )
+    research.add_argument(
+        "--stage",
+        choices=["all", "sequence-audit", "features", "models", "report"],
+        default="all",
+    )
+    research.add_argument(
+        "--split-design",
+        default="chronological_proxy_70_15_15",
+        choices=["chronological_proxy_70_15_15"],
+    )
+    research.add_argument("--split-date", default=None)
+    research.add_argument("--allow-high-sequence-risk", action="store_true")
+
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")
     leakage_audit.add_argument("--features", type=Path, required=True)
     leakage_audit.add_argument("--out", type=Path, required=True)
@@ -848,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
         return _build_feature_matrix(args)
     if args.command == "train-models":
         return _train_models(args)
+    if args.command == "research":
+        return _research(args, config)
     if args.command == "leakage-audit":
         return _leakage_audit(args)
     if args.command == "backtest-smoke":

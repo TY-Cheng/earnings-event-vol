@@ -662,6 +662,18 @@ def run_model_suite(
             "goyal_saretto_rv_iv_spread",
             "patell_wolfson_diagnostic",
         }:
+            results.append(
+                ModelFitResult(
+                    model_id=model_id,
+                    predictions=pd.DataFrame(),
+                    feature_columns=[],
+                    diagnostics={
+                        "status": "diagnostic_features_only"
+                        if model_id == "patell_wolfson_diagnostic"
+                        else "evaluated"
+                    },
+                )
+            )
             continue
         if model_id == "mamba_sequence_encoder":
             columns = sequence_feature_columns(base)

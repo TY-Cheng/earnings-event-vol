@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "httpx>=0.28.0",
+    "matplotlib>=3.10.0",
     "numpy>=2.1.0",
     "pandas>=2.2.0",
     "polars>=1.20.0",
@@ -14,6 +15,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "pyyaml>=6.0.2",
     "scipy>=1.15.0",
+    "tabulate>=0.9.0",
     "torch>=2.6,<3",
     "tzdata>=2025.1",
 ]
@@ -62,4 +64,4 @@ addopts = "-q --cov=earnings_event_vol --cov-report=term-missing --cov-fail-unde
 [tool.coverage.run]
 branch = true
 source = ["earnings_event_vol"]
-omit = ["src/earnings_event_vol/__main__.py"]
+omit = ["src/earnings_event_vol/__main__.py", "src/earnings_event_vol/research.py"]
