@@ -166,6 +166,12 @@ def discover_option_contracts(
         CONTRACT_STATUS_DOES_NOT_COVER_EVENT
     )
     out["eligible_for_quote_pool"] = out["contract_discovery_status"].eq(CONTRACT_STATUS_OK)
+    out["is_main_dte_5_14"] = out["eligible_for_quote_pool"] & out["dte"].between(
+        5, 14, inclusive="both"
+    )
+    out["is_robustness_dte_3_21"] = out["eligible_for_quote_pool"] & out["dte"].between(
+        3, 21, inclusive="both"
+    )
 
     preferred = [
         "event_id",
@@ -184,6 +190,8 @@ def discover_option_contracts(
         "corporate_action_flag",
         "contract_discovery_status",
         "eligible_for_quote_pool",
+        "is_main_dte_5_14",
+        "is_robustness_dte_3_21",
     ]
     rest = [column for column in out.columns if column not in preferred]
     return out[preferred + rest]

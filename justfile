@@ -35,6 +35,9 @@ audit date="": _format
 data stage="proxy-all" args="": _require-external-uv-env
     @stage='{{ stage }}'; extra='{{ args }}'; if [[ "$stage" == args=* ]]; then extra="${stage#args=}"; stage="proxy-all"; elif [[ "$stage" == --* ]]; then extra="$stage ${extra#args=}"; stage="proxy-all"; else extra="${extra#args=}"; fi; defaults=(); if [[ "$stage" == "proxy-all" ]]; then defaults=(--start 2022-12-01 --end 2025-12-31 --jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap --dte-min 3 --dte-max 21 --universe-top-n 50 --universe-trailing-months 6); elif [[ "$stage" == "trade-proxy-panel" ]]; then defaults=(--jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap); fi; read -r -a extra_args <<< "$extra"; {{ cli }} data --stage "$stage" "${defaults[@]}" "${extra_args[@]}"
 
+research args="": _sync
+    @extra='{{ args }}'; extra="${extra#args=}"; {{ cli }} build-feature-matrix; read -r -a extra_args <<< "$extra"; {{ cli }} train-models "${extra_args[@]}"
+
 docs port="8000": _format
     uv run mkdocs build --strict --clean
     @port=$(python3 -c 'import socket, sys; host = "127.0.0.1"; start = int(sys.argv[1]); print(next(p for p in range(start, start + 100) if socket.socket().connect_ex((host, p))))' "{{ port }}"); echo "Serving docs at http://127.0.0.1:${port}"; uv run mkdocs serve -a 127.0.0.1:${port}

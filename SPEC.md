@@ -106,5 +106,7 @@ premium-space expected edge, not raw variance edge.
   inconclusive; it is not a required calendar dependency. Unresolved or
   ambiguous timing stays outside the main sample.
 - No inferred timestamp fallback.
-- No calendar spread, intraday simulator, surface projection, GNN/GNO, or full
-  deep-model training in this pass.
+- No calendar spread, intraday simulator, surface projection, GNN/GNO, or
+  paper-grade deep-model tuning claims in this pass. The proxy research layer
+  may train the registered benchmark/model suite for diagnostics, but outputs
+  remain `no_nbbo_trade_proxy` until quote/NBBO ingestion exists.

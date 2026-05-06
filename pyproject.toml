@@ -20,7 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 docs = ["mkdocs>=1.6.1", "mkdocs-material>=9.6.0"]
-ml = ["lightgbm>=4.5.0"]
+ml = ["lightgbm>=4.5.0", "scikit-learn>=1.5.0", "xgboost>=2.1.0"]
 
 [tool.uv]
 package = false

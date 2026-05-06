@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
+import torch
 
 import earnings_event_vol.data_pipeline as data_pipeline
 import scripts.build_trade_proxy_panel as trade_proxy_panel_script
@@ -23,6 +25,7 @@ from earnings_event_vol.backtest import (
     SymmetricTwoPointJumpDistribution,
     apply_portfolio_caps,
     black_scholes_price,
+    build_proxy_strategy_frame,
     estimated_transaction_cost_usd,
     expected_strategy_value_usd,
     integer_contract_count,
@@ -77,8 +80,11 @@ from earnings_event_vol.events import (
     validate_calendar_frame,
 )
 from earnings_event_vol.features import (
+    build_model_feature_matrix,
+    build_option_surface_sequence_matrix,
     has_required_sequence_history,
     iv_butterfly_25d,
+    sequence_eligibility_reason,
     universe_by_trailing_option_dollar_volume,
 )
 from earnings_event_vol.leakage_audit import audit_feature_leakage, make_feature_timestamps
@@ -99,7 +105,39 @@ from earnings_event_vol.massive import (
     read_secret_file,
     underlying_flat_file_key,
 )
-from earnings_event_vol.models import MODEL_REGISTRY, get_model_spec, unimplemented_model_message
+from earnings_event_vol.metrics import (
+    auc_score,
+    breakdown_metrics,
+    brier_score,
+    calibration_table,
+    cost_sensitivity,
+    edge_decile_table,
+    evaluate_prediction_bundle,
+    forecast_metrics,
+    max_drawdown,
+    qlike_loss,
+    ranking_metrics,
+    strategy_metrics,
+)
+from earnings_event_vol.models import (
+    MODEL_REGISTRY,
+    FTTransformerRegressor,
+    LinearElasticNetRegressor,
+    MambaSequenceEncoder,
+    add_benchmark_predictions,
+    fit_ft_transformer,
+    fit_linear_elastic_net,
+    fit_mamba_sequence_encoder,
+    fit_model,
+    get_model_spec,
+    model_diagnostics_as_frame,
+    prediction_column_for_model,
+    run_model_suite,
+    sequence_feature_columns,
+    sequence_tensor_from_frame,
+    temporal_train_test_split,
+    unimplemented_model_message,
+)
 from earnings_event_vol.schemas import (
     AnnouncementTiming,
     EarningsEvent,
@@ -1565,6 +1603,8 @@ def test_standard_contracts_enter_quote_pool() -> None:
     assert discovered["contract_discovery_status"].tolist() == [CONTRACT_STATUS_OK]
     assert discovered["eligible_for_quote_pool"].tolist() == [True]
     assert discovered["dte"].iloc[0] == 8
+    assert discovered["is_main_dte_5_14"].tolist() == [True]
+    assert discovered["is_robustness_dte_3_21"].tolist() == [True]
     assert bool(discovered["covers_event_window"].iloc[0]) is True
 
 
@@ -4057,29 +4097,334 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     patell_text = MODEL_REGISTRY["patell_wolfson_diagnostic"].justification
     assert "diagnostic features" in patell_text
     assert "pre-event implied-volatility behavior" in patell_text
-    assert "not a trainable model" in patell_text
+    assert "prior event variance history" in patell_text
     goyal_text = MODEL_REGISTRY["goyal_saretto_rv_iv_spread"].justification
-    assert "RV-IV spread feature/baseline" in goyal_text
-    assert "not a full replication" in goyal_text
+    assert "Trailing RV-IV spread" in goyal_text
     assert get_model_spec("market_implied_event_variance").implemented is True
-    assert get_model_spec("last_four_rvar").implemented is False
-    assert get_model_spec("last_four_ivar").implemented is False
-    assert get_model_spec("patell_wolfson_diagnostic").implemented is False
+    assert get_model_spec("last_four_rvar").implemented is True
+    assert get_model_spec("last_four_ivar").implemented is True
+    assert get_model_spec("patell_wolfson_diagnostic").implemented is True
+    assert get_model_spec("xgboost").implemented is True
     assert "implemented as a deterministic baseline" in unimplemented_model_message(
         "market_implied_event_variance"
-    )
-    assert "not implemented in v1" in unimplemented_model_message("mamba_sequence_encoder")
+    ) or "implemented and available" in unimplemented_model_message("market_implied_event_variance")
+    assert "implemented and available" in unimplemented_model_message("mamba_sequence_encoder")
 
 
 def test_patell_wolfson_registry_text() -> None:
     spec = MODEL_REGISTRY["patell_wolfson_diagnostic"]
 
     assert spec.role == "diagnostic"
-    assert spec.implemented is False
+    assert spec.implemented is True
     assert "diagnostic features" in spec.justification
     assert "pre-event implied-volatility behavior" in spec.justification
-    assert "realized earnings move history" in spec.justification
-    assert "post-event volatility compression diagnostics" in spec.justification
+    assert "prior event variance history" in spec.justification
+
+
+def test_feature_matrix_benchmarks_models_and_metrics() -> None:
+    panel = pd.DataFrame(
+        {
+            "event_id": [f"ABC_{idx}" for idx in range(6)],
+            "ticker": ["ABC", "ABC", "ABC", "XYZ", "XYZ", "XYZ"],
+            "announcement_date": pd.date_range("2025-01-01", periods=6, freq="30D"),
+            "announcement_timing": ["AMC", "AMC", "BMO", "AMC", "BMO", "AMC"],
+            "rvar_event": [0.05, 0.03, 0.07, 0.02, 0.04, 0.06],
+            "ivar_event": [0.04, 0.04, 0.05, 0.03, 0.03, 0.05],
+            "dte_1": [8, 9, 16, 20, 12, 7],
+            "universe_rank": [1, 2, 3, 4, 5, 6],
+            "s_before": [100, 101, 102, 50, 51, 52],
+            "paper_grade": [False] * 6,
+        }
+    )
+    straddles = pd.DataFrame(
+        {
+            "event_id": [f"ABC_{idx}" for idx in range(6)],
+            "entry_premium_usd": [400, 420, 430, 250, 260, 270],
+            "gross_proxy_pnl_usd": [80, -40, 100, -30, 50, 70],
+            "haircut_pnl_usd": [40, -82, 57, -55, 24, 43],
+            "proxy_volume_window": [10, 11, 12, 13, 14, 15],
+            "proxy_transactions_window": [3, 4, 5, 6, 7, 8],
+        }
+    )
+
+    features = add_benchmark_predictions(
+        build_model_feature_matrix(panel, straddle_diagnostics=straddles)
+    )
+
+    assert features["is_main_dte_5_14"].tolist() == [True, True, False, False, True, True]
+    assert "forecast_last_four_rvar" in features
+    assert "forecast_goyal_saretto_rv_iv_spread" in features
+    assert features["mispricing_realized"].iloc[0] == pytest.approx(0.01)
+
+    fit = fit_linear_elastic_net(features, split_date="2025-05-01")
+    assert fit.model_id == "linear_elastic_net"
+    assert "forecast_linear_elastic_net" in fit.predictions
+    assert fit.predictions["forecast_linear_elastic_net"].ge(0).all()
+
+    forecast = forecast_metrics(
+        features,
+        forecast_col="forecast_market_implied_event_variance",
+    )
+    assert forecast["n"] == 6
+    assert forecast["mae"] is not None
+
+    ranking = ranking_metrics(
+        features.assign(
+            score=features["forecast_goyal_saretto_rv_iv_spread"] - features["ivar_event"]
+        ),
+        score_col="score",
+    )
+    assert ranking["top_decile_precision"] is not None
+    assert (
+        edge_decile_table(
+            features.assign(score=features["edge_var_realized"]), score_col="score"
+        ).empty
+        is False
+    )
+
+    strategy = build_proxy_strategy_frame(
+        features,
+        forecast_col="forecast_goyal_saretto_rv_iv_spread",
+    )
+    trades = strategy.loc[strategy["should_trade"].astype(bool)]
+    metrics = strategy_metrics(trades)
+    assert metrics["turnover"] == len(trades)
+    assert cost_sensitivity(trades).shape[0] == 5
+
+
+def test_sequence_matrix_and_torch_sequence_models() -> None:
+    rows = pd.DataFrame(
+        {
+            "event_id": ["E1", "E1", "E2", "E2"],
+            "day_index": [-2, -1, -2, -1],
+            "atm_iv": [0.30, 0.32, 0.40, 0.42],
+            "option_volume": [100, 120, 200, 220],
+            "spread_over_mid": [0.10, 0.09, 0.08, 0.07],
+        }
+    )
+    sequence = build_option_surface_sequence_matrix(rows, lookback_days=2)
+    columns = [column for column in sequence.columns if column.startswith("seq_t")]
+    tensor = sequence_tensor_from_frame(sequence, columns)
+
+    assert tensor.shape == (2, 2, 3)
+    ft = FTTransformerRegressor(n_features=3)
+    mamba = MambaSequenceEncoder(n_features=3)
+    assert ft(tensor[:, 0, :]).shape == (2,)
+    assert mamba(tensor).shape == (2,)
+
+
+def test_research_metrics_cover_empty_and_breakdown_paths() -> None:
+    frame = pd.DataFrame(
+        {
+            "event_date": pd.date_range("2025-01-01", periods=5, freq="D"),
+            "ticker": ["AAA", "AAA", "BBB", "BBB", "CCC"],
+            "forecast": [0.06, 0.02, 0.07, 0.01, 0.05],
+            "rvar_event": [0.05, 0.03, 0.08, 0.02, 0.04],
+            "ivar_event": [0.04, 0.04, 0.05, 0.03, 0.05],
+            "edge_var_realized": [0.01, -0.01, 0.03, -0.01, -0.01],
+            "net_proxy_pnl_usd": [100, -50, 200, -20, 0],
+            "gross_proxy_pnl_usd": [120, -30, 230, -10, 5],
+            "entry_premium_usd": [500, 400, 600, 300, 450],
+            "estimated_transaction_cost_usd": [20, 20, 30, 10, 5],
+            "announcement_timing": ["AMC", "BMO", "AMC", "BMO", "AMC"],
+        }
+    )
+
+    assert qlike_loss([0.05, 0.10], [0.04, 0.11]) >= 0
+    assert (
+        forecast_metrics(
+            pd.DataFrame({"forecast": [np.nan], "rvar_event": [np.nan]}),
+            forecast_col="forecast",
+        )["n"]
+        == 0
+    )
+    assert (
+        forecast_metrics(frame.drop(columns=["ivar_event"]), forecast_col="forecast")[
+            "oos_r2_vs_ivar"
+        ]
+        is None
+    )
+    assert auc_score([1, 1], [0.2, 0.3]) is None
+    assert brier_score([np.nan], [np.nan]) is None
+    assert max_drawdown([]) == 0.0
+
+    calibration = calibration_table(
+        frame.assign(outcome=frame["edge_var_realized"].gt(0).astype(int)),
+        score_col="forecast",
+        outcome_col="outcome",
+        bins=3,
+    )
+    assert calibration["n"].sum() == len(frame)
+    assert calibration_table(
+        pd.DataFrame({"forecast": [np.nan], "outcome": [np.nan]}),
+        score_col="forecast",
+        outcome_col="outcome",
+    ).empty
+    with pytest.raises(ValueError, match="frame must include"):
+        calibration_table(frame, score_col="missing", outcome_col="outcome")
+
+    assert (
+        ranking_metrics(
+            pd.DataFrame({"score": [np.nan], "edge_var_realized": [np.nan]}),
+            score_col="score",
+        )["n"]
+        == 0
+    )
+    assert edge_decile_table(
+        pd.DataFrame({"score": [np.nan], "edge_var_realized": [np.nan]}), score_col="score"
+    ).empty
+    assert strategy_metrics(pd.DataFrame({"net_proxy_pnl_usd": [np.nan]}))["turnover"] == 0
+    with pytest.raises(ValueError, match="frame must include"):
+        strategy_metrics(frame.drop(columns=["net_proxy_pnl_usd"]))
+    with pytest.raises(ValueError, match="frame must include"):
+        cost_sensitivity(frame.drop(columns=["gross_proxy_pnl_usd"]))
+    with pytest.raises(ValueError, match="breakdown columns"):
+        breakdown_metrics(frame, by=["missing"], forecast_col="forecast")
+
+    by_timing = breakdown_metrics(frame, by=["announcement_timing"], forecast_col="forecast")
+    assert set(by_timing["announcement_timing"]) == {"AMC", "BMO"}
+    bundle = evaluate_prediction_bundle(
+        frame,
+        forecast_col="forecast",
+        score_col="forecast",
+        breakdown_columns=["announcement_timing"],
+    )
+    assert bundle.forecast["n"] == len(frame)
+    assert bundle.ranking["n"] == len(frame)
+    assert bundle.strategy["turnover"] == len(frame)
+    assert "announcement_timing" in bundle.breakdowns
+
+
+def test_research_model_suite_and_error_paths() -> None:
+    feature_frame = pd.DataFrame(
+        {
+            "event_id": [f"E{idx}" for idx in range(8)],
+            "ticker": ["AAA", "AAA", "AAA", "AAA", "BBB", "BBB", "BBB", "BBB"],
+            "announcement_date": pd.date_range("2024-01-01", periods=8, freq="30D"),
+            "rvar_event": [0.05, 0.03, 0.06, 0.08, 0.02, 0.04, 0.07, 0.09],
+            "ivar_event": [0.04, 0.04, 0.05, 0.06, 0.03, 0.03, 0.05, 0.06],
+            "feature_a": [1, 2, 3, 4, 1, 2, 3, 4],
+            "feature_b": [True, False, True, False, True, False, True, False],
+            "entry_premium_usd": [400, 410, 420, 430, 300, 310, 320, 330],
+            "gross_proxy_pnl_usd": [40, -20, 60, 80, -10, 30, 70, 90],
+            "haircut_pnl_usd": [5, -55, 23, 43, -40, 1, 38, 57],
+        }
+    )
+
+    with pytest.raises(ValueError, match="announcement_date"):
+        temporal_train_test_split(pd.DataFrame({"ticker": ["AAA"], "rvar_event": [0.1]}))
+    with pytest.raises(ValueError, match="missing required"):
+        add_benchmark_predictions(feature_frame.drop(columns=["ivar_event"]))
+    with pytest.raises(ValueError, match="model is not fit"):
+        LinearElasticNetRegressor().predict(feature_frame)
+    with pytest.raises(ValueError, match="alpha"):
+        LinearElasticNetRegressor(alpha=-0.1)
+    with pytest.raises(ValueError, match="l1_ratio"):
+        LinearElasticNetRegressor(l1_ratio=1.5)
+
+    predictions, results = run_model_suite(
+        feature_frame,
+        model_ids=[
+            "market_implied_event_variance",
+            "last_four_rvar",
+            "last_four_ivar",
+            "goyal_saretto_rv_iv_spread",
+            "linear_elastic_net",
+            "mamba_sequence_encoder",
+        ],
+        split_date="2024-06-01",
+    )
+    assert "forecast_market_implied_event_variance" in predictions
+    assert "forecast_linear_elastic_net" in predictions
+    diagnostics = model_diagnostics_as_frame(results)
+    assert set(diagnostics["model_id"]) == {"linear_elastic_net", "mamba_sequence_encoder"}
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("mamba_sequence_encoder"), "status"].iloc[0]
+        == "skipped_no_sequence_features"
+    )
+
+    ft_fit = fit_ft_transformer(feature_frame, split_date="2024-06-01", epochs=1)
+    assert ft_fit.predictions["forecast_ft_transformer"].ge(0).all()
+    seq_frame = feature_frame.assign(
+        seq_t00_atm_iv=np.linspace(0.2, 0.3, len(feature_frame)),
+        seq_t01_atm_iv=np.linspace(0.21, 0.31, len(feature_frame)),
+        seq_t00_volume=np.linspace(10, 17, len(feature_frame)),
+        seq_t01_volume=np.linspace(11, 18, len(feature_frame)),
+    )
+    assert sequence_feature_columns(seq_frame) == [
+        "seq_t00_atm_iv",
+        "seq_t00_volume",
+        "seq_t01_atm_iv",
+        "seq_t01_volume",
+    ]
+    mamba_fit = fit_mamba_sequence_encoder(seq_frame, split_date="2024-06-01", epochs=1)
+    assert mamba_fit.predictions["forecast_mamba_sequence_encoder"].ge(0).all()
+
+    assert prediction_column_for_model("linear_elastic_net") == "forecast_linear_elastic_net"
+    with pytest.raises(ValueError, match="unknown model_id"):
+        run_model_suite(feature_frame, model_ids=["not_a_model"])
+    with pytest.raises(ValueError, match="not a trainable"):
+        fit_model("not_a_trainable_model", feature_frame)
+    with pytest.raises(ValueError, match="at least one sequence"):
+        sequence_tensor_from_frame(seq_frame, [])
+    with pytest.raises(ValueError, match="invalid sequence"):
+        sequence_tensor_from_frame(seq_frame, ["bad_name"])
+    with pytest.raises(ValueError, match="sequence must have shape"):
+        MambaSequenceEncoder(n_features=2)(torch.zeros(2, 2))
+
+
+def test_feature_matrix_edge_cases_and_sequence_eligibility() -> None:
+    assert (
+        sequence_eligibility_reason(
+            [date(2025, 1, 1), date(2025, 1, 2)],
+            entry_date=date(2025, 1, 3),
+            required_trading_days=2,
+        )
+        is None
+    )
+    assert (
+        sequence_eligibility_reason(
+            [date(2025, 1, 1)],
+            entry_date=date(2025, 1, 3),
+            required_trading_days=2,
+        )
+        == "insufficient_2_day_sequence"
+    )
+    with pytest.raises(ValueError, match="missing required"):
+        build_model_feature_matrix(pd.DataFrame({"ticker": ["AAA"], "rvar_event": [0.1]}))
+    with pytest.raises(ValueError, match="requires announcement_date"):
+        build_model_feature_matrix(
+            pd.DataFrame({"ticker": ["AAA"], "rvar_event": [0.1], "ivar_event": [0.2]})
+        )
+
+    panel = pd.DataFrame(
+        {
+            "ticker": ["AAA"],
+            "event_date": ["2025-01-01"],
+            "entry_date": ["2025-01-01"],
+            "rvar_event": [0.05],
+            "ivar_event": [0.04],
+            "dte": [22],
+        }
+    )
+    features = build_model_feature_matrix(panel)
+    assert features["dte_bucket"].iloc[0] == "ivar_support_gt_21"
+    assert bool(features["is_robustness_dte_3_21"].iloc[0]) is False
+
+    with pytest.raises(ValueError, match="sequence rows missing"):
+        build_option_surface_sequence_matrix(pd.DataFrame({"event_id": ["E1"]}))
+    empty_sequence = build_option_surface_sequence_matrix(
+        pd.DataFrame(
+            {
+                "event_id": ["E1"],
+                "day_index": [0],
+                "atm_iv": [0.2],
+                "option_volume": [10],
+                "spread_over_mid": [0.1],
+            }
+        )
+    )
+    assert empty_sequence.columns.tolist() == ["event_id"]
 
 
 def test_transaction_cost_and_portfolio_caps_scale_trades() -> None:
@@ -4457,6 +4802,61 @@ def test_cli_smoke_commands(tmp_path: Path) -> None:
         == 0
     )
     assert (backtest_out / "backtest_smoke_signal.json").exists()
+
+    feature_panel = tmp_path / "trade_proxy_panel.parquet"
+    pd.DataFrame(
+        {
+            "event_id": ["E1", "E2", "E3", "E4"],
+            "ticker": ["ABC", "ABC", "XYZ", "XYZ"],
+            "announcement_date": ["2025-01-01", "2025-02-01", "2025-03-01", "2025-04-01"],
+            "announcement_timing": ["AMC", "BMO", "AMC", "BMO"],
+            "rvar_event": [0.05, 0.04, 0.03, 0.06],
+            "ivar_event": [0.04, 0.05, 0.03, 0.04],
+            "dte_1": [8, 9, 12, 16],
+            "universe_rank": [1, 2, 3, 4],
+        }
+    ).to_parquet(feature_panel, index=False)
+    feature_straddles = tmp_path / "straddles.csv"
+    pd.DataFrame(
+        {
+            "event_id": ["E1", "E2", "E3", "E4"],
+            "entry_premium_usd": [400, 420, 300, 350],
+            "gross_proxy_pnl_usd": [80, -30, 20, 90],
+            "haircut_pnl_usd": [40, -72, -10, 55],
+        }
+    ).to_csv(feature_straddles, index=False)
+    features_out = tmp_path / "features.parquet"
+    assert (
+        main(
+            [
+                "build-feature-matrix",
+                "--panel",
+                str(feature_panel),
+                "--straddles",
+                str(feature_straddles),
+                "--out",
+                str(features_out),
+            ]
+        )
+        == 0
+    )
+    models_out = tmp_path / "models"
+    assert (
+        main(
+            [
+                "train-models",
+                "--features",
+                str(features_out),
+                "--out",
+                str(models_out),
+                "--models",
+                "market_implied_event_variance,last_four_rvar,linear_elastic_net",
+            ]
+        )
+        == 0
+    )
+    assert (models_out / "forecast_metrics.csv").exists()
+    assert (models_out / "strategy_metrics.csv").exists()
 
 
 def test_compute_variance_uses_event_exit_date_and_rejects_duplicates(tmp_path: Path) -> None:

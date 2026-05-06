@@ -5,10 +5,11 @@
 This repository is an early-stage research pipeline for the earnings event
 volatility project. The current implementation can build audited candidate
 events, provisional event panels, and a second-aggregate trade-price proxy
-panel. It does not yet produce paper-grade quote/NBBO backtest results. The
-active market-data route has no historical option quote rows: proxy entry marks
-come from Massive option second aggregates, and proxy exit marks come from
-exit-date option day-aggregate closes when available.
+panel, then build a feature matrix and run the first proxy forecast/ranking/
+strategy model suite. It does not yet produce paper-grade quote/NBBO backtest
+results. The active market-data route has no historical option quote rows:
+proxy entry marks come from Massive option second aggregates, and proxy exit
+marks come from exit-date option day-aggregate closes when available.
 
 Active and current:
 
@@ -20,7 +21,7 @@ Active and current:
   --fix`, strict mypy, pytest, MkDocs strict, status, and Massive credential
   probes.
 - Test coverage floor: 93% on the active package. Current local test gate:
-  65 tests passed with 93.10% total coverage.
+  75 tests passed with 93.14% total coverage.
 - Data-audit gate: `just audit` for fixtures; `just audit date=YYYY-MM-DD` for
   a narrow Massive flat-file sample gate.
 - Data-engineering gate: `just data` for resumable stages. The current stages
@@ -44,6 +45,13 @@ Active and current:
   audit, and legacy fixture panel smoke paths. It prints stage-level progress
   plus bulk day-agg, second-agg, and exit day-agg count/status updates during
   long runs.
+- Research gate: `just research` builds
+  `data/gold/modeling/feature_matrix.parquet` from the current proxy event
+  panel and trains/evaluates market IVAR, last-four RVAR, last-four IVAR,
+  Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost,
+  FT-Transformer, and the Mamba sequence-encoder entrypoint. Mamba is marked
+  `skipped_no_sequence_features` when the feature matrix lacks 20-day
+  `seq_tXX_*` option-surface path columns.
 - Data lake layout: Massive flat-file downloads are temporary transfer files.
   They are converted immediately into compressed Parquet under `data/bronze/`;
   full-market option/underlying day aggregates are cached under
@@ -115,10 +123,11 @@ Not yet paper evidence:
   observed in this workspace exposes option day aggregates from 2022-05-04;
   full 2013-2025 dynamic-universe data still requires upgraded historical
   options day-agg entitlement or another licensed options data route.
-- The active implementation is still deterministic/pilot plumbing: event
-  alignment, variance extraction, leakage checks, data audit, contract
-  discovery, local-IV diagnostics, and backtest smoke paths. It is not yet a
-  train/test modeling pipeline.
+- The active implementation now includes deterministic data plumbing plus a
+  train/test proxy modeling pipeline: event alignment, variance extraction,
+  leakage checks, data audit, contract discovery, local-IV diagnostics, feature
+  matrix construction, benchmark/model training, forecast metrics, ranking
+  diagnostics, and cost-aware proxy strategy summaries.
 - Integrity guards now fail closed on model-implementation claims, IVAR expiry
   coverage, timezone mismatches, missing/duplicate event-price rows, and
   vendor/local IV audit prerequisites.
@@ -130,7 +139,9 @@ Not yet paper evidence:
   `possible_preannouncement_or_prior_guidance`.
 - IVAR extraction failures now keep selected raw IVs, DTEs, expiries, spreads,
   and `expiry_gap_days` for diagnosis.
-- No models or backtests have been run.
+- Proxy model outputs have been run locally. They are useful for engineering
+  diagnostics and first-pass signal screening, but they are not paper evidence
+  until robustness, cost sensitivity, and no-NBBO limitations are analyzed.
 
 Latest local pilot-panel run:
 
@@ -162,6 +173,26 @@ Latest local trade-proxy run:
   screening panel based on trade-price OHLCV bars, not a bid/ask executable
   strategy result.
 
+Latest local research run:
+
+- Command:
+  `just research args="--split-date 2025-01-01"`.
+- Feature matrix: `data/gold/modeling/feature_matrix.parquet`.
+- Rows/columns: 810 events and 84 columns.
+- Outputs: `artifacts/modeling/forecast_metrics.csv`,
+  `ranking_metrics.csv`, `strategy_metrics.csv`,
+  `strategy_breakdowns.csv`, `model_fit_diagnostics.csv`,
+  `model_predictions.parquet`, per-model `edge_deciles_*.csv`, and per-model
+  `strategy_trades_*.csv`.
+- Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
+  Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost, and
+  FT-Transformer. Mamba is present in diagnostics as
+  `skipped_no_sequence_features` because the current proxy feature matrix does
+  not yet include 20-day option-surface path columns.
+- The best-looking proxy rows in this split are LightGBM/XGBoost, but these are
+  no-NBBO proxy results. They should be treated as a signal-quality smoke test,
+  not as a paper claim.
+
 ## Legacy Material
 
 Copied modules, scripts, data, generated site artifacts, and caches from earlier
@@ -176,9 +207,9 @@ The current rule is:
 
 ## Next Gate
 
-The next implementation gate is the uncapped 2022-12-01 through 2025-12-31
-dynamic top-50 proxy pass under the current Massive entitlement, not quote/NBBO
-ingestion. The recommended sequence is:
+The next implementation gate is to regenerate the proxy data after any contract
+schema changes and then use the model outputs as diagnostics, not quote/NBBO
+paper evidence. The recommended sequence is:
 
 1. Run bare `just data` and inspect
    `artifacts/data_pipeline/options_day_aggs_bulk/options_day_aggs_bulk_manifest.json`,
@@ -190,9 +221,13 @@ ingestion. The recommended sequence is:
 3. Use `just data args="--dry-run"` before larger fetches, then use real run
    telemetry to decide whether any expanded proxy lake stays on WSL ext4 or
    moves `DATA_DIR` to a larger NVMe/external path.
-4. Only after the proxy lake is stable, build the feature matrix and model
-   baselines. Paper-grade quote/NBBO ingestion remains a later route, not a
-   current dependency for the proxy data-engineering pass.
+4. Run `just research args="--split-date 2025-01-01"` to refresh the feature
+   matrix and model/strategy reports.
+5. Inspect `artifacts/modeling/model_fit_diagnostics.csv`,
+   `forecast_metrics.csv`, `ranking_metrics.csv`, `strategy_metrics.csv`, and
+   `strategy_breakdowns.csv` before writing any claims. Paper-grade quote/NBBO
+   ingestion remains a later route, not a current dependency for the proxy
+   data-engineering pass.
 
 Promotion criterion:
 

@@ -236,6 +236,7 @@ def _load_option_day_contracts(
         if close <= 0 or volume <= 0:
             continue
         strike = float(parsed["strike"])
+        in_requested_dte = dte <= int(event.get("requested_dte_max", dte_max))
         rows.append(
             {
                 "event_id": event["event_id"],
@@ -256,8 +257,11 @@ def _load_option_day_contracts(
                 "contract_size": 100,
                 "deliverable_status": "standard",
                 "corporate_action_flag": False,
-                "contract_discovery_status": "ok",
-                "eligible_for_quote_pool": True,
+                "contract_discovery_status": "ok" if in_requested_dte else "ivar_support_only",
+                "eligible_for_quote_pool": bool(in_requested_dte),
+                "is_main_dte_5_14": bool(in_requested_dte and 5 <= dte <= 14),
+                "is_robustness_dte_3_21": bool(in_requested_dte and 3 <= dte <= 21),
+                "is_ivar_support_only": bool(not in_requested_dte),
                 "quote_route": "options_day_aggs_close_proxy",
             }
         )
@@ -539,6 +543,9 @@ def build_pilot_panel(
                 "entry_date": entry_date,
                 "exit_date": exit_date,
                 "feature_cutoff_date": entry_date,
+                "requested_dte_min": dte_min,
+                "requested_dte_max": dte_max,
+                "ivar_support_dte_max": second_expiry_dte_max,
                 "event_entry_timestamp": regular_close_timestamp(entry_date).isoformat()
                 if entry_date
                 else None,
@@ -633,6 +640,7 @@ def build_pilot_panel(
             "calendar": str(calendar_path),
             "dte_min": dte_min,
             "dte_max": dte_max,
+            "ivar_support_dte_max": second_expiry_dte_max,
             "max_events": max_events,
         },
         "events": int(len(panel)),
@@ -640,6 +648,18 @@ def build_pilot_panel(
         "events_with_ivar": int(panel["ivar_event"].notna().sum()),
         "ivar_failure_counts": panel["ivar_failure_reason"].fillna("ok").value_counts().to_dict(),
         "contracts": int(len(contracts)),
+        "quote_pool_contracts": int(contracts["eligible_for_quote_pool"].sum())
+        if "eligible_for_quote_pool" in contracts
+        else 0,
+        "main_dte_5_14_contracts": int(contracts["is_main_dte_5_14"].sum())
+        if "is_main_dte_5_14" in contracts
+        else 0,
+        "robustness_dte_3_21_contracts": int(contracts["is_robustness_dte_3_21"].sum())
+        if "is_robustness_dte_3_21" in contracts
+        else 0,
+        "ivar_support_only_contracts": int(contracts["is_ivar_support_only"].sum())
+        if "is_ivar_support_only" in contracts
+        else 0,
         "contracts_with_local_iv": int(iv_contracts["local_iv"].notna().sum())
         if not iv_contracts.empty
         else 0,

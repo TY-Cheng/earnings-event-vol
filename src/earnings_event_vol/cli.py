@@ -8,6 +8,7 @@ from typing import Any, NoReturn, cast
 import pandas as pd
 
 from earnings_event_vol.backtest import (
+    build_proxy_strategy_frame,
     expected_strategy_value_usd,
     market_entry_cost_usd,
     premium_space_signal,
@@ -22,11 +23,26 @@ from earnings_event_vol.data_pipeline import (
 from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
 from earnings_event_vol.events import align_event_window, validate_calendar_frame
+from earnings_event_vol.features import build_model_feature_matrix
 from earnings_event_vol.leakage_audit import audit_feature_leakage
 from earnings_event_vol.massive import (
     build_massive_day_agg_sample,
     credential_probe,
     massive_flat_file_manifest,
+)
+from earnings_event_vol.metrics import (
+    breakdown_metrics,
+    edge_decile_table,
+    forecast_metrics,
+    ranking_metrics,
+    strategy_metrics,
+)
+from earnings_event_vol.models import (
+    MODEL_REGISTRY,
+    add_benchmark_predictions,
+    model_diagnostics_as_frame,
+    prediction_column_for_model,
+    run_model_suite,
 )
 from earnings_event_vol.schemas import EarningsEvent, OptionRight, OptionSide, TradeLeg
 from earnings_event_vol.variance import (
@@ -79,6 +95,20 @@ def _source_probe(source: str, config: ProjectConfig) -> int:
 
 def _read_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
+
+
+def _read_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def _write_table(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix.lower() == ".parquet":
+        frame.to_parquet(path, index=False)
+    else:
+        frame.to_csv(path, index=False)
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -368,6 +398,154 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
     return 0 if bool(payload["ok"]) else 1
 
 
+def _build_feature_matrix(args: argparse.Namespace) -> int:
+    panel = _read_table(args.panel)
+    straddles = _read_table(args.straddles) if args.straddles and args.straddles.exists() else None
+    features = build_model_feature_matrix(panel, straddle_diagnostics=straddles)
+    features = add_benchmark_predictions(features)
+    _write_table(args.out, features)
+    payload = {
+        "rows": int(len(features)),
+        "columns": int(len(features.columns)),
+        "out": str(args.out),
+        "target": "rvar_event",
+        "market_baseline": "ivar_event",
+        "prediction_columns": [
+            column for column in features.columns if column.startswith("forecast_")
+        ],
+    }
+    _print_json(payload)
+    return 0
+
+
+def _model_ids_from_args(values: list[str]) -> list[str]:
+    if not values or values == ["all"]:
+        return [
+            "market_implied_event_variance",
+            "last_four_rvar",
+            "last_four_ivar",
+            "goyal_saretto_rv_iv_spread",
+            "linear_elastic_net",
+            "lightgbm",
+            "xgboost",
+            "ft_transformer",
+            "mamba_sequence_encoder",
+        ]
+    parsed: list[str] = []
+    for value in values:
+        parsed.extend(part.strip() for part in value.split(",") if part.strip())
+    unknown = sorted(set(parsed) - set(MODEL_REGISTRY))
+    if unknown:
+        raise ValueError(f"unknown model ids: {unknown}")
+    return parsed
+
+
+def _train_models(args: argparse.Namespace) -> int:
+    features = _read_table(args.features)
+    model_ids = _model_ids_from_args(args.models)
+    predictions, fit_results = run_model_suite(
+        features,
+        model_ids=model_ids,
+        split_date=args.split_date,
+    )
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    predictions_path = out / "model_predictions.parquet"
+    predictions.to_parquet(predictions_path, index=False)
+    diagnostics = model_diagnostics_as_frame(fit_results)
+    diagnostics.to_csv(out / "model_fit_diagnostics.csv", index=False)
+
+    forecast_rows: list[dict[str, object]] = []
+    ranking_rows: list[dict[str, object]] = []
+    strategy_rows: list[dict[str, object]] = []
+    breakdown_frames: list[pd.DataFrame] = []
+    for model_id in model_ids:
+        if model_id == "patell_wolfson_diagnostic":
+            continue
+        column = prediction_column_for_model(model_id)
+        if column not in predictions.columns:
+            continue
+        scored = predictions.copy()
+        scored[f"score_{model_id}"] = pd.to_numeric(
+            scored[column], errors="coerce"
+        ) - pd.to_numeric(scored["ivar_event"], errors="coerce")
+        forecast_rows.append(
+            {
+                "model_id": model_id,
+                **forecast_metrics(scored, forecast_col=column),
+            }
+        )
+        if "edge_var_realized" in scored.columns:
+            ranking_rows.append(
+                {
+                    "model_id": model_id,
+                    **ranking_metrics(scored, score_col=f"score_{model_id}"),
+                }
+            )
+            edge_decile_table(
+                scored,
+                score_col=f"score_{model_id}",
+            ).to_csv(out / f"edge_deciles_{model_id}.csv", index=False)
+        if {"gross_proxy_pnl_usd", "entry_premium_usd"}.issubset(scored.columns):
+            strategy_frame = build_proxy_strategy_frame(
+                scored,
+                forecast_col=column,
+                min_edge_var=args.min_edge_var,
+            )
+            trades = strategy_frame.loc[strategy_frame["should_trade"].astype(bool)].copy()
+            trades.to_csv(out / f"strategy_trades_{model_id}.csv", index=False)
+            strategy_rows.append(
+                {
+                    "model_id": model_id,
+                    **strategy_metrics(trades),
+                }
+            )
+            for breakdown in (
+                "is_main_dte_5_14",
+                "announcement_timing",
+                "event_year",
+                "regime",
+                "ticker",
+            ):
+                if breakdown in trades.columns and not trades.empty:
+                    frame = breakdown_metrics(
+                        trades,
+                        by=[breakdown],
+                        forecast_col=column,
+                    )
+                    frame.insert(0, "model_id", model_id)
+                    frame.insert(1, "breakdown", breakdown)
+                    breakdown_frames.append(frame)
+
+    forecast_frame = pd.DataFrame(forecast_rows)
+    ranking_frame = pd.DataFrame(ranking_rows)
+    strategy_frame = pd.DataFrame(strategy_rows)
+    forecast_frame.to_csv(out / "forecast_metrics.csv", index=False)
+    ranking_frame.to_csv(out / "ranking_metrics.csv", index=False)
+    strategy_frame.to_csv(out / "strategy_metrics.csv", index=False)
+    if breakdown_frames:
+        pd.concat(breakdown_frames, ignore_index=True).to_csv(
+            out / "strategy_breakdowns.csv", index=False
+        )
+    payload = {
+        "ok": True,
+        "features": str(args.features),
+        "out": str(out),
+        "models": model_ids,
+        "prediction_rows": int(len(predictions)),
+        "outputs": {
+            "predictions": str(predictions_path),
+            "forecast_metrics": str(out / "forecast_metrics.csv"),
+            "ranking_metrics": str(out / "ranking_metrics.csv"),
+            "strategy_metrics": str(out / "strategy_metrics.csv"),
+            "model_fit_diagnostics": str(out / "model_fit_diagnostics.csv"),
+        },
+    }
+    _write_json(out / "modeling_report.json", payload)
+    _print_json(payload)
+    return 0
+
+
 def _leakage_audit(args: argparse.Namespace) -> int:
     frame = _read_csv(args.features)
     result = audit_feature_leakage(frame)
@@ -591,6 +769,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trade-proxy option price field from second aggregates.",
     )
 
+    build_features = subparsers.add_parser(
+        "build-feature-matrix", help="Build event-level feature matrix for models."
+    )
+    build_features.add_argument(
+        "--panel",
+        type=Path,
+        default=Path("data/gold/event_panel/trade_proxy_event_panel.parquet"),
+    )
+    build_features.add_argument(
+        "--straddles",
+        type=Path,
+        default=Path(
+            "artifacts/data_pipeline/trade_proxy_panel/trade_proxy_straddle_diagnostics.csv"
+        ),
+    )
+    build_features.add_argument(
+        "--out",
+        type=Path,
+        default=Path("data/gold/modeling/feature_matrix.parquet"),
+    )
+
+    train_models = subparsers.add_parser(
+        "train-models", help="Train benchmarks/models and write forecast/ranking/strategy metrics."
+    )
+    train_models.add_argument(
+        "--features",
+        type=Path,
+        default=Path("data/gold/modeling/feature_matrix.parquet"),
+    )
+    train_models.add_argument("--out", type=Path, default=Path("artifacts/modeling"))
+    train_models.add_argument("--models", nargs="*", default=["all"])
+    train_models.add_argument("--split-date", default=None)
+    train_models.add_argument("--min-edge-var", type=float, default=0.0)
+
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")
     leakage_audit.add_argument("--features", type=Path, required=True)
     leakage_audit.add_argument("--out", type=Path, required=True)
@@ -632,6 +844,10 @@ def main(argv: list[str] | None = None) -> int:
         return _build_event_panel(args)
     if args.command == "data":
         return _data(args, config)
+    if args.command == "build-feature-matrix":
+        return _build_feature_matrix(args)
+    if args.command == "train-models":
+        return _train_models(args)
     if args.command == "leakage-audit":
         return _leakage_audit(args)
     if args.command == "backtest-smoke":

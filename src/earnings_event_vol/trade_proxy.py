@@ -655,6 +655,12 @@ def summarize_trade_proxy_panel(
         else {},
         "proxy_contracts": int(len(proxy_prices)),
         "proxy_contract_status_counts": status_counts,
+        "main_dte_5_14_contracts": int(proxy_prices["is_main_dte_5_14"].sum())
+        if "is_main_dte_5_14" in proxy_prices
+        else 0,
+        "robustness_dte_3_21_contracts": int(proxy_prices["is_robustness_dte_3_21"].sum())
+        if "is_robustness_dte_3_21" in proxy_prices
+        else 0,
         "proxy_contracts_with_local_iv": int(proxy_prices["local_iv"].notna().sum())
         if "local_iv" in proxy_prices
         else 0,

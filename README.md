@@ -44,11 +44,12 @@ in premium space:
 
 Current status: the repository has a working deterministic data-engineering
 spine for event alignment, provisional IVAR extraction, and a Massive
-second-aggregate trade-price proxy panel. It is not yet a paper-grade
-quote/NBBO backtest or a model-training pipeline. The implemented market-data
-route does not ingest historical option quote rows: it starts from Massive
-option second aggregates for pre-cutoff entry prices and diagnostics, and uses
-exit-date option day-aggregate closes for proxy exits.
+second-aggregate trade-price proxy panel, plus a first train/test modeling and
+strategy-evaluation layer for proxy research. It is not yet a paper-grade
+quote/NBBO backtest. The implemented market-data route does not ingest
+historical option quote rows: it starts from Massive option second aggregates
+for pre-cutoff entry prices and diagnostics, and uses exit-date option
+day-aggregate closes for proxy exits.
 
 Implemented now:
 
@@ -58,8 +59,9 @@ Implemented now:
 - `earnings_event_vol` Python package and CLI for status, source checks, audits,
   event panels, and data-pipeline stages.
 - V1 protocol implementation for event alignment, variance extraction, data
-  audit, leakage audit, feature checks, model registry, and deterministic
-  backtest smoke.
+  audit, leakage audit, feature checks, model registry, deterministic backtest
+  smoke, feature-matrix construction, model training, and forecast/ranking/
+  strategy metric reports.
 - Integrity guards for timezone-aware event timestamps, IVAR expiry coverage,
   explicit model implementation claims, and fail-closed audit outputs.
 - SEC-first earnings-candidate builder with SEC primary-document text validation
@@ -73,12 +75,23 @@ Implemented now:
 - V1.5 Massive second-aggregate trade-proxy route, marked
   `no_nbbo_trade_proxy`, for screening event alignment, IVAR extraction, and
   proxy PnL without quote/NBBO data.
+- Implemented benchmark/model layer for market-implied IVAR, last-four RVAR,
+  last-four IVAR, Goyal-Saretto-style RV-IV spread, Patell-Wolfson-style
+  diagnostics, Elastic Net, LightGBM, XGBoost, FT-Transformer, and a Mamba-style
+  sequence encoder interface. Current tabular proxy panels train the tabular
+  models; the Mamba route requires 20-day pre-event `seq_tXX_*` surface-path
+  features and is reported as skipped when those columns are absent.
+- Implemented forecast, ranking/mispricing, and proxy-strategy metrics: MAE,
+  RMSE, QLIKE, OOS R2 versus IVAR, top-decile precision, AUC/Brier,
+  calibration/edge-decile diagnostics, gross/net proxy PnL, return on premium
+  or capital, Sharpe/Sortino, drawdown, hit rate, average win/loss, cost
+  sensitivity, and breakdown tables.
 
 Not yet implemented:
 
 - Paper-grade historical bid/ask or NBBO ingestion.
 - Downloaded full 2013-2025 top-50 proxy panel results and coverage tables.
-- Production model training for LightGBM, FT-Transformer, and Mamba.
+- 20-day option-surface path feature engineering for the Mamba sequence route.
 - Paper-grade empirical results.
 
 ## Quick Start
@@ -107,6 +120,7 @@ Public entrypoints:
 just status
 just audit
 just data
+just research
 just docs
 ```
 
@@ -168,7 +182,7 @@ removed. The working layout is:
   diagnostics. Post-cutoff second-aggregate bars are not retained.
 - `data/silver/`: cleaned calendar, event-window, contract, and IVAR input
   tables.
-- `data/gold/`: analysis-ready event panels and later feature/model inputs.
+- `data/gold/`: analysis-ready event panels and feature/model inputs.
 - `artifacts/`: manifests, readiness reports, and audit summaries.
 
 Large table reads and writes use Polars + Parquet. Pandas remains acceptable
@@ -188,6 +202,22 @@ just data trade-proxy-panel args="--max-events 3 --jobs 2 --force"
 just data contracts args="--events PATH --contracts PATH"
 just data panel args="--events PATH --quotes PATH"
 ```
+
+`just research` builds `data/gold/modeling/feature_matrix.parquet` from the
+current trade-proxy event panel and then trains/evaluates the benchmark/model
+suite into `artifacts/modeling/`. The recommended first temporal split after a
+successful `just data` run is:
+
+```bash
+just research args="--split-date 2025-01-01"
+```
+
+Key outputs are `forecast_metrics.csv`, `ranking_metrics.csv`,
+`strategy_metrics.csv`, `strategy_breakdowns.csv`,
+`model_fit_diagnostics.csv`, `model_predictions.parquet`, and per-model
+`edge_deciles_*.csv` / `strategy_trades_*.csv`. These are proxy research
+outputs only: rows remain `no_nbbo_trade_proxy` unless a later quote/NBBO route
+is added.
 
 `just docs` also formats/lint-fixes first, then builds and serves the strict
 docs site.
