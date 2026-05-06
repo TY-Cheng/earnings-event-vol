@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Results Snapshot
 
 This page is the curated reader-facing snapshot. Raw generated outputs live

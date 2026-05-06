@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Future Work
 
 Keep the first paper narrow. The current repo has a working no-NBBO proxy data

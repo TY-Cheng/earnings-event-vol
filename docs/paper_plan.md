@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Paper Plan
 
 Working title:
