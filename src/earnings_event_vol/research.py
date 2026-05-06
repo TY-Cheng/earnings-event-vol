@@ -1747,6 +1747,11 @@ def write_proxy_research_report(
         if (artifacts_dir / "strategy_metrics.csv").exists()
         else pd.DataFrame()
     )
+    cost = (
+        pd.read_csv(artifacts_dir / "cost_sensitivity.csv")
+        if (artifacts_dir / "cost_sensitivity.csv").exists()
+        else pd.DataFrame()
+    )
     sequence_report_path = artifacts_dir / "sequence_coverage_report.json"
     sequence_report = (
         json.loads(sequence_report_path.read_text(encoding="utf-8"))
@@ -1797,6 +1802,73 @@ def write_proxy_research_report(
         clean = clean.where(pd.notna(clean), "n/a")
         return str(clean.to_markdown(index=False))
 
+    def _label(model_id: object) -> str:
+        return str(model_id).replace("_", " ")
+
+    def _value(frame: pd.DataFrame, model_id: str, metric: str) -> float | None:
+        if frame.empty or metric not in frame.columns or "model_id" not in frame.columns:
+            return None
+        rows = frame.loc[frame["model_id"].astype(str).eq(model_id), metric]
+        if rows.empty:
+            return None
+        value = pd.to_numeric(rows, errors="coerce").dropna()
+        if value.empty:
+            return None
+        return float(value.iloc[0])
+
+    def _fmt(value: float | None, *, pct: bool = False, money: bool = False) -> str:
+        if value is None or not np.isfinite(value):
+            return "n/a"
+        if money:
+            return f"${value:,.0f}"
+        if pct:
+            return f"{value:.1%}"
+        return f"{value:.4f}"
+
+    def _best(
+        frame: pd.DataFrame,
+        metric: str,
+        *,
+        higher_is_better: bool = True,
+    ) -> tuple[str, float] | None:
+        if frame.empty or "model_id" not in frame.columns or metric not in frame.columns:
+            return None
+        values = pd.to_numeric(frame[metric], errors="coerce")
+        valid = frame.loc[values.notna(), ["model_id"]].copy()
+        valid[metric] = values.loc[values.notna()]
+        if valid.empty:
+            return None
+        idx = valid[metric].idxmax() if higher_is_better else valid[metric].idxmin()
+        return str(valid.loc[idx, "model_id"]), float(valid.loc[idx, metric])
+
+    def _append_bullets(lines: list[str], bullets: Sequence[str]) -> None:
+        lines.extend([f"- {bullet}" for bullet in bullets if bullet])
+        lines.append("")
+
+    def _figure_path(name: str) -> str | None:
+        path = figure_paths.get(name)
+        if path is None:
+            return None
+        resolved = Path(path).resolve()
+        try:
+            return resolved.relative_to(report_path.parent.resolve()).as_posix()
+        except ValueError:
+            return str(resolved)
+
+    def _figure_block(
+        lines: list[str],
+        *,
+        name: str,
+        title: str,
+        bullets: Sequence[str],
+        level: str = "####",
+    ) -> None:
+        path = _figure_path(name)
+        if path is None:
+            return
+        lines.extend([f"{level} {title}", "", f"![{name}]({path})", ""])
+        _append_bullets(lines, bullets)
+
     mamba_note = "Mamba diagnostics were unavailable."
     if not predictions.empty and {
         "forecast_mamba_sequence_encoder",
@@ -1838,19 +1910,75 @@ def write_proxy_research_report(
                 f"{mask_target_corr:.3f} for the mask-only ablation."
             )
 
-    figure_order = [
-        ("forecast_performance", "Forecast Performance"),
-        ("auc_top_decile_precision", "AUC and Top-Decile Precision"),
-        ("calibration_plot", "Calibration"),
-        ("edge_decile_realized_mispricing", "Edge-Decile Realized Mispricing"),
-        ("strategy_pnl_by_edge_decile", "Strategy PnL"),
-        ("cost_sensitivity", "Cost Sensitivity"),
-        ("qlike_contribution_diagnostic", "QLIKE Contribution Diagnostic"),
-    ]
+    best_mae = _best(forecast, "mae", higher_is_better=False)
+    best_oos = _best(forecast, "oos_r2_vs_ivar", higher_is_better=True)
+    best_auc = _best(ranking, "auc", higher_is_better=True)
+    best_top_decile = _best(ranking, "top_decile_precision", higher_is_better=True)
+    best_edge_monotone = _best(ranking, "edge_decile_spearman", higher_is_better=True)
+    best_net = _best(strategy, "net_pnl_usd", higher_is_better=True)
+    best_return = _best(strategy, "return_on_premium", higher_is_better=True)
+    qlike_worst = _best(qlike, "raw_qlike", higher_is_better=True)
+    qlike_share_worst = _best(
+        qlike,
+        "top_1pct_qlike_contribution_share",
+        higher_is_better=True,
+    )
+    mamba_auc = _value(ranking, "mamba_sequence_encoder", "auc")
+    mask_auc = _value(ranking, "mask_only_mamba_sequence_encoder", "auc")
+    mamba_net = _value(strategy, "mamba_sequence_encoder", "net_pnl_usd")
+    mask_net = _value(strategy, "mask_only_mamba_sequence_encoder", "net_pnl_usd")
+    sequence_drop_rate = float(sequence_report.get("drop_rate", 0.0))
+    if best_auc and best_top_decile:
+        ranking_winner_text = (
+            f"{_label(best_auc[0])} is the clearest ranking winner in this proxy run."
+            if best_auc[0] == best_top_decile[0]
+            else (
+                f"{_label(best_auc[0])} leads AUC, while {_label(best_top_decile[0])} "
+                "leads top-decile precision."
+            )
+        )
+    else:
+        ranking_winner_text = "Ranking comparison was unavailable."
+
+    if not cost.empty and {"cost_multiplier", "net_pnl_usd", "model_id"}.issubset(cost.columns):
+        cost_snapshot = cost.loc[
+            pd.to_numeric(cost["cost_multiplier"], errors="coerce").isin([0.0, 1.0, 3.0, 5.0])
+            & cost["model_id"]
+            .astype(str)
+            .isin(["lightgbm", "xgboost", "linear_elastic_net", "mamba_sequence_encoder"])
+        ].copy()
+        cost_snapshot = cost_snapshot[
+            ["model_id", "cost_multiplier", "n", "net_pnl_usd", "hit_rate", "max_drawdown_usd"]
+        ].round(4)
+    else:
+        cost_snapshot = pd.DataFrame()
+
+    diagnostics_model_id = diagnostics.get("model_id", pd.Series(dtype=str)).astype(str)
+    diagnostics_snapshot = diagnostics.loc[diagnostics_model_id.isin(selected_models)].copy()
+    if not diagnostics_snapshot.empty:
+        diagnostics_snapshot = diagnostics_snapshot[
+            [
+                column
+                for column in [
+                    "model_id",
+                    "status",
+                    "feature_count",
+                    "train_rows",
+                    "validation_rows",
+                    "test_rows",
+                    "epochs",
+                    "hidden_sizes",
+                    "loss",
+                    "mask_only",
+                ]
+                if column in diagnostics_snapshot.columns
+            ]
+        ]
+
     lines = [
         "# Earnings Event Variance Mispricing",
         "",
-        "## Proxy Research Report",
+        "## Intro",
         "",
         "**Scope.** This report is a proxy-stage study using the currently available sample "
         "from 2022 onward. It uses SEC filings for earnings-event identification and "
@@ -1862,7 +1990,7 @@ def write_proxy_research_report(
         "proxy-Mamba uses 20-day close-trade-implied option-surface summaries from day "
         "aggregates. It is not trained on NBBO-mid IV surfaces.",
         "",
-        "## Research Question",
+        "### Research Question",
         "",
         "The question is whether models improve trading decisions around option-implied "
         "earnings event variance mispricing. The forecast target is realized event variance "
@@ -1870,7 +1998,7 @@ def write_proxy_research_report(
         "mispricing is `RVAR_event - IVAR_event`. Trading decisions are evaluated in "
         "premium space through proxy PnL and cost-aware edge, not by forecast error alone.",
         "",
-        "## Data and Construction",
+        "## Materials: Data",
         "",
         (
             "- Earnings events: SEC EDGAR 8-K Item 2.02 discovery with "
@@ -1886,96 +2014,321 @@ def write_proxy_research_report(
             f"eligible events out of {sequence_report.get('total_events', 'NA')}; "
             f"drop rate {float(sequence_report.get('drop_rate', 0.0)):.1%}."
         ),
+        "- Data coverage and selection-risk diagnostics are summarized in Appendix A.",
         "- Cost model: `cost_model=proxy_haircut`, "
         f"`haircut_bps={DEFAULT_HAIRCUT_BPS}`, `bid_ask_costs_unavailable=true`. "
         "Multiplier 0 is a sensitivity anchor, not a realistic execution-cost assumption.",
         "",
-        "## Main Findings",
+        "## Methods: Models and Configuration",
         "",
-        "1. The strongest proxy evidence is cross-sectional ranking, not raw variance forecasting. "
-        "LightGBM and XGBoost dominate the market IVAR baseline in top-decile precision, AUC, "
-        "and proxy net PnL.",
-        "2. The market IVAR baseline remains a useful level forecast. It does not generate trades "
-        "under the premium-edge rule because its forecast edge is zero by construction.",
-        "3. The Goyal-Saretto-style spread is unstable in QLIKE because several forecasts "
-        "are clipped "
-        "near zero while realized event variance is positive. It should be treated as a diagnostic "
-        "baseline, not a headline result.",
-        "4. proxy-Mamba now trains with an unconstrained log-target head. It improves over the "
-        "mask-only ablation in variance-level diagnostics, but it does not yet produce useful "
-        "trading ranks. It is not a headline model in this proxy run.",
+        (
+            "- Split: chronological event-level `70/15/15`; all rows for the same "
+            "`event_id` remain in one split."
+        ),
+        (
+            "- Baselines: market-implied IVAR, last-four RVAR, last-four IVAR, and "
+            "Goyal-Saretto-style RV-IV spread."
+        ),
+        (
+            "- Tabular models: Elastic Net, LightGBM, XGBoost, and FT-Transformer use "
+            "event-level features; GBDT models also receive sequence aggregates."
+        ),
+        (
+            "- Sequence model: proxy-Mamba uses a 20 x 15 tensor with time and feature "
+            "masks; mask-only Mamba is the missingness ablation."
+        ),
+        (
+            "- proxy-Mamba loss: q=0.5 quantile loss on "
+            "`log(RVAR_event + forecast_floor)` with `forecast_floor=1e-6`."
+        ),
+        "- Full fit status and hyperparameter diagnostics are in Appendix B.",
         "",
-        "## Summary Metrics",
+        "## Results Snapshot",
+        "",
+        "### Main Results",
+        "",
+        "#### Main Result Table",
         "",
         _markdown_table(summary, "_No summary metrics written._"),
         "",
-        "## QLIKE Sanity Check",
-        "",
-        "QLIKE is reported, but it is not used as a headline metric in this proxy run. The measure "
-        "is highly sensitive to near-zero forecasts. This is visible in the Goyal-Saretto-style "
-        "spread baseline, where raw QLIKE is dominated by zero-clipped forecasts.",
-        "",
-        _markdown_table(qlike.round(4), "_No QLIKE diagnostics written._"),
-        "",
-        "## proxy-Mamba Diagnostic",
-        "",
-        mamba_note,
-        "",
-        (
-            "The Mamba loss is q=0.5 quantile loss on log-transformed `RVAR_event`. "
-            "This optimizes median behavior; RMSE and QLIKE are comparison metrics, not "
-            "training objectives."
-        ),
-        "",
-        "## Model Diagnostics",
-        "",
-        _markdown_table(diagnostics, "_No diagnostics written._"),
-        "",
-        "## Interpretation",
-        "",
-        "The current proxy evidence supports a simple interpretation: tabular nonlinear models "
-        "are useful for sorting earnings events by realized mispricing and proxy economic edge. "
-        "The result is economically meaningful in this proxy setting because the strongest models "
-        "also improve the cost-aware strategy layer. The sequence model is not yet competitive; "
-        "its current value is diagnostic, showing that the available close-trade-implied surface "
-        "path is not sufficient, by itself, to beat the tabular GBDT models.",
-        "",
-        "## Limits",
-        "",
-        (
-            "- The sample starts in 2022 because older options day-aggregate coverage is "
-            "not available under the current data entitlement."
-        ),
-        "- There are no quote or NBBO data. The results are not execution-grade.",
-        (
-            "- The sequence sample has selection risk because 16.3% of events fail the "
-            "V1 Mamba coverage rule."
-        ),
-        "- VIX regime features are unavailable in the current run.",
-        "- The report is suitable for internal research discussion, not final paper claims.",
-        "",
-        "## Next Steps",
-        "",
-        "1. Keep LightGBM and XGBoost as the main proxy-stage models.",
-        (
-            "2. Treat Mamba as a diagnostic experiment until sequence coverage and "
-            "surface quality improve."
-        ),
-        "3. Run a robustness pass focused on liquidity, DTE, BMO/AMC, and ticker concentration.",
-        (
-            "4. If paper-grade execution evidence is required, add licensed quote/NBBO "
-            "data rather than extending claims from this proxy route."
-        ),
-        "",
-        "## Figures",
-        "",
     ]
-    for name, title in figure_order:
-        path = figure_paths.get(name)
-        if path is None:
-            continue
-        rel = Path(path).resolve()
-        lines.extend([f"### {title}", "", f"![{name}]({rel})", ""])
+    _append_bullets(
+        lines,
+        [
+            (
+                f"{_label(best_oos[0])} has the best OOS R2 versus IVAR "
+                f"({_fmt(best_oos[1])}), while {_label(best_mae[0])} has the lowest MAE "
+                f"({_fmt(best_mae[1])})."
+                if best_oos and best_mae
+                else "Forecast metrics were not available for model comparison."
+            ),
+            (
+                f"{_label(best_auc[0])} leads ranking quality with AUC {_fmt(best_auc[1])}; "
+                f"{_label(best_top_decile[0])} has top-decile precision "
+                f"{_fmt(best_top_decile[1], pct=True)}."
+                if best_auc and best_top_decile
+                else "Ranking metrics were not available for model comparison."
+            ),
+            (
+                f"{_label(best_net[0])} has the strongest proxy net PnL "
+                f"({_fmt(best_net[1], money=True)}), and {_label(best_return[0])} has the best "
+                f"return on premium ({_fmt(best_return[1], pct=True)})."
+                if best_net and best_return
+                else "Strategy metrics were not available for model comparison."
+            ),
+            (
+                "The market IVAR baseline remains the level benchmark, but it does not create "
+                "trades under the zero-edge premium rule."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="forecast_performance",
+        title="Forecast Performance",
+        bullets=[
+            (
+                f"Best variance-level forecast improvement is {_label(best_oos[0])} "
+                f"with OOS R2 {_fmt(best_oos[1])} versus IVAR."
+                if best_oos
+                else "Forecast comparison was unavailable."
+            ),
+            (
+                f"Best absolute-error model is {_label(best_mae[0])} with MAE "
+                f"{_fmt(best_mae[1])}; this is separate from ranking quality."
+                if best_mae
+                else "MAE comparison was unavailable."
+            ),
+            (
+                "QLIKE is not used as the headline forecast metric because near-zero forecasts "
+                "dominate some raw values; see Appendix C."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="auc_top_decile_precision",
+        title="Ranking and Top-Decile Precision",
+        bullets=[
+            ranking_winner_text,
+            (
+                "This is the main sellable result: the task is not only level forecasting, "
+                "but sorting event-variance mispricing into tradable opportunities."
+            ),
+            (
+                "The deterministic IVAR baseline is intentionally neutral in ranking because "
+                "its forecast edge is zero by construction."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="edge_decile_realized_mispricing",
+        title="Edge-Decile Realized Mispricing",
+        bullets=[
+            (
+                f"{_label(best_edge_monotone[0])} has the strongest edge-decile monotonicity "
+                f"(Spearman {_fmt(best_edge_monotone[1])})."
+                if best_edge_monotone
+                else "Edge-decile monotonicity was unavailable."
+            ),
+            (
+                "A useful model should concentrate positive realized mispricing in high "
+                "predicted-edge deciles."
+            ),
+            "This figure is closer to the paper's economic question than MAE alone.",
+        ],
+    )
+    _figure_block(
+        lines,
+        name="strategy_pnl_by_edge_decile",
+        title="Strategy PnL by Edge Decile",
+        bullets=[
+            (
+                f"{_label(best_net[0])} produces the best net proxy PnL in the current "
+                f"test sample ({_fmt(best_net[1], money=True)})."
+                if best_net
+                else "Strategy PnL comparison was unavailable."
+            ),
+            (
+                "The strategy layer evaluates premium-space outcomes and proxy costs, which "
+                "is the intended target for selling the project."
+            ),
+            "These are still no-NBBO proxy economics, not paper-grade execution evidence.",
+        ],
+    )
+    lines.extend(["### Other Results and Diagnostics", ""])
+    _figure_block(
+        lines,
+        name="calibration_plot",
+        title="Calibration",
+        bullets=[
+            (
+                "Calibration checks whether forecasted event variance is on the same scale as "
+                "realized event variance, not just correctly ranked."
+            ),
+            (
+                "The current proxy evidence is stronger for ranking than for perfectly "
+                "calibrated variance levels."
+            ),
+            (
+                "This plot is a guardrail against over-selling high AUC models as fully "
+                "calibrated probability or variance forecasters."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="cost_sensitivity",
+        title="Cost Sensitivity",
+        bullets=[
+            (
+                "The default cost model is a proxy haircut: "
+                "`proxy_cost_usd = 0.005 * entry_premium_usd`."
+            ),
+            (
+                "Multiplier 0 is shown only as an anchor; multiplier 1 is the default proxy "
+                "cost assumption."
+            ),
+            (
+                "Persistence across higher multipliers is the relevant robustness check "
+                "because true bid/ask costs are unavailable."
+            ),
+        ],
+    )
+    lines.extend(
+        [
+            "##### Cost Sensitivity Snapshot",
+            "",
+            _markdown_table(cost_snapshot, "_No cost sensitivity table written._"),
+            "",
+        ]
+    )
+    _append_bullets(
+        lines,
+        [
+            (
+                "The snapshot keeps the main tabular contenders and proxy-Mamba at "
+                "multipliers 0, 1, 3, and 5."
+            ),
+            (
+                "Use this as a stress-test table rather than an execution-cost estimate; "
+                "bid/ask costs are unavailable in the current route."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="qlike_contribution_diagnostic",
+        title="QLIKE Contribution Diagnostic",
+        bullets=[
+            (
+                f"Raw QLIKE is most distorted for {_label(qlike_worst[0])}; the worst top-1% "
+                f"contribution share is {_fmt(qlike_share_worst[1], pct=True)} for "
+                f"{_label(qlike_share_worst[0])}."
+                if qlike_worst and qlike_share_worst
+                else "QLIKE diagnostics were unavailable."
+            ),
+            (
+                "Raw QLIKE is a diagnostic, not the headline result, when forecasts are "
+                "clipped near zero."
+            ),
+            "The full raw/floored/winsorized table is in Appendix C.",
+        ],
+    )
+    lines.extend(["### proxy-Mamba Result", "", mamba_note, ""])
+    _append_bullets(
+        lines,
+        [
+            (
+                f"proxy-Mamba AUC is {_fmt(mamba_auc)} versus mask-only AUC {_fmt(mask_auc)}; "
+                f"net PnL is {_fmt(mamba_net, money=True)} versus "
+                f"{_fmt(mask_net, money=True)}."
+            ),
+            "proxy-Mamba trains successfully, but it is not the headline model in this proxy run.",
+            (
+                "The sequence result should be read as diagnostic because the sequence coverage "
+                "drop rate is above 10%."
+            ),
+        ],
+    )
+    lines.extend(
+        [
+            "## Interpretation",
+            "",
+            (
+                "The current proxy evidence supports a simple interpretation: tabular nonlinear "
+                "models are useful for sorting earnings events by realized mispricing and proxy "
+                "economic edge. The result is economically meaningful in this proxy setting "
+                "because the strongest models also improve the cost-aware strategy layer. "
+                "The sequence model is not yet competitive; its current value is diagnostic, "
+                "showing that the available close-trade-implied surface path is not sufficient, "
+                "by itself, to beat the tabular GBDT models."
+            ),
+            "",
+            "## Appendix",
+            "",
+            "### Appendix A: Data Coverage and Selection Risk",
+            "",
+            (
+                f"- Sequence coverage: {sequence_report.get('eligible_events', 'NA')} eligible "
+                f"events out of {sequence_report.get('total_events', 'NA')} total events."
+            ),
+            f"- Default Mamba eligibility drop rate: {sequence_drop_rate:.1%}.",
+            f"- Threshold sensitivity: `{sequence_report.get('threshold_sensitivity', {})}`.",
+            (
+                "- `high_sequence_selection_risk="
+                f"{sequence_report.get('high_sequence_selection_risk', 'NA')}`."
+            ),
+            f"- `vix_regime_unavailable={sequence_report.get('vix_regime_unavailable', 'NA')}`.",
+            "",
+            "### Appendix B: Model Configuration and Fit Diagnostics",
+            "",
+            _markdown_table(diagnostics_snapshot, "_No diagnostics written._"),
+            "",
+            "### Appendix C: QLIKE Sanity Check",
+            "",
+            (
+                "QLIKE is reported, but it is not used as a headline metric in this proxy run. "
+                "The measure is highly sensitive to near-zero forecasts. This is visible in the "
+                "Goyal-Saretto-style spread baseline, where raw QLIKE is dominated by "
+                "zero-clipped forecasts."
+            ),
+            "",
+            _markdown_table(qlike.round(4), "_No QLIKE diagnostics written._"),
+            "",
+            "### Appendix D: Limits and Next Steps",
+            "",
+            (
+                "- The sample starts in 2022 because older options day-aggregate coverage is "
+                "not available under the current data entitlement."
+            ),
+            "- There are no quote or NBBO data. The results are not execution-grade.",
+            (
+                "- The sequence sample has selection risk because 16.3% of events fail the "
+                "V1 Mamba coverage rule."
+            ),
+            "- VIX regime features are unavailable in the current run.",
+            "- The report is suitable for internal research discussion, not final paper claims.",
+            "",
+            "Next steps:",
+            "",
+            "1. Keep LightGBM and XGBoost as the main proxy-stage models.",
+            (
+                "2. Treat Mamba as a diagnostic experiment until sequence coverage and "
+                "surface quality improve."
+            ),
+            (
+                "3. Run a robustness pass focused on liquidity, DTE, BMO/AMC, and "
+                "ticker concentration."
+            ),
+            (
+                "4. If paper-grade execution evidence is required, add licensed quote/NBBO "
+                "data rather than extending claims from this proxy route."
+            ),
+            "",
+        ]
+    )
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path
 

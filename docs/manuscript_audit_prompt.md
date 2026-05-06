@@ -1,78 +1,110 @@
 # Manuscript Audit Brief
 
-Audit any manuscript for consistency with the `earnings-event-vol` research
-contract.
+Audit any manuscript or slide narrative against the `earnings-event-vol`
+research contract.
 
-## Paper Claim
+## Valid Claim Shape
 
-The manuscript should claim:
+The manuscript may claim, if supported by the reported evidence:
 
-> We test whether machine learning improves the ranking of option-implied
-> earnings event variance mispricing in tradable, risk-defined option strategies.
+> We test whether models improve the ranking of option-implied earnings event
+> variance mispricing in risk-defined earnings option strategies.
 
-It should not claim:
+For the current local results, the claim must stay narrower:
+
+> In a no-NBBO proxy sample, model features show preliminary cross-sectional
+> ranking signal for earnings event-variance mispricing. Paper-grade tradability
+> requires bid/ask or NBBO execution data.
+
+It must not claim:
 
 - generic IV forecasting superiority;
+- paper-grade executable backtest results from second-aggregate trade bars;
 - that lower RMSE alone implies economic value;
-- that Mamba is the contribution independent of baselines and costs;
+- that Mamba is the contribution independent of baselines, ablations, and
+  costs;
 - that calendar spreads isolate pure event variance.
 
 ## Required Manuscript Elements
 
-Introduction:
+Research object:
 
 - Earnings announcements are scheduled jump-risk events.
 - Options embed an ex ante market-implied event variance.
-- The paper asks whether models improve the forecast and ranking of realized
-  event variance relative to that market-implied benchmark.
+- Models forecast `RVAR_event`.
+- Ex post mispricing is `RVAR_event - IVAR_event`.
+- Trading entry is evaluated in USD premium space, not raw variance space.
 
 Data:
 
-- Massive or another named options source is described clearly.
-- Earnings timestamp source and BMO/AMC rules are explicit.
-- DMH and unknown timing are excluded in v1.
-- Bid/ask, liquidity, DTE, and event-alignment filters are reported.
-- Any second-aggregate or trade-price proxy result is labeled as
+- The options source and entitlement window are stated explicitly.
+- Current local proxy results use Massive option second aggregates and option
+  day aggregates from the observed 2022-onward entitlement window.
+- The 2013-2025 sample is described as the target paper range unless historical
+  option data for that range has actually been acquired and processed.
+- Earnings events come from SEC EDGAR submissions plus SEC primary filing
+  document validation.
+- Massive 8-K text is auxiliary fallback only.
+- BMO/AMC rules are explicit; DMH and unknown events are excluded in v1.
+- Universe construction filters non-single-name symbols before selecting the
+  monthly top 50.
+- Any second-aggregate or trade-price proxy result is labeled
   `no_nbbo_trade_proxy` and separated from bid/ask executable backtests.
 
-Variable construction:
+Variables:
 
 - `RVAR_event = log(S_after / S_before)^2`.
 - `IVAR_event` is extracted from two-expiry total implied variance.
-- Entry thresholds are expressed in USD premium space, not variance space.
-- Negative event-variance extractions are flagged, excluded, and reported.
-- `iv_butterfly_25d` is defined from short-expiry IV curve shape.
+- IVAR extraction failures are reported by reason, including missing event-
+  covering expiries, nonmonotone total variance, and negative extracted IVAR.
+- Feature as-of timestamps are before or at event entry.
+- `iv_butterfly_25d` or proxy curve-shape measures are defined before use.
 
 Models:
 
-- Market-implied event variance is the primary baseline.
-- Historical earnings moves, linear or elastic-net, and LightGBM are included.
-- FT-Transformer and Mamba are positioned after strong baselines.
-- Quantile loss is justified by heavy-tailed earnings moves.
+- Market-implied IVAR is the primary benchmark.
+- Historical event baselines and Goyal-Saretto-style RV-IV spread are included.
+- Elastic Net and LightGBM/XGBoost are included before deep-model claims.
+- FT-Transformer and Mamba are positioned after strong tabular baselines.
+- Mamba results include sequence coverage, drop-rate diagnostics, and a
+  mask-only ablation.
+- If LightGBM/XGBoost beat Mamba, the conclusion is that tabular nonlinear
+  interactions currently dominate the proxy sequence route.
+
+Evaluation:
+
+- Forecast metrics include MAE, RMSE, QLIKE, and OOS R2 versus market-implied
+  IVAR.
+- Ranking metrics include AUC, Brier score, calibration, and top-decile
+  precision.
+- Strategy metrics include net proxy PnL, return on premium or capital, Sharpe,
+  Sortino, drawdown, hit rate, tail loss, turnover, and cost sensitivity.
+- Inference does not rely on naive t-stats only; event-date, ticker, two-way
+  clustering, block bootstrap, or model-comparison corrections are used when
+  the paper moves beyond proxy screening.
 
 Backtests:
 
 - Long ATM straddle tests predicted cheap event volatility.
 - Short iron fly tests predicted rich event volatility.
-- Full bid-ask crossing is the main cost assumption.
-- Mid and half-spread results are labeled as sensitivity cases.
-- Multi-leg fills assume simultaneous quoted bid/ask execution and disclose
-  legging risk as an unmodeled limitation.
-
-Inference:
-
-- Event-date and ticker clustering are reported.
-- Cross-sectional dependence is not evaluated with naive t-stats only.
-- Threshold/model multiple testing is handled if many variants are compared.
+- Current proxy PnL is explicitly non-NBBO and non-paper-grade.
+- Paper-grade execution claims require historical bid/ask or NBBO, realistic
+  spread crossing, and leg-level cost accounting.
+- Mid or haircut results are labeled as sensitivity or proxy cases, not the
+  main tradability evidence.
+- Multi-leg fills disclose simultaneous-fill assumptions and unmodeled legging
+  risk.
 
 ## Red Flags
 
-- "Mamba predicts IV better" as the headline contribution.
+- "Mamba predicts IV better" as the headline.
 - Random train/test split.
 - Missing BMO/AMC alignment.
-- Trades entered after the earnings announcement quote date.
-- Full-spread results omitted.
-- Second-aggregate trade bars presented as if they were NBBO quotes.
-- Deep models compared only against LSTM or MLP and not LightGBM.
+- Trades entered after the event cutoff.
+- Second-aggregate trade bars described as quotes, mid, bid/ask, or NBBO.
+- Full-spread results omitted while making executable strategy claims.
+- Deep models compared only against weak neural baselines and not LightGBM or
+  XGBoost.
 - Calendar returns interpreted as pure event-variance returns.
 - Variance-space edge compared directly to dollar transaction costs.
+- Proxy results from 2022-2025 presented as full 2013-2025 paper evidence.
