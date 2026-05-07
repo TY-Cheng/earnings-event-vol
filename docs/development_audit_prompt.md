@@ -45,13 +45,21 @@ Data route and labeling:
   NBBO quotes.
 - Market-data inputs are separated correctly: options day aggregates for
   universe/contract/IV proxy/exit/sequence construction, underlying day
-  aggregates for closes and `RVAR_event`, and targeted option one-second
-  aggregates for entry proxy pricing.
+  aggregates for vendor OHLC opens, C2O/C2C/O2C targets, and exit spot, and
+  targeted option one-second aggregates for entry proxy pricing.
 - Second-aggregate entry cache keeps only the pre-cutoff buffer, default 60
-  minutes before event cutoff; entry price selection then uses the latest
-  positive VWAP or close in the final 900 seconds before cutoff.
-- Exit diagnostics use same-contract option day-aggregate closes when available
-  and flag intrinsic fallback use.
+  minutes before event cutoff; entry price selection uses the true per-leg
+  volume-weighted option VWAP over the final 900 seconds before cutoff.
+- The option open anchor is unified as trade-aggregate 5-15 minute post-open
+  VWAP. It is the primary C2O exit proxy and the O2C diagnostic entry proxy;
+  0-5 minute VWAP remains only an opening microstructure stress test.
+- O2C proxy PnL is diagnostic only unless a post-open residual-IV baseline is
+  added.
+- C2C exit diagnostics use same-contract option VWAP over the final 15 minutes
+  before the exit-date close as the primary mark. Same-contract option
+  day-aggregate close is not a strategy-exit fallback. Intrinsic fallback is
+  flagged when the exit-preclose trade-aggregate mark is missing/unusable or
+  when the option expires on the exit date.
 - The current default proxy range is the observed entitlement range
   `2022-12-01` to `2025-12-31`; 2013-2025 remains the target paper range, not
   the current completed result.

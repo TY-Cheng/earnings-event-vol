@@ -81,12 +81,14 @@ variance edge.
     calendar.
   - Require paired call/put proxy prices before constructing an expiry-level ATM
     IV input.
-  - Exit diagnostics use `underlying_exit_price_source = day_aggs_close`,
-    `option_exit_price_source = options_day_aggs_close`, and
-    `option_exit_payoff_fallback = intrinsic_value_at_underlying_exit`.
-    Same-contract option day-aggregate close is the default exit mark; intrinsic
-    payoff is used only when the exit option close is missing/unusable or when
-    the option expires on the exit date.
+  - C2C exit diagnostics use same-contract option second aggregates over the
+    final 15 minutes before the exit-date close as the primary trade-aggregate
+    exit mark: `option_exit_price_source =
+    exit_preclose_15m_option_second_agg_vwap`.
+    Same-contract option day-aggregate close is not used for strategy exits.
+    Intrinsic payoff is a flagged fallback only when the exit-preclose
+    trade-aggregate mark is missing/unusable or when the option expires on the
+    exit date.
   - Proxy PnL outputs must record `option_exit_price_source`,
     `option_exit_price_status`, and `used_intrinsic_fallback`.
   - Mark all outputs `no_nbbo_trade_proxy`.
@@ -130,12 +132,20 @@ variance edge.
   `edge_var_day_c2c = forecast_RVAR_event_day_c2c - IVAR_event`. C2O is
   reported as forecast/ranking of realized jump variance, not as a V1 tradable
   mispricing or option-PnL headline.
+- The option-proxy open anchor is unified for C2O and O2C diagnostics:
+  same-contract option VWAP from 5-15 minutes after the regular-session open.
+  Thus C2O uses pre-close 15-minute entry to post-open 5-15 minute VWAP, and
+  O2C uses that same post-open 5-15 minute VWAP to the primary C2C exit mark.
+  O2C option PnL is a realized decomposition diagnostic only; a model-driven
+  O2C strategy requires a post-open residual-IV baseline and is not a V1
+  headline.
 - Trading threshold is premium-space:
   - Convert forecast variance into expected strategy value using deterministic
     quadrature under a zero-mean Gaussian event-return distribution.
   - The deterministic v1 backtest smoke remains a simplified payoff model. The
-    V1.5 trade-proxy diagnostics preserve residual option extrinsic value when
-    exit-date option day-aggregate closes are available.
+    V1.5 trade-proxy diagnostics preserve residual option extrinsic value using
+    exit-date preclose trade-aggregate VWAP when available, with day-aggregate
+    close retained as fallback/diagnostic.
   - `expected_strategy_edge_usd = expected_strategy_value_usd - market_entry_cost_usd`.
   - Primary rule: `expected_strategy_edge_usd > 1.5 * estimated_transaction_cost_usd`.
 - Every feature row must satisfy `feature_asof_timestamp <= event_entry_timestamp`.

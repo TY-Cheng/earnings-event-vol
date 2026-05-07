@@ -6,6 +6,7 @@ import sys
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -13,16 +14,13 @@ import pandas as pd
 import polars as pl
 
 from earnings_event_vol.config import ProjectConfig, load_project_config
-from earnings_event_vol.massive import (
-    _run_head_object_command,
-    build_download_file_command,
-    massive_flat_file_aws_env,
-    option_flat_file_key,
-)
 from earnings_event_vol.trade_proxy import (
+    POST_OPEN_OPTION_VWAP_WINDOWS,
     TRADE_PROXY_PANEL_GRADE,
     TRADE_PROXY_STATUS_FETCH_FAILED,
     attach_trade_proxy_local_iv,
+    build_exit_preclose_option_vwap_frame,
+    build_post_open_option_vwap_frame,
     build_proxy_straddle_diagnostics,
     build_trade_proxy_ivar_inputs,
     build_trade_proxy_price_frame,
@@ -44,7 +42,6 @@ SECOND_AGG_REQUIRED_COLUMNS = {
     "volume",
     "transactions",
 }
-OPTIONS_DAY_AGG_REQUIRED_COLUMNS = {"ticker", "close"}
 
 
 def _progress(message: str) -> None:
@@ -113,59 +110,44 @@ def _second_agg_bronze_path(
     )
 
 
-def _tmp_flat_file_path(config: ProjectConfig, *, dataset: str, day: pd.Timestamp) -> Path:
-    return (
-        config.bronze_data_dir / "_tmp" / "massive" / dataset / f"{day.date().isoformat()}.csv.gz"
-    )
-
-
-def _options_day_agg_path(config: ProjectConfig, day: pd.Timestamp) -> Path:
+def _post_open_second_agg_bronze_path(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    exit_date: pd.Timestamp,
+    window_minutes: int,
+) -> Path:
+    day = exit_date.date().isoformat()
+    safe_ticker = _safe_partition_value(option_ticker)
     return (
         config.bronze_data_dir
         / "massive"
-        / "options_day_aggs"
-        / f"date={day.date().isoformat()}"
+        / "options_second_aggs_post_open"
+        / f"date={day}"
+        / f"window_minutes={window_minutes}"
+        / f"options_ticker={safe_ticker}"
         / "part.parquet"
     )
 
 
-def _ensure_options_day_agg_file(config: ProjectConfig, day: pd.Timestamp) -> str | None:
-    destination = _options_day_agg_path(config, day)
-    repaired = False
-    if _parquet_is_usable(destination, required_columns=OPTIONS_DAY_AGG_REQUIRED_COLUMNS):
-        return "hit"
-    if destination.exists():
-        repaired = True
-        destination.unlink(missing_ok=True)
-    key = option_flat_file_key(
-        config,
-        year=day.year,
-        month=day.month,
-        date=day.date().isoformat(),
+def _exit_preclose_second_agg_bronze_path(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    exit_date: pd.Timestamp,
+    lookback_seconds: int,
+) -> Path:
+    day = exit_date.date().isoformat()
+    safe_ticker = _safe_partition_value(option_ticker)
+    return (
+        config.bronze_data_dir
+        / "massive"
+        / "options_second_aggs_exit_preclose"
+        / f"date={day}"
+        / f"lookback_seconds={lookback_seconds}"
+        / f"options_ticker={safe_ticker}"
+        / "part.parquet"
     )
-    tmp_path = _tmp_flat_file_path(config, dataset="options_day_aggs", day=day)
-    tmp_path.parent.mkdir(parents=True, exist_ok=True)
-    result = _run_head_object_command(
-        build_download_file_command(config, key=key, destination=tmp_path),
-        massive_flat_file_aws_env(config),
-        config.massive_request_timeout_seconds * 8,
-    )
-    if result.returncode != 0:
-        tmp_path.unlink(missing_ok=True)
-        return None
-    frame = pl.read_csv(tmp_path).with_columns(
-        [
-            pl.lit(day.date().isoformat()).alias("source_date"),
-            pl.lit("options_day_aggs").alias("source_dataset"),
-            pl.lit(key).alias("source_key"),
-        ]
-    )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp_parquet = destination.with_name(f".{destination.stem}.tmp.parquet")
-    frame.write_parquet(tmp_parquet, compression=PARQUET_COMPRESSION)
-    tmp_parquet.replace(destination)
-    tmp_path.unlink(missing_ok=True)
-    return "repaired" if repaired else "downloaded"
 
 
 def _fetch_one_contract(
@@ -273,6 +255,168 @@ def _fetch_or_load_one_contract(
     return option_ticker, buffered, report
 
 
+def _filter_post_open_window(
+    bars: pd.DataFrame,
+    *,
+    exit_date: pd.Timestamp,
+    window_minutes: int,
+) -> pd.DataFrame:
+    if bars.empty:
+        return bars.copy()
+    frame = bars.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
+    if frame["timestamp_et"].dt.tz is None:
+        raise ValueError("timestamp_et must be timezone-aware")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
+    open_ts = pd.Timestamp(f"{exit_date.date().isoformat()} 09:30:00", tz="America/New_York")
+    end = open_ts + pd.Timedelta(minutes=window_minutes)
+    return frame.loc[frame["timestamp_et"].between(open_ts, end, inclusive="both")].copy()
+
+
+def _filter_exit_preclose_window(
+    bars: pd.DataFrame,
+    *,
+    exit_date: pd.Timestamp,
+    lookback_seconds: int,
+) -> pd.DataFrame:
+    if bars.empty:
+        return bars.copy()
+    frame = bars.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
+    if frame["timestamp_et"].dt.tz is None:
+        raise ValueError("timestamp_et must be timezone-aware")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
+    close_ts = pd.Timestamp(f"{exit_date.date().isoformat()} 16:00:00", tz="America/New_York")
+    start = close_ts - pd.Timedelta(seconds=lookback_seconds)
+    return frame.loc[frame["timestamp_et"].between(start, close_ts, inclusive="both")].copy()
+
+
+def _fetch_or_load_one_post_open_contract(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    exit_date: pd.Timestamp,
+    limit: int,
+    window_minutes: int,
+    force: bool,
+) -> tuple[tuple[str, pd.Timestamp], pd.DataFrame, dict[str, object]]:
+    bronze_path = _post_open_second_agg_bronze_path(
+        config,
+        option_ticker=option_ticker,
+        exit_date=exit_date,
+        window_minutes=window_minutes,
+    )
+    repaired = False
+    if not force and _parquet_is_usable(
+        bronze_path,
+        required_columns=SECOND_AGG_REQUIRED_COLUMNS,
+    ):
+        cached = _read_parquet(bronze_path)
+        return (
+            (option_ticker, exit_date),
+            cached,
+            {
+                "options_ticker": option_ticker,
+                "status": "ok",
+                "rows": int(len(cached)),
+                "exit_date": exit_date.date(),
+                "bronze_path": str(bronze_path),
+                "window_minutes": window_minutes,
+                "raw_rows": None,
+                "cache_status": "hit",
+            },
+        )
+    if not force and bronze_path.exists():
+        repaired = True
+        bronze_path.unlink(missing_ok=True)
+
+    option_ticker, normalized, report = _fetch_one_contract(
+        config,
+        option_ticker=option_ticker,
+        entry_date=exit_date,
+        limit=limit,
+    )
+    buffered = _filter_post_open_window(
+        normalized,
+        exit_date=exit_date,
+        window_minutes=window_minutes,
+    )
+    report["exit_date"] = exit_date.date()
+    report["bronze_path"] = str(bronze_path)
+    report["window_minutes"] = window_minutes
+    report["raw_rows"] = int(len(normalized))
+    report["rows"] = int(len(buffered))
+    if report["status"] == "ok":
+        _write_parquet(bronze_path, buffered)
+        report["cache_status"] = "repaired" if repaired else "written"
+    else:
+        report["cache_status"] = "repair_failed" if repaired else "miss"
+    return (option_ticker, exit_date), buffered, report
+
+
+def _fetch_or_load_one_exit_preclose_contract(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    exit_date: pd.Timestamp,
+    limit: int,
+    lookback_seconds: int,
+    force: bool,
+) -> tuple[tuple[str, pd.Timestamp], pd.DataFrame, dict[str, object]]:
+    bronze_path = _exit_preclose_second_agg_bronze_path(
+        config,
+        option_ticker=option_ticker,
+        exit_date=exit_date,
+        lookback_seconds=lookback_seconds,
+    )
+    repaired = False
+    if not force and _parquet_is_usable(
+        bronze_path,
+        required_columns=SECOND_AGG_REQUIRED_COLUMNS,
+    ):
+        cached = _read_parquet(bronze_path)
+        return (
+            (option_ticker, exit_date),
+            cached,
+            {
+                "options_ticker": option_ticker,
+                "status": "ok",
+                "rows": int(len(cached)),
+                "exit_date": exit_date.date(),
+                "bronze_path": str(bronze_path),
+                "lookback_seconds": lookback_seconds,
+                "raw_rows": None,
+                "cache_status": "hit",
+            },
+        )
+    if not force and bronze_path.exists():
+        repaired = True
+        bronze_path.unlink(missing_ok=True)
+
+    option_ticker, normalized, report = _fetch_one_contract(
+        config,
+        option_ticker=option_ticker,
+        entry_date=exit_date,
+        limit=limit,
+    )
+    buffered = _filter_exit_preclose_window(
+        normalized,
+        exit_date=exit_date,
+        lookback_seconds=lookback_seconds,
+    )
+    report["exit_date"] = exit_date.date()
+    report["bronze_path"] = str(bronze_path)
+    report["lookback_seconds"] = lookback_seconds
+    report["raw_rows"] = int(len(normalized))
+    report["rows"] = int(len(buffered))
+    if report["status"] == "ok":
+        _write_parquet(bronze_path, buffered)
+        report["cache_status"] = "repaired" if repaired else "written"
+    else:
+        report["cache_status"] = "repair_failed" if repaired else "miss"
+    return (option_ticker, exit_date), buffered, report
+
+
 def _fetch_second_aggregate_bars(
     config: ProjectConfig,
     contracts: pd.DataFrame,
@@ -370,53 +514,198 @@ def _fetch_second_aggregate_bars(
     )
 
 
-def _load_option_exit_prices(config: ProjectConfig, contracts: pd.DataFrame) -> pd.DataFrame:
-    columns = ["options_ticker", "date", "option_close", "source_dataset"]
-    if contracts.empty:
-        _progress("exit day-agg prices: no contracts")
-        return pd.DataFrame(columns=columns)
-    rows: list[pd.DataFrame] = []
-    exit_groups = list(contracts.groupby("exit_date"))
-    _progress(
-        f"exit day-agg prices start: exit_dates={len(exit_groups)} contract_rows={len(contracts)}"
+def _fetch_post_open_second_aggregate_bars(
+    config: ProjectConfig,
+    selected_straddles: pd.DataFrame,
+    *,
+    jobs: int,
+    limit: int,
+    window_minutes: int,
+    force: bool,
+) -> tuple[dict[tuple[str, date], pd.DataFrame], pd.DataFrame]:
+    report_columns = [
+        "options_ticker",
+        "status",
+        "rows",
+        "exit_date",
+        "bronze_path",
+        "window_minutes",
+        "raw_rows",
+        "cache_status",
+        "failure_reason",
+    ]
+    if selected_straddles.empty:
+        _progress("post-open second-agg fetch: no selected straddles")
+        return {}, pd.DataFrame(columns=report_columns)
+    requests: list[dict[str, object]] = []
+    for row in selected_straddles.to_dict("records"):
+        exit_date = pd.Timestamp(row["exit_date"])
+        for column in ("call_options_ticker", "put_options_ticker"):
+            value = row.get(column)
+            if value is not None and not pd.isna(value):
+                requests.append({"options_ticker": str(value), "exit_date": exit_date})
+    request_frame = (
+        pd.DataFrame(requests).drop_duplicates().sort_values(["exit_date", "options_ticker"])
+        if requests
+        else pd.DataFrame(columns=["options_ticker", "exit_date"])
     )
-    for index, (exit_date, group) in enumerate(exit_groups, start=1):
-        day = pd.Timestamp(exit_date)
-        tickers = sorted(set(group["options_ticker"].astype(str)))
-        cache_status = _ensure_options_day_agg_file(config, day)
-        if cache_status is None:
+    total = int(len(request_frame))
+    if request_frame.empty:
+        _progress("post-open second-agg fetch: no option legs")
+        return {}, pd.DataFrame(columns=report_columns)
+    _progress(
+        f"post-open second-agg fetch start: contracts={total} jobs={jobs} "
+        f"window_minutes={window_minutes} force={force}"
+    )
+    bar_frames: dict[tuple[str, date], pd.DataFrame] = {}
+    reports: list[dict[str, object]] = []
+    counts: Counter[str] = Counter()
+    checkpoint = max(1, total // 10)
+
+    def note_progress(completed: int, option_ticker: str, report: dict[str, object]) -> None:
+        cache_status = str(report.get("cache_status") or "unknown")
+        status = str(report.get("status") or "unknown")
+        counts[f"{cache_status}:{status}"] += 1
+        if completed == total or completed % checkpoint == 0:
             _progress(
-                f"exit day-agg prices {index}/{len(exit_groups)}: "
-                f"date={day.date().isoformat()} status=missing contracts={len(tickers)}"
+                f"post-open second-agg fetch {completed}/{total}: latest={option_ticker} "
+                f"rows={report.get('rows')} raw_rows={report.get('raw_rows')} "
+                f"counts={dict(counts)}"
             )
-            continue
-        path = _options_day_agg_path(config, day)
-        frame = (
-            pl.scan_parquet(path)
-            .filter(pl.col("ticker").is_in(tickers))
-            .select(
-                [
-                    pl.col("ticker").alias("options_ticker"),
-                    pl.lit(day.date()).alias("date"),
-                    pl.col("close").cast(pl.Float64, strict=False).alias("option_close"),
-                    pl.lit("options_day_aggs").alias("source_dataset"),
-                ]
+
+    if jobs <= 1:
+        for completed, row in enumerate(request_frame.to_dict("records"), start=1):
+            (option_ticker, exit_date), frame, report = _fetch_or_load_one_post_open_contract(
+                config,
+                option_ticker=str(row["options_ticker"]),
+                exit_date=pd.Timestamp(row["exit_date"]),
+                limit=limit,
+                window_minutes=window_minutes,
+                force=force,
             )
-            .collect()
-        )
-        _progress(
-            f"exit day-agg prices {index}/{len(exit_groups)}: "
-            f"date={day.date().isoformat()} status={cache_status} "
-            f"contracts={len(tickers)} matched={frame.height}"
-        )
-        if frame.height:
-            rows.append(frame.to_pandas())
-    if not rows:
-        _progress("exit day-agg prices done: matched_rows=0")
-        return pd.DataFrame(columns=columns)
-    out = pd.concat(rows, ignore_index=True)[columns]
-    _progress(f"exit day-agg prices done: matched_rows={len(out)}")
-    return out
+            bar_frames[(option_ticker, exit_date.date())] = frame
+            reports.append(report)
+            note_progress(completed, option_ticker, report)
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_or_load_one_post_open_contract,
+                    config,
+                    option_ticker=str(row["options_ticker"]),
+                    exit_date=pd.Timestamp(row["exit_date"]),
+                    limit=limit,
+                    window_minutes=window_minutes,
+                    force=force,
+                )
+                for row in request_frame.to_dict("records")
+            ]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                (option_ticker, exit_date), frame, report = future.result()
+                bar_frames[(option_ticker, exit_date.date())] = frame
+                reports.append(report)
+                note_progress(completed, option_ticker, report)
+    return (
+        bar_frames,
+        pd.DataFrame(reports, columns=report_columns).sort_values(["exit_date", "options_ticker"]),
+    )
+
+
+def _fetch_exit_preclose_second_aggregate_bars(
+    config: ProjectConfig,
+    selected_straddles: pd.DataFrame,
+    *,
+    jobs: int,
+    limit: int,
+    lookback_seconds: int,
+    force: bool,
+) -> tuple[dict[tuple[str, date], pd.DataFrame], pd.DataFrame]:
+    report_columns = [
+        "options_ticker",
+        "status",
+        "rows",
+        "exit_date",
+        "bronze_path",
+        "lookback_seconds",
+        "raw_rows",
+        "cache_status",
+        "failure_reason",
+    ]
+    if selected_straddles.empty:
+        _progress("exit-preclose second-agg fetch: no selected straddles")
+        return {}, pd.DataFrame(columns=report_columns)
+    requests: list[dict[str, object]] = []
+    for row in selected_straddles.to_dict("records"):
+        exit_date = pd.Timestamp(row["exit_date"])
+        for column in ("call_options_ticker", "put_options_ticker"):
+            value = row.get(column)
+            if value is not None and not pd.isna(value):
+                requests.append({"options_ticker": str(value), "exit_date": exit_date})
+    request_frame = (
+        pd.DataFrame(requests).drop_duplicates().sort_values(["exit_date", "options_ticker"])
+        if requests
+        else pd.DataFrame(columns=["options_ticker", "exit_date"])
+    )
+    total = int(len(request_frame))
+    if request_frame.empty:
+        _progress("exit-preclose second-agg fetch: no option legs")
+        return {}, pd.DataFrame(columns=report_columns)
+    _progress(
+        f"exit-preclose second-agg fetch start: contracts={total} jobs={jobs} "
+        f"lookback_seconds={lookback_seconds} force={force}"
+    )
+    bar_frames: dict[tuple[str, date], pd.DataFrame] = {}
+    reports: list[dict[str, object]] = []
+    counts: Counter[str] = Counter()
+    checkpoint = max(1, total // 10)
+
+    def note_progress(completed: int, option_ticker: str, report: dict[str, object]) -> None:
+        cache_status = str(report.get("cache_status") or "unknown")
+        status = str(report.get("status") or "unknown")
+        counts[f"{cache_status}:{status}"] += 1
+        if completed == total or completed % checkpoint == 0:
+            _progress(
+                f"exit-preclose second-agg fetch {completed}/{total}: latest={option_ticker} "
+                f"rows={report.get('rows')} raw_rows={report.get('raw_rows')} "
+                f"counts={dict(counts)}"
+            )
+
+    if jobs <= 1:
+        for completed, row in enumerate(request_frame.to_dict("records"), start=1):
+            (option_ticker, exit_date), frame, report = _fetch_or_load_one_exit_preclose_contract(
+                config,
+                option_ticker=str(row["options_ticker"]),
+                exit_date=pd.Timestamp(row["exit_date"]),
+                limit=limit,
+                lookback_seconds=lookback_seconds,
+                force=force,
+            )
+            bar_frames[(option_ticker, exit_date.date())] = frame
+            reports.append(report)
+            note_progress(completed, option_ticker, report)
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_or_load_one_exit_preclose_contract,
+                    config,
+                    option_ticker=str(row["options_ticker"]),
+                    exit_date=pd.Timestamp(row["exit_date"]),
+                    limit=limit,
+                    lookback_seconds=lookback_seconds,
+                    force=force,
+                )
+                for row in request_frame.to_dict("records")
+            ]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                (option_ticker, exit_date), frame, report = future.result()
+                bar_frames[(option_ticker, exit_date.date())] = frame
+                reports.append(report)
+                note_progress(completed, option_ticker, report)
+    return (
+        bar_frames,
+        pd.DataFrame(reports, columns=report_columns).sort_values(["exit_date", "options_ticker"]),
+    )
 
 
 def build_trade_proxy_panel(
@@ -447,6 +736,8 @@ def build_trade_proxy_panel(
     proxy_prices_path = silver_proxy_dir / "trade_proxy_option_prices.parquet"
     iv_estimates_path = silver_proxy_dir / "trade_proxy_contract_iv_estimates.parquet"
     ivar_inputs_path = silver_proxy_dir / "trade_proxy_ivar_inputs.parquet"
+    exit_preclose_prices_path = silver_proxy_dir / "exit_preclose_option_vwap_prices.parquet"
+    post_open_exit_prices_path = silver_proxy_dir / "post_open_option_vwap_exit_prices.parquet"
     panel_path = gold_panel_dir / "trade_proxy_event_panel.parquet"
     diagnostics_path = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
     params = {
@@ -456,6 +747,9 @@ def build_trade_proxy_panel(
         "lookback_seconds": lookback_seconds,
         "second_agg_buffer_minutes": second_agg_buffer_minutes,
         "price_field": price_field,
+        "entry_price_method": "preclose_15m_option_second_agg_vwap",
+        "c2c_exit_price_method": "exit_preclose_15m_option_second_agg_vwap",
+        "post_open_option_vwap_windows": [window[0] for window in POST_OPEN_OPTION_VWAP_WINDOWS],
     }
     if not force and panel_path.exists() and _json_params_match(diagnostics_path, params):
         return {
@@ -500,11 +794,46 @@ def build_trade_proxy_panel(
     iv_estimates = attach_trade_proxy_local_iv(proxy_prices, windows)
     ivar_inputs = build_trade_proxy_ivar_inputs(iv_estimates, windows)
     panel = extract_trade_proxy_event_panel(ivar_inputs, windows)
-    option_exit_prices = _load_option_exit_prices(config, contracts)
+    selected_straddles = build_proxy_straddle_diagnostics(
+        iv_estimates,
+        windows,
+        haircut_fraction=haircut_fraction,
+    )
+    exit_preclose_bar_frames, exit_preclose_fetch_report = (
+        _fetch_exit_preclose_second_aggregate_bars(
+            config,
+            selected_straddles,
+            jobs=jobs,
+            limit=rest_limit,
+            lookback_seconds=lookback_seconds,
+            force=refresh_bronze,
+        )
+    )
+    exit_preclose_prices = build_exit_preclose_option_vwap_frame(
+        selected_straddles,
+        exit_preclose_bar_frames,
+        price_field=price_field,
+        lookback_seconds=lookback_seconds,
+    )
+    post_open_window_minutes = max(window[2] for window in POST_OPEN_OPTION_VWAP_WINDOWS)
+    post_open_bar_frames, post_open_fetch_report = _fetch_post_open_second_aggregate_bars(
+        config,
+        selected_straddles,
+        jobs=jobs,
+        limit=rest_limit,
+        window_minutes=post_open_window_minutes,
+        force=refresh_bronze,
+    )
+    post_open_exit_prices = build_post_open_option_vwap_frame(
+        selected_straddles,
+        post_open_bar_frames,
+        price_field=price_field,
+    )
     straddle_diagnostics = build_proxy_straddle_diagnostics(
         iv_estimates,
         windows,
-        option_exit_prices=option_exit_prices,
+        exit_preclose_option_prices=exit_preclose_prices,
+        post_open_option_prices=post_open_exit_prices,
         haircut_fraction=haircut_fraction,
     )
     edge_deciles = edge_decile_diagnostics(panel)
@@ -512,10 +841,18 @@ def build_trade_proxy_panel(
     _write_parquet(proxy_prices_path, proxy_prices)
     _write_parquet(iv_estimates_path, iv_estimates)
     _write_parquet(ivar_inputs_path, ivar_inputs)
+    _write_parquet(exit_preclose_prices_path, exit_preclose_prices)
+    _write_parquet(post_open_exit_prices_path, post_open_exit_prices)
     _write_parquet(panel_path, panel)
     report_dir = out_root / "trade_proxy_panel"
     report_dir.mkdir(parents=True, exist_ok=True)
     fetch_report.to_csv(report_dir / "second_aggregate_fetch_report.csv", index=False)
+    exit_preclose_fetch_report.to_csv(
+        report_dir / "exit_preclose_second_aggregate_fetch_report.csv", index=False
+    )
+    post_open_fetch_report.to_csv(
+        report_dir / "post_open_second_aggregate_fetch_report.csv", index=False
+    )
     straddle_diagnostics.to_csv(report_dir / "trade_proxy_straddle_diagnostics.csv", index=False)
     edge_deciles.to_csv(report_dir / "trade_proxy_edge_deciles.csv", index=False)
 
@@ -536,6 +873,26 @@ def build_trade_proxy_panel(
         if "cache_status" in fetch_report
         else {},
     }
+    report["bronze_post_open_second_aggregate_cache"] = {
+        "dataset": "options_second_aggs_post_open",
+        "root": str(config.bronze_data_dir / "massive" / "options_second_aggs_post_open"),
+        "files": int(post_open_fetch_report["bronze_path"].nunique())
+        if "bronze_path" in post_open_fetch_report
+        else 0,
+        "cache_status_counts": post_open_fetch_report["cache_status"].value_counts().to_dict()
+        if "cache_status" in post_open_fetch_report
+        else {},
+    }
+    report["bronze_exit_preclose_second_aggregate_cache"] = {
+        "dataset": "options_second_aggs_exit_preclose",
+        "root": str(config.bronze_data_dir / "massive" / "options_second_aggs_exit_preclose"),
+        "files": int(exit_preclose_fetch_report["bronze_path"].nunique())
+        if "bronze_path" in exit_preclose_fetch_report
+        else 0,
+        "cache_status_counts": exit_preclose_fetch_report["cache_status"].value_counts().to_dict()
+        if "cache_status" in exit_preclose_fetch_report
+        else {},
+    }
     report["outputs"] = {
         "trade_proxy_second_aggs_bronze_root": str(
             config.bronze_data_dir / "massive" / "options_second_aggs"
@@ -543,8 +900,16 @@ def build_trade_proxy_panel(
         "trade_proxy_option_prices": str(proxy_prices_path),
         "trade_proxy_contract_iv_estimates": str(iv_estimates_path),
         "trade_proxy_ivar_inputs": str(ivar_inputs_path),
+        "exit_preclose_option_vwap_prices": str(exit_preclose_prices_path),
+        "post_open_option_vwap_exit_prices": str(post_open_exit_prices_path),
         "trade_proxy_event_panel": str(panel_path),
         "second_aggregate_fetch_report": str(report_dir / "second_aggregate_fetch_report.csv"),
+        "exit_preclose_second_aggregate_fetch_report": str(
+            report_dir / "exit_preclose_second_aggregate_fetch_report.csv"
+        ),
+        "post_open_second_aggregate_fetch_report": str(
+            report_dir / "post_open_second_aggregate_fetch_report.csv"
+        ),
         "trade_proxy_straddle_diagnostics": str(
             report_dir / "trade_proxy_straddle_diagnostics.csv"
         ),

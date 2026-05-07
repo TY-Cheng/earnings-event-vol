@@ -42,12 +42,20 @@ Data:
 - Current local proxy results use Massive option second aggregates and option
   day aggregates from the observed 2022-onward entitlement window.
 - Market-data inputs are stated precisely: options day aggregates for universe,
-  contract, IV proxy, exit, and sequence construction; underlying day
-  aggregates for closes and `RVAR_event`; targeted option one-second trade
-  aggregates for entry proxy pricing.
+  contract, IV proxy, fallback exit diagnostics, and sequence construction;
+  underlying day aggregates for vendor OHLC opens, C2O/C2C/O2C targets, and
+  exit spot; targeted option one-second trade aggregates for entry pricing,
+  primary C2C exit pricing, and post-open C2O/O2C open-anchor pricing.
 - Entry second aggregates are restricted to the pre-cutoff buffer, default 60
-  minutes before event cutoff, and the selected entry price comes from the
-  latest positive VWAP or close in the final 900 seconds before cutoff.
+  minutes before event cutoff, and the selected entry price is the true per-leg
+  volume-weighted option VWAP over the final 900 seconds before cutoff.
+- The option open anchor is unified as a trade-aggregate 5-15 minute post-open
+  VWAP. It is the primary C2O comparison mark and the O2C diagnostic entry
+  mark; 0-5 minute VWAP is only an opening microstructure stress test.
+- C2C exits use exit-date preclose 15-minute option VWAP as the primary proxy;
+  option day-aggregate close is not used as a strategy-exit fallback.
+- O2C proxy PnL is a realized decomposition diagnostic, not a model-driven
+  strategy headline without a post-open residual-IV baseline.
 - The 2013-2025 sample is described as the target paper range unless historical
   option data for that range has actually been acquired and processed.
 - Earnings events come from SEC EDGAR submissions plus SEC primary filing

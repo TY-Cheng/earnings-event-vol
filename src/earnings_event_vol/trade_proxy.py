@@ -27,11 +27,26 @@ TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW = "no_trade_in_cutoff_window"
 TRADE_PROXY_STATUS_MISSING_CONTRACT = "missing_contract"
 TRADE_PROXY_STATUS_FETCH_FAILED = "fetch_failed"
 UNDERLYING_EXIT_PRICE_SOURCE = "day_aggs_close"
-OPTION_EXIT_PRICE_SOURCE_DAY_AGGS = "options_day_aggs_close"
 OPTION_EXIT_PAYOFF_FALLBACK_INTRINSIC = "intrinsic_value_at_underlying_exit"
-OPTION_EXIT_STATUS_OK = "ok"
-OPTION_EXIT_STATUS_MISSING_DAY_AGG = "missing_exit_option_close"
+OPTION_EXIT_STATUS_MISSING_PRECLOSE_VWAP = "missing_exit_preclose_vwap_intrinsic_fallback"
 OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT = "expiration_at_exit_intrinsic"
+EXIT_PRECLOSE_OPTION_VWAP_SOURCE = "exit_preclose_15m_option_second_agg_vwap"
+EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK = "ok"
+EXIT_PRECLOSE_OPTION_VWAP_STATUS_MISSING_LEG = "missing_leg_vwap"
+C2O_PROXY_PNL_SOURCE_INTRINSIC_OPEN = "underlying_open_intrinsic_only"
+C2O_PROXY_PNL_STATUS_OK = "vendor_open_intrinsic_proxy"
+C2O_PROXY_PNL_STATUS_MISSING_OPEN = "missing_open_after"
+ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP = "preclose_15m_option_second_agg_vwap"
+POST_OPEN_OPTION_VWAP_SOURCE = "post_open_option_second_agg_vwap"
+POST_OPEN_OPTION_VWAP_STATUS_OK = "ok"
+POST_OPEN_OPTION_VWAP_STATUS_MISSING_LEG = "missing_leg_vwap"
+REACTION_O2C_OPTION_VWAP_SOURCE = "post_open_option_vwap_to_c2c_exit_proxy"
+REACTION_O2C_OPTION_VWAP_STATUS_OK = "ok"
+REACTION_O2C_OPTION_VWAP_STATUS_MISSING_OPEN_ANCHOR = "missing_open_option_vwap"
+POST_OPEN_OPTION_VWAP_WINDOWS: tuple[tuple[str, int, int], ...] = (
+    ("0_5", 0, 5),
+    ("5_15", 5, 15),
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +59,9 @@ class ProxyPriceSelection:
     proxy_transactions: int = 0
     proxy_rows_in_window: int = 0
     price_field: str = "option_vwap"
+    price_method: str = "window_vwap"
+    window_start: datetime | None = None
+    window_end: datetime | None = None
 
 
 def _to_date(value: object) -> date:
@@ -63,6 +81,13 @@ def _as_float(value: object) -> float:
 
 def _as_int(value: object) -> int:
     return int(cast(Any, value))
+
+
+def _optional_positive_float(value: object) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    out = float(cast(Any, value))
+    return out if pd.notna(out) and out > 0 else None
 
 
 def _aware_et_timestamp(value: object, *, name: str) -> pd.Timestamp:
@@ -172,7 +197,87 @@ def normalize_second_aggregates(raw: pd.DataFrame, *, option_ticker: str) -> pd.
     return out[columns]
 
 
-def select_latest_proxy_price(
+def select_option_window_vwap(
+    bars: pd.DataFrame,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    price_field: str = "option_vwap",
+    include_end: bool = True,
+    price_method: str = "window_vwap",
+) -> ProxyPriceSelection:
+    if price_field not in {"option_vwap", "option_close"}:
+        raise ValueError("price_field must be option_vwap or option_close.")
+    start = _aware_et_timestamp(window_start, name="window_start")
+    end = _aware_et_timestamp(window_end, name="window_end")
+    if end <= start:
+        raise ValueError("window_end must be after window_start.")
+    if bars.empty:
+        return ProxyPriceSelection(
+            status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
+            price_field=price_field,
+            price_method=price_method,
+            window_start=start.to_pydatetime(),
+            window_end=end.to_pydatetime(),
+        )
+    if "timestamp_et" not in bars.columns:
+        raise ValueError("bar frame missing timestamp_et column.")
+    frame = bars.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
+    if frame["timestamp_et"].dt.tz is None:
+        raise ValueError("timestamp_et must be timezone-aware")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
+    frame[price_field] = pd.to_numeric(frame[price_field], errors="coerce")
+    if "volume" in frame.columns:
+        frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0)
+    else:
+        frame["volume"] = 0
+    if include_end:
+        in_window = frame["timestamp_et"].between(start, end, inclusive="both")
+    else:
+        in_window = frame["timestamp_et"].ge(start) & frame["timestamp_et"].lt(end)
+    eligible = frame.loc[in_window & frame[price_field].gt(0) & frame["volume"].gt(0)].copy()
+    if eligible.empty:
+        return ProxyPriceSelection(
+            status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
+            price_field=price_field,
+            price_method=price_method,
+            window_start=start.to_pydatetime(),
+            window_end=end.to_pydatetime(),
+        )
+    eligible = eligible.sort_values("timestamp_et")
+    volume = pd.to_numeric(eligible["volume"], errors="coerce").fillna(0.0)
+    total_volume = float(volume.sum())
+    if total_volume <= 0:
+        return ProxyPriceSelection(
+            status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
+            price_field=price_field,
+            price_method=price_method,
+            window_start=start.to_pydatetime(),
+            window_end=end.to_pydatetime(),
+        )
+    window_vwap = float((pd.to_numeric(eligible[price_field], errors="coerce") * volume).sum())
+    window_vwap /= total_volume
+    selected = eligible.iloc[-1]
+    timestamp = pd.Timestamp(selected["timestamp_et"]).to_pydatetime()
+    return ProxyPriceSelection(
+        status=TRADE_PROXY_STATUS_OK,
+        proxy_price=window_vwap,
+        proxy_timestamp=timestamp,
+        proxy_age_seconds=(end.to_pydatetime() - timestamp).total_seconds(),
+        proxy_volume=int(total_volume),
+        proxy_transactions=int(eligible["transactions"].sum())
+        if "transactions" in eligible.columns
+        else 0,
+        proxy_rows_in_window=int(len(eligible)),
+        price_field=price_field,
+        price_method=price_method,
+        window_start=start.to_pydatetime(),
+        window_end=end.to_pydatetime(),
+    )
+
+
+def select_preclose_entry_proxy_price(
     bars: pd.DataFrame,
     *,
     cutoff_timestamp: datetime,
@@ -184,35 +289,22 @@ def select_latest_proxy_price(
     if price_field not in {"option_vwap", "option_close"}:
         raise ValueError("price_field must be option_vwap or option_close.")
     if bars.empty:
-        return ProxyPriceSelection(status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW)
+        return ProxyPriceSelection(
+            status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
+            price_field=price_field,
+            price_method=ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP,
+        )
     if "timestamp_et" not in bars.columns:
         raise ValueError("bar frame missing timestamp_et column.")
     cutoff = _aware_et_timestamp(cutoff_timestamp, name="cutoff_timestamp")
     start = cutoff - pd.Timedelta(seconds=lookback_seconds)
-    frame = bars.copy()
-    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"])
-    if frame["timestamp_et"].dt.tz is None:
-        raise ValueError("timestamp_et must be timezone-aware")
-    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
-    frame[price_field] = pd.to_numeric(frame[price_field], errors="coerce")
-    eligible = frame.loc[
-        frame["timestamp_et"].between(start, cutoff, inclusive="both") & frame[price_field].gt(0)
-    ].copy()
-    if eligible.empty:
-        return ProxyPriceSelection(status=TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW)
-    selected = eligible.sort_values("timestamp_et").iloc[-1]
-    timestamp = pd.Timestamp(selected["timestamp_et"]).to_pydatetime()
-    return ProxyPriceSelection(
-        status=TRADE_PROXY_STATUS_OK,
-        proxy_price=float(selected[price_field]),
-        proxy_timestamp=timestamp,
-        proxy_age_seconds=(cutoff.to_pydatetime() - timestamp).total_seconds(),
-        proxy_volume=int(eligible["volume"].sum()) if "volume" in eligible.columns else 0,
-        proxy_transactions=int(eligible["transactions"].sum())
-        if "transactions" in eligible.columns
-        else 0,
-        proxy_rows_in_window=int(len(eligible)),
+    return select_option_window_vwap(
+        bars,
+        window_start=start.to_pydatetime(),
+        window_end=cutoff.to_pydatetime(),
         price_field=price_field,
+        include_end=True,
+        price_method=ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP,
     )
 
 
@@ -251,7 +343,7 @@ def build_trade_proxy_price_frame(
                 tz="America/New_York",
             ).to_pydatetime()
         )
-        selection = select_latest_proxy_price(
+        selection = select_preclose_entry_proxy_price(
             bar_frames.get(option_ticker, pd.DataFrame()),
             cutoff_timestamp=cutoff,
             lookback_seconds=lookback_seconds,
@@ -267,6 +359,9 @@ def build_trade_proxy_price_frame(
                 "proxy_transactions_window": selection.proxy_transactions,
                 "proxy_rows_in_window": selection.proxy_rows_in_window,
                 "proxy_price_field": selection.price_field,
+                "proxy_price_method": selection.price_method,
+                "proxy_window_start": selection.window_start,
+                "proxy_window_end": selection.window_end,
                 "proxy_status": selection.status,
                 "quote_route": TRADE_PROXY_ROUTE_SECOND_AGGS,
                 "quote_status": TRADE_PROXY_PANEL_GRADE,
@@ -479,37 +574,352 @@ def extract_trade_proxy_event_panel(
     return pd.DataFrame(rows)
 
 
-def _option_exit_close_lookup(
-    option_exit_prices: pd.DataFrame | None,
-) -> dict[tuple[str, date], float]:
-    if option_exit_prices is None or option_exit_prices.empty:
+def build_post_open_option_vwap_frame(
+    selected_straddles: pd.DataFrame,
+    bar_frames: dict[tuple[str, date], pd.DataFrame],
+    *,
+    price_field: str = "option_vwap",
+) -> pd.DataFrame:
+    """Compute post-open option VWAP windows for selected straddle legs.
+
+    These are trade-aggregate VWAP marks, not bid/ask or NBBO executable exits.
+    """
+    columns = [
+        "event_id",
+        "options_ticker",
+        "exit_date",
+        "window_label",
+        "window_start",
+        "window_end",
+        "option_exit_vwap",
+        "volume",
+        "transactions",
+        "rows_in_window",
+        "last_trade_timestamp",
+        "last_trade_age_seconds",
+        "status",
+        "source",
+    ]
+    if selected_straddles.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, object]] = []
+    for straddle in selected_straddles.to_dict("records"):
+        event_id = straddle["event_id"]
+        exit_date = _to_date(straddle["exit_date"])
+        open_ts = pd.Timestamp(
+            f"{exit_date.isoformat()} 09:30:00", tz="America/New_York"
+        ).to_pydatetime()
+        for option_column in ("call_options_ticker", "put_options_ticker"):
+            option_ticker_raw = straddle.get(option_column)
+            if option_ticker_raw is None or pd.isna(option_ticker_raw):
+                continue
+            option_ticker = str(option_ticker_raw)
+            bars = bar_frames.get((option_ticker, exit_date), pd.DataFrame())
+            for label, start_minute, end_minute in POST_OPEN_OPTION_VWAP_WINDOWS:
+                start = (pd.Timestamp(open_ts) + pd.Timedelta(minutes=start_minute)).to_pydatetime()
+                end = (pd.Timestamp(open_ts) + pd.Timedelta(minutes=end_minute)).to_pydatetime()
+                selection = select_option_window_vwap(
+                    bars,
+                    window_start=start,
+                    window_end=end,
+                    price_field=price_field,
+                    include_end=True,
+                    price_method=f"post_open_{label}_window_vwap",
+                )
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "options_ticker": option_ticker,
+                        "exit_date": exit_date,
+                        "window_label": label,
+                        "window_start": start,
+                        "window_end": end,
+                        "option_exit_vwap": selection.proxy_price,
+                        "volume": selection.proxy_volume,
+                        "transactions": selection.proxy_transactions,
+                        "rows_in_window": selection.proxy_rows_in_window,
+                        "last_trade_timestamp": selection.proxy_timestamp,
+                        "last_trade_age_seconds": selection.proxy_age_seconds,
+                        "status": selection.status,
+                        "source": POST_OPEN_OPTION_VWAP_SOURCE,
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_exit_preclose_option_vwap_frame(
+    selected_straddles: pd.DataFrame,
+    bar_frames: dict[tuple[str, date], pd.DataFrame],
+    *,
+    price_field: str = "option_vwap",
+    lookback_seconds: int = 900,
+) -> pd.DataFrame:
+    """Compute exit-day preclose option VWAP for selected straddle legs.
+
+    These are trade-aggregate VWAP marks, not bid/ask or NBBO executable exits.
+    """
+    columns = [
+        "event_id",
+        "options_ticker",
+        "exit_date",
+        "window_start",
+        "window_end",
+        "option_exit_vwap",
+        "volume",
+        "transactions",
+        "rows_in_window",
+        "last_trade_timestamp",
+        "last_trade_age_seconds",
+        "status",
+        "source",
+    ]
+    if selected_straddles.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, object]] = []
+    for straddle in selected_straddles.to_dict("records"):
+        event_id = straddle["event_id"]
+        exit_date = _to_date(straddle["exit_date"])
+        close_ts = pd.Timestamp(
+            f"{exit_date.isoformat()} 16:00:00", tz="America/New_York"
+        ).to_pydatetime()
+        start_ts = (pd.Timestamp(close_ts) - pd.Timedelta(seconds=lookback_seconds)).to_pydatetime()
+        for option_column in ("call_options_ticker", "put_options_ticker"):
+            option_ticker_raw = straddle.get(option_column)
+            if option_ticker_raw is None or pd.isna(option_ticker_raw):
+                continue
+            option_ticker = str(option_ticker_raw)
+            bars = bar_frames.get((option_ticker, exit_date), pd.DataFrame())
+            selection = select_option_window_vwap(
+                bars,
+                window_start=start_ts,
+                window_end=close_ts,
+                price_field=price_field,
+                include_end=True,
+                price_method=EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+            )
+            rows.append(
+                {
+                    "event_id": event_id,
+                    "options_ticker": option_ticker,
+                    "exit_date": exit_date,
+                    "window_start": start_ts,
+                    "window_end": close_ts,
+                    "option_exit_vwap": selection.proxy_price,
+                    "volume": selection.proxy_volume,
+                    "transactions": selection.proxy_transactions,
+                    "rows_in_window": selection.proxy_rows_in_window,
+                    "last_trade_timestamp": selection.proxy_timestamp,
+                    "last_trade_age_seconds": selection.proxy_age_seconds,
+                    "status": selection.status,
+                    "source": EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _post_open_option_vwap_lookup(
+    post_open_option_prices: pd.DataFrame | None,
+) -> dict[tuple[object, str, str], dict[str, object]]:
+    if post_open_option_prices is None or post_open_option_prices.empty:
         return {}
-    required = {"options_ticker", "date", "option_close"}
-    missing = sorted(required - set(option_exit_prices.columns))
+    required = {
+        "event_id",
+        "options_ticker",
+        "window_label",
+        "option_exit_vwap",
+        "volume",
+        "transactions",
+        "rows_in_window",
+        "status",
+    }
+    missing = sorted(required - set(post_open_option_prices.columns))
     if missing:
-        raise ValueError(f"option exit price frame missing required columns: {missing}")
-    lookup: dict[tuple[str, date], float] = {}
-    for row in option_exit_prices.to_dict("records"):
-        close = row.get("option_close")
-        if close is None or pd.isna(close) or float(close) <= 0:
-            continue
-        lookup[(str(row["options_ticker"]), _to_date(row["date"]))] = float(close)
+        raise ValueError(f"post-open option price frame missing required columns: {missing}")
+    lookup: dict[tuple[object, str, str], dict[str, object]] = {}
+    for row in post_open_option_prices.to_dict("records"):
+        key = (row["event_id"], str(row["options_ticker"]), str(row["window_label"]))
+        lookup[key] = row
     return lookup
+
+
+def _exit_preclose_option_vwap_lookup(
+    exit_preclose_option_prices: pd.DataFrame | None,
+) -> dict[tuple[object, str], dict[str, object]]:
+    if exit_preclose_option_prices is None or exit_preclose_option_prices.empty:
+        return {}
+    required = {
+        "event_id",
+        "options_ticker",
+        "option_exit_vwap",
+        "volume",
+        "transactions",
+        "rows_in_window",
+        "status",
+    }
+    missing = sorted(required - set(exit_preclose_option_prices.columns))
+    if missing:
+        raise ValueError(f"exit preclose option price frame missing required columns: {missing}")
+    lookup: dict[tuple[object, str], dict[str, object]] = {}
+    for row in exit_preclose_option_prices.to_dict("records"):
+        lookup[(row["event_id"], str(row["options_ticker"]))] = row
+    return lookup
+
+
+def _exit_preclose_window_metrics(
+    *,
+    lookup: dict[tuple[object, str], dict[str, object]],
+    event_id: object,
+    call_options_ticker: str,
+    put_options_ticker: str,
+    entry_premium_usd: float,
+    haircut_fraction: float,
+) -> dict[str, object]:
+    call = lookup.get((event_id, call_options_ticker))
+    put = lookup.get((event_id, put_options_ticker))
+    call_price_raw = None if call is None else call.get("option_exit_vwap")
+    put_price_raw = None if put is None else put.get("option_exit_vwap")
+    call_price = (
+        float(cast(Any, call_price_raw))
+        if call_price_raw is not None and pd.notna(call_price_raw)
+        else None
+    )
+    put_price = (
+        float(cast(Any, put_price_raw))
+        if put_price_raw is not None and pd.notna(put_price_raw)
+        else None
+    )
+    if call_price is not None and put_price is not None and call_price > 0 and put_price > 0:
+        exit_usd = (call_price + put_price) * 100.0
+        gross = exit_usd - entry_premium_usd
+        haircut = gross - haircut_fraction * entry_premium_usd
+        status = EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK
+    else:
+        exit_usd = None
+        gross = None
+        haircut = None
+        status = EXIT_PRECLOSE_OPTION_VWAP_STATUS_MISSING_LEG
+    call_volume = 0 if call is None else int(cast(Any, call.get("volume") or 0))
+    put_volume = 0 if put is None else int(cast(Any, put.get("volume") or 0))
+    call_transactions = 0 if call is None else int(cast(Any, call.get("transactions") or 0))
+    put_transactions = 0 if put is None else int(cast(Any, put.get("transactions") or 0))
+    call_rows = 0 if call is None else int(cast(Any, call.get("rows_in_window") or 0))
+    put_rows = 0 if put is None else int(cast(Any, put.get("rows_in_window") or 0))
+    return {
+        "exit_option_vwap_preclose_15m_value_usd": exit_usd,
+        "gross_exit_option_vwap_preclose_15m_proxy_pnl_usd": gross,
+        "exit_option_vwap_preclose_15m_haircut_pnl_usd": haircut,
+        "exit_option_vwap_preclose_15m_status": status,
+        "exit_option_vwap_preclose_15m_source": EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+        "exit_option_vwap_preclose_15m_volume": call_volume + put_volume,
+        "exit_option_vwap_preclose_15m_transactions": call_transactions + put_transactions,
+        "exit_option_vwap_preclose_15m_rows": call_rows + put_rows,
+    }
+
+
+def _post_open_window_metrics(
+    *,
+    lookup: dict[tuple[object, str, str], dict[str, object]],
+    event_id: object,
+    call_options_ticker: str,
+    put_options_ticker: str,
+    label: str,
+    entry_premium_usd: float,
+    haircut_fraction: float,
+) -> dict[str, object]:
+    prefix = f"post_open_option_vwap_{label}"
+    call = lookup.get((event_id, call_options_ticker, label))
+    put = lookup.get((event_id, put_options_ticker, label))
+    call_price_raw = None if call is None else call.get("option_exit_vwap")
+    put_price_raw = None if put is None else put.get("option_exit_vwap")
+    call_price = (
+        float(cast(Any, call_price_raw))
+        if call_price_raw is not None and pd.notna(call_price_raw)
+        else None
+    )
+    put_price = (
+        float(cast(Any, put_price_raw))
+        if put_price_raw is not None and pd.notna(put_price_raw)
+        else None
+    )
+    if call_price is not None and put_price is not None and call_price > 0 and put_price > 0:
+        exit_usd = (call_price + put_price) * 100.0
+        gross = exit_usd - entry_premium_usd
+        haircut = gross - haircut_fraction * entry_premium_usd
+        status = POST_OPEN_OPTION_VWAP_STATUS_OK
+    else:
+        exit_usd = None
+        gross = None
+        haircut = None
+        status = POST_OPEN_OPTION_VWAP_STATUS_MISSING_LEG
+    call_volume = 0 if call is None else int(cast(Any, call.get("volume") or 0))
+    put_volume = 0 if put is None else int(cast(Any, put.get("volume") or 0))
+    call_transactions = 0 if call is None else int(cast(Any, call.get("transactions") or 0))
+    put_transactions = 0 if put is None else int(cast(Any, put.get("transactions") or 0))
+    call_rows = 0 if call is None else int(cast(Any, call.get("rows_in_window") or 0))
+    put_rows = 0 if put is None else int(cast(Any, put.get("rows_in_window") or 0))
+    volume = call_volume + put_volume
+    transactions = call_transactions + put_transactions
+    rows = call_rows + put_rows
+    return {
+        f"{prefix}_exit_usd": exit_usd,
+        f"gross_{prefix}_proxy_pnl_usd": gross,
+        f"{prefix}_haircut_pnl_usd": haircut,
+        f"{prefix}_status": status,
+        f"{prefix}_source": POST_OPEN_OPTION_VWAP_SOURCE,
+        f"{prefix}_volume": volume,
+        f"{prefix}_transactions": transactions,
+        f"{prefix}_rows": rows,
+    }
+
+
+def _reaction_o2c_window_metrics(
+    *,
+    label: str,
+    post_open_metrics: dict[str, object],
+    exit_option_value_usd: float,
+    gross_c2c_pnl_usd: float,
+    haircut_fraction: float,
+) -> dict[str, object]:
+    """Compute O2C proxy PnL using the same option-VWAP anchor as C2O exit."""
+    prefix = f"reaction_o2c_option_vwap_{label}"
+    c2o_prefix = f"post_open_option_vwap_{label}"
+    open_anchor = _optional_positive_float(post_open_metrics.get(f"{c2o_prefix}_exit_usd"))
+    c2o_gross = post_open_metrics.get(f"gross_{c2o_prefix}_proxy_pnl_usd")
+    if open_anchor is None:
+        gross = None
+        haircut = None
+        residual = None
+        status = REACTION_O2C_OPTION_VWAP_STATUS_MISSING_OPEN_ANCHOR
+    else:
+        gross = exit_option_value_usd - open_anchor
+        haircut = gross - haircut_fraction * open_anchor
+        c2o_value = _as_float(c2o_gross) if c2o_gross is not None and pd.notna(c2o_gross) else None
+        residual = None if c2o_value is None else gross_c2c_pnl_usd - c2o_value - gross
+        status = REACTION_O2C_OPTION_VWAP_STATUS_OK
+    return {
+        f"open_option_vwap_{label}_anchor_usd": open_anchor,
+        f"gross_{prefix}_to_c2c_exit_proxy_pnl_usd": gross,
+        f"{prefix}_haircut_pnl_usd": haircut,
+        f"{prefix}_status": status,
+        f"{prefix}_source": REACTION_O2C_OPTION_VWAP_SOURCE,
+        f"option_proxy_decomposition_residual_{label}_usd": residual,
+    }
 
 
 def build_proxy_straddle_diagnostics(
     iv_contracts: pd.DataFrame,
     windows: pd.DataFrame,
     *,
-    option_exit_prices: pd.DataFrame | None = None,
+    exit_preclose_option_prices: pd.DataFrame | None = None,
+    post_open_option_prices: pd.DataFrame | None = None,
     haircut_fraction: float = 0.10,
 ) -> pd.DataFrame:
     """Compute one-contract long ATM straddle proxy PnL using entry proxy prices.
 
-    Exit value uses the same contracts' exit-date option day-aggregate close when available.
-    Intrinsic value is a fallback only when the exit option close is missing or the contract
-    expires on the exit date. This remains a gross screening diagnostic, not a quote-executable
-    strategy result.
+    Primary C2C exit value uses the same contracts' option VWAP over the final 15
+    minutes before the exit-date close. Intrinsic value is used only when this
+    mark is missing or the contract expires on the exit date. This remains a
+    gross screening diagnostic, not a quote-executable strategy result.
     """
     columns = [
         "event_id",
@@ -518,9 +928,54 @@ def build_proxy_straddle_diagnostics(
         "exit_date",
         "expiration",
         "strike",
+        "call_options_ticker",
+        "put_options_ticker",
         "entry_premium_usd",
+        "entry_price_method",
         "exit_option_value_usd",
+        "exit_option_vwap_preclose_15m_value_usd",
+        "gross_exit_option_vwap_preclose_15m_proxy_pnl_usd",
+        "exit_option_vwap_preclose_15m_haircut_pnl_usd",
+        "exit_option_vwap_preclose_15m_status",
+        "exit_option_vwap_preclose_15m_source",
+        "exit_option_vwap_preclose_15m_volume",
+        "exit_option_vwap_preclose_15m_transactions",
+        "exit_option_vwap_preclose_15m_rows",
         "exit_intrinsic_usd",
+        "open_after",
+        "c2o_exit_intrinsic_usd",
+        "gross_c2o_intrinsic_proxy_pnl_usd",
+        "c2o_haircut_pnl_usd",
+        "c2o_proxy_pnl_source",
+        "c2o_proxy_pnl_status",
+        "post_open_option_vwap_0_5_exit_usd",
+        "gross_post_open_option_vwap_0_5_proxy_pnl_usd",
+        "post_open_option_vwap_0_5_haircut_pnl_usd",
+        "post_open_option_vwap_0_5_status",
+        "post_open_option_vwap_0_5_source",
+        "post_open_option_vwap_0_5_volume",
+        "post_open_option_vwap_0_5_transactions",
+        "post_open_option_vwap_0_5_rows",
+        "open_option_vwap_0_5_anchor_usd",
+        "gross_reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy_pnl_usd",
+        "reaction_o2c_option_vwap_0_5_haircut_pnl_usd",
+        "reaction_o2c_option_vwap_0_5_status",
+        "reaction_o2c_option_vwap_0_5_source",
+        "option_proxy_decomposition_residual_0_5_usd",
+        "post_open_option_vwap_5_15_exit_usd",
+        "gross_post_open_option_vwap_5_15_proxy_pnl_usd",
+        "post_open_option_vwap_5_15_haircut_pnl_usd",
+        "post_open_option_vwap_5_15_status",
+        "post_open_option_vwap_5_15_source",
+        "post_open_option_vwap_5_15_volume",
+        "post_open_option_vwap_5_15_transactions",
+        "post_open_option_vwap_5_15_rows",
+        "open_option_vwap_5_15_anchor_usd",
+        "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd",
+        "reaction_o2c_option_vwap_5_15_haircut_pnl_usd",
+        "reaction_o2c_option_vwap_5_15_status",
+        "reaction_o2c_option_vwap_5_15_source",
+        "option_proxy_decomposition_residual_5_15_usd",
         "underlying_exit_price_source",
         "option_exit_price_source",
         "option_exit_price_status",
@@ -533,7 +988,8 @@ def build_proxy_straddle_diagnostics(
     ]
     if iv_contracts.empty:
         return pd.DataFrame(columns=columns)
-    exit_close_by_contract = _option_exit_close_lookup(option_exit_prices)
+    exit_preclose_lookup = _exit_preclose_option_vwap_lookup(exit_preclose_option_prices)
+    post_open_lookup = _post_open_option_vwap_lookup(post_open_option_prices)
     rows: list[dict[str, object]] = []
     seen_events: set[object] = set()
     grouped = iv_contracts.sort_values(["event_id", "expiration"]).groupby(
@@ -561,6 +1017,11 @@ def build_proxy_straddle_diagnostics(
                         "put_price": float(put["proxy_price"]),
                         "call_options_ticker": str(call["options_ticker"]),
                         "put_options_ticker": str(put["options_ticker"]),
+                        "entry_price_method": str(
+                            call.get("proxy_price_method")
+                            or put.get("proxy_price_method")
+                            or ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP
+                        ),
                         "moneyness_abs": abs(float(strike) / spot - 1.0),
                         "volume": int(strike_group["proxy_volume_window"].sum()),
                         "transactions": int(strike_group["proxy_transactions_window"].sum()),
@@ -576,30 +1037,73 @@ def build_proxy_straddle_diagnostics(
         entry_premium_usd = (
             _as_float(selected["call_price"]) + _as_float(selected["put_price"])
         ) * 100.0
+        call_options_ticker = str(selected["call_options_ticker"])
+        put_options_ticker = str(selected["put_options_ticker"])
+        post_open_metrics: dict[str, object] = {}
+        for label, _, _ in POST_OPEN_OPTION_VWAP_WINDOWS:
+            post_open_metrics.update(
+                _post_open_window_metrics(
+                    lookup=post_open_lookup,
+                    event_id=event_id,
+                    call_options_ticker=call_options_ticker,
+                    put_options_ticker=put_options_ticker,
+                    label=label,
+                    entry_premium_usd=entry_premium_usd,
+                    haircut_fraction=haircut_fraction,
+                )
+            )
+        exit_preclose_metrics = _exit_preclose_window_metrics(
+            lookup=exit_preclose_lookup,
+            event_id=event_id,
+            call_options_ticker=call_options_ticker,
+            put_options_ticker=put_options_ticker,
+            entry_premium_usd=entry_premium_usd,
+            haircut_fraction=haircut_fraction,
+        )
         exit_date = _to_date(event_row["exit_date"])
         expiry = _to_date(expiration)
         terminal_spot = float(event_row["s_after"])
         exit_intrinsic_usd = abs(terminal_spot - strike) * 100.0
-        call_exit_close = exit_close_by_contract.get(
-            (str(selected["call_options_ticker"]), exit_date)
-        )
-        put_exit_close = exit_close_by_contract.get(
-            (str(selected["put_options_ticker"]), exit_date)
-        )
-        use_intrinsic = expiry <= exit_date or call_exit_close is None or put_exit_close is None
-        if expiry <= exit_date:
-            exit_status = OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT
-        elif call_exit_close is None or put_exit_close is None:
-            exit_status = OPTION_EXIT_STATUS_MISSING_DAY_AGG
+        open_after = _optional_positive_float(event_row.get("open_after"))
+        if open_after is None:
+            c2o_exit_intrinsic_usd = None
+            gross_c2o_intrinsic_proxy_pnl = None
+            c2o_haircut_pnl = None
+            c2o_status = C2O_PROXY_PNL_STATUS_MISSING_OPEN
         else:
-            exit_status = OPTION_EXIT_STATUS_OK
-        if use_intrinsic:
+            c2o_exit_intrinsic_usd = abs(open_after - strike) * 100.0
+            gross_c2o_intrinsic_proxy_pnl = c2o_exit_intrinsic_usd - entry_premium_usd
+            c2o_haircut_pnl = gross_c2o_intrinsic_proxy_pnl - haircut_fraction * entry_premium_usd
+            c2o_status = C2O_PROXY_PNL_STATUS_OK
+        exit_preclose_value = _optional_positive_float(
+            exit_preclose_metrics.get("exit_option_vwap_preclose_15m_value_usd")
+        )
+        if exit_preclose_value is not None:
+            exit_option_value_usd = exit_preclose_value
+            primary_exit_status = EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK
+            primary_exit_source = EXIT_PRECLOSE_OPTION_VWAP_SOURCE
+            primary_used_intrinsic = False
+        else:
             exit_option_value_usd = exit_intrinsic_usd
-        else:
-            assert call_exit_close is not None
-            assert put_exit_close is not None
-            exit_option_value_usd = (float(call_exit_close) + float(put_exit_close)) * 100.0
+            primary_exit_status = (
+                OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT
+                if expiry <= exit_date
+                else OPTION_EXIT_STATUS_MISSING_PRECLOSE_VWAP
+            )
+            primary_exit_source = OPTION_EXIT_PAYOFF_FALLBACK_INTRINSIC
+            primary_used_intrinsic = True
         gross_pnl = exit_option_value_usd - entry_premium_usd
+        reaction_o2c_metrics: dict[str, object] = {}
+        for label, _, _ in POST_OPEN_OPTION_VWAP_WINDOWS:
+            reaction_o2c_metrics.update(
+                _reaction_o2c_window_metrics(
+                    label=label,
+                    post_open_metrics=post_open_metrics,
+                    exit_option_value_usd=exit_option_value_usd,
+                    gross_c2c_pnl_usd=gross_pnl,
+                    haircut_fraction=haircut_fraction,
+                )
+            )
         rows.append(
             {
                 "event_id": event_id,
@@ -608,13 +1112,25 @@ def build_proxy_straddle_diagnostics(
                 "exit_date": exit_date,
                 "expiration": expiry,
                 "strike": strike,
+                "call_options_ticker": call_options_ticker,
+                "put_options_ticker": put_options_ticker,
                 "entry_premium_usd": entry_premium_usd,
+                "entry_price_method": selected["entry_price_method"],
                 "exit_option_value_usd": exit_option_value_usd,
+                **exit_preclose_metrics,
                 "exit_intrinsic_usd": exit_intrinsic_usd,
+                "open_after": open_after,
+                "c2o_exit_intrinsic_usd": c2o_exit_intrinsic_usd,
+                "gross_c2o_intrinsic_proxy_pnl_usd": gross_c2o_intrinsic_proxy_pnl,
+                "c2o_haircut_pnl_usd": c2o_haircut_pnl,
+                "c2o_proxy_pnl_source": C2O_PROXY_PNL_SOURCE_INTRINSIC_OPEN,
+                "c2o_proxy_pnl_status": c2o_status,
+                **post_open_metrics,
+                **reaction_o2c_metrics,
                 "underlying_exit_price_source": UNDERLYING_EXIT_PRICE_SOURCE,
-                "option_exit_price_source": OPTION_EXIT_PRICE_SOURCE_DAY_AGGS,
-                "option_exit_price_status": exit_status,
-                "used_intrinsic_fallback": use_intrinsic,
+                "option_exit_price_source": primary_exit_source,
+                "option_exit_price_status": primary_exit_status,
+                "used_intrinsic_fallback": primary_used_intrinsic,
                 "gross_proxy_pnl_usd": gross_pnl,
                 "haircut_pnl_usd": gross_pnl - haircut_fraction * entry_premium_usd,
                 "proxy_volume_window": selected["volume"],
@@ -668,8 +1184,46 @@ def summarize_trade_proxy_panel(
         "mean_gross_proxy_pnl_usd": float(straddle_diagnostics["gross_proxy_pnl_usd"].mean())
         if not straddle_diagnostics.empty
         else None,
+        "mean_gross_exit_option_vwap_preclose_15m_proxy_pnl_usd": float(
+            straddle_diagnostics["gross_exit_option_vwap_preclose_15m_proxy_pnl_usd"].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "gross_exit_option_vwap_preclose_15m_proxy_pnl_usd" in straddle_diagnostics
+        else None,
         "mean_haircut_pnl_usd": float(straddle_diagnostics["haircut_pnl_usd"].mean())
         if not straddle_diagnostics.empty
+        else None,
+        "mean_gross_c2o_intrinsic_proxy_pnl_usd": float(
+            straddle_diagnostics["gross_c2o_intrinsic_proxy_pnl_usd"].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "gross_c2o_intrinsic_proxy_pnl_usd" in straddle_diagnostics
+        else None,
+        "mean_gross_post_open_option_vwap_0_5_proxy_pnl_usd": float(
+            straddle_diagnostics["gross_post_open_option_vwap_0_5_proxy_pnl_usd"].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "gross_post_open_option_vwap_0_5_proxy_pnl_usd" in straddle_diagnostics
+        else None,
+        "mean_gross_post_open_option_vwap_5_15_proxy_pnl_usd": float(
+            straddle_diagnostics["gross_post_open_option_vwap_5_15_proxy_pnl_usd"].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "gross_post_open_option_vwap_5_15_proxy_pnl_usd" in straddle_diagnostics
+        else None,
+        "mean_gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd": float(
+            straddle_diagnostics[
+                "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd"
+            ].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd" in straddle_diagnostics
+        else None,
+        "mean_option_proxy_decomposition_residual_5_15_usd": float(
+            straddle_diagnostics["option_proxy_decomposition_residual_5_15_usd"].mean()
+        )
+        if not straddle_diagnostics.empty
+        and "option_proxy_decomposition_residual_5_15_usd" in straddle_diagnostics
         else None,
         "limitations": [
             "Second aggregates are trade-price OHLCV bars, not bid/ask or NBBO quotes.",

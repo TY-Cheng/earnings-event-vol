@@ -12,10 +12,12 @@ question is:
 > Can models improve trading decisions around option-implied earnings event
 > variance mispricing?
 
-The target is event-level realized earnings variance:
+The realized-variance target system is decomposed into three labels:
 
 ```text
-RVAR_event = log(S_after / S_before)^2
+jump_c2o     = close-to-open earnings jump variance
+day_c2c      = close-to-close full reaction-day variance
+reaction_o2c = open-to-close post-open digestion variance
 ```
 
 The market benchmark is the event variance implied by short-dated options:
@@ -24,19 +26,21 @@ The market benchmark is the event variance implied by short-dated options:
 IVAR_event
 ```
 
-Ex post mispricing is:
+C2C ex post mispricing is:
 
 ```text
-RVAR_event - IVAR_event
+RVAR_event_day_c2c - IVAR_event
 ```
 
-Trading decisions are evaluated in premium space. A raw variance forecast is
-not enough; expected strategy value must beat market entry cost and transaction
-cost estimates.
+The V1 strategy/PnL layer uses `day_c2c` only. `jump_c2o` is the primary
+scientific forecast/ranking target, but it is not reported as executable option
+PnL in the current no-NBBO proxy run. Trading decisions are evaluated in premium
+space. A raw variance forecast is not enough; expected strategy value must beat
+market entry cost and transaction cost estimates.
 
 ## Current State
 
-Verified local state on 2026-05-06:
+Verified local state on 2026-05-07:
 
 - `just data` builds the active no-NBBO proxy data pipeline.
 - `just research` builds the proxy feature/model/report package from the
@@ -52,8 +56,8 @@ Latest proxy data artifacts:
 
 - Dynamic calendar: 1,054 SEC-first candidate rows; 810 BMO/AMC main-sample
   candidates after universe and text-validation filters.
-- Trade-proxy panel: 810 events, 801 with `RVAR_event`, 690 with trade-proxy
-  `IVAR_event`.
+- Trade-proxy panel: 810 events, 801 with the backward-compatible C2C
+  `rvar_event` alias, 690 with trade-proxy `IVAR_event`.
 - Proxy contracts: 12,038 candidates; 10,165 with usable pre-cutoff
   second-aggregate prices.
 - Proxy straddle diagnostics: 779 rows; mean gross proxy PnL about 12.41 USD,
@@ -64,13 +68,15 @@ Latest proxy modeling artifacts:
 - Feature matrix: 810 rows.
 - Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost,
-  FT-Transformer, Mamba sequence encoder, and a mask-only Mamba ablation.
+  FT-Transformer, daily proxy-Mamba, hybrid proxy-Mamba, intraday-only Mamba,
+  and mask-only Mamba ablations.
 - Sequence audit: 678 eligible events out of 810 under the default path
   coverage rule; flagged as high sequence-selection risk.
 - In the current no-NBBO proxy run, LightGBM and XGBoost look strongest on
-  ranking and proxy strategy metrics. This is signal-screening evidence, not a
-  paper-grade executable trading result.
-- Proxy-Mamba is implemented but not a headline result in the current run.
+  `jump_c2o` ranking and `day_c2c` proxy strategy metrics. This is
+  signal-screening evidence, not a paper-grade executable trading result.
+- Proxy-Mamba is implemented for both the 20-step daily tensor and the 31-step
+  hybrid tensor, but it is not a headline model in the current run.
 
 ## Command Surface
 
@@ -104,15 +110,21 @@ Default data parameters:
   - options day aggregates for universe liquidity ranking, contract discovery,
     local IV/IVAR proxy inputs, same-contract option exit closes, and the
     20-day close-trade-implied option-surface sequence;
-  - underlying stock day aggregates for underlying closes, event returns,
-    `RVAR_event`, and exit spot;
+  - underlying stock day aggregates for underlying closes, vendor OHLC opens,
+    C2O/C2C/O2C event returns, and exit spot;
   - targeted Massive option second aggregates from
     `/range/1/second/<date>/<date>` for the entry proxy.
 - entry proxy window: keep only bars in the resolved pre-cutoff buffer,
-  default 60 minutes before the event cutoff, then select the latest positive
-  `option_vwap` or `option_close` in the final 900 seconds.
+  default 60 minutes before the event cutoff, then compute the true per-leg
+  volume-weighted `option_vwap` over the final 900 seconds.
+- The option-proxy open anchor is unified as same-contract option VWAP from
+  5-15 minutes after open. C2O uses it as the primary post-open exit proxy;
+  O2C uses the same mark as the diagnostic post-open entry proxy. The 0-5
+  minute VWAP remains an opening-microstructure stress test.
 - second aggregates are trade OHLCV bars, not quote, bid/ask, or NBBO data;
-  exit proxy uses same-contract option day-aggregate close when available.
+  the primary C2C exit proxy is same-contract option VWAP over the final
+  15 minutes before the exit-date close. Same-contract option day-aggregate
+  close is retained only as fallback/diagnostic.
 
 `just research` does not download market data. It consumes the current proxy
 panel, builds features, trains/evaluates models, and writes metrics, figures,

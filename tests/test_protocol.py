@@ -169,6 +169,7 @@ from earnings_event_vol.research import (
     SEQUENCE_FEATURE_NAMES,
     aggregate_sequence_features,
     assign_event_splits,
+    build_metric_tables,
     build_sequence_tensor,
     enrich_feature_matrix_for_research,
     hybrid_sequence_coverage_by_event,
@@ -194,12 +195,14 @@ from earnings_event_vol.schemas import (
     UnderlyingBar,
 )
 from earnings_event_vol.trade_proxy import (
-    OPTION_EXIT_STATUS_MISSING_DAY_AGG,
-    OPTION_EXIT_STATUS_OK,
+    EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK,
+    OPTION_EXIT_STATUS_MISSING_PRECLOSE_VWAP,
     TRADE_PROXY_PANEL_GRADE,
     TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW,
     TRADE_PROXY_STATUS_OK,
     attach_trade_proxy_local_iv,
+    build_exit_preclose_option_vwap_frame,
+    build_post_open_option_vwap_frame,
     build_proxy_straddle_diagnostics,
     build_trade_proxy_ivar_inputs,
     build_trade_proxy_price_frame,
@@ -208,7 +211,8 @@ from earnings_event_vol.trade_proxy import (
     fetch_massive_option_second_aggregates,
     filter_pre_cutoff_buffer,
     normalize_second_aggregates,
-    select_latest_proxy_price,
+    select_option_window_vwap,
+    select_preclose_entry_proxy_price,
     summarize_trade_proxy_panel,
     write_trade_proxy_metadata,
 )
@@ -3501,43 +3505,6 @@ def test_trade_proxy_second_aggregates_are_cached_in_bronze_parquet(
     assert repaired_frames["O:ABC260213C00100000"]["option_close"].iloc[0] == pytest.approx(4.1)
 
 
-def test_trade_proxy_exit_day_aggs_repair_corrupt_cache(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = replace(load_project_config(), bronze_data_dir=tmp_path / "data" / "bronze")
-    day = pd.Timestamp("2026-02-06")
-    destination = trade_proxy_panel_script._options_day_agg_path(config, day)
-    destination.parent.mkdir(parents=True)
-    destination.write_text("not a parquet file", encoding="utf-8")
-
-    def fake_download_command(config: object, *, key: str, destination: Path) -> list[str]:
-        return ["fake-download", str(destination)]
-
-    def fake_aws_env(config: object) -> dict[str, str]:
-        return {}
-
-    def fake_run_download(command: Sequence[str], env: Mapping[str, str], timeout: float) -> object:
-        with gzip.open(command[-1], "wt", encoding="utf-8") as handle:
-            handle.write("ticker,close\nO:ABC260213C00100000,4.75\n")
-        return subprocess.CompletedProcess(list(command), 0)
-
-    monkeypatch.setattr(
-        trade_proxy_panel_script,
-        "build_download_file_command",
-        fake_download_command,
-    )
-    monkeypatch.setattr(trade_proxy_panel_script, "massive_flat_file_aws_env", fake_aws_env)
-    monkeypatch.setattr(trade_proxy_panel_script, "_run_head_object_command", fake_run_download)
-
-    status = trade_proxy_panel_script._ensure_options_day_agg_file(config, day)
-
-    assert status == "repaired"
-    repaired = pd.read_parquet(destination)
-    assert repaired["ticker"].tolist() == ["O:ABC260213C00100000"]
-    assert repaired["close"].tolist() == pytest.approx([4.75])
-
-
 def test_second_aggregates_trade_proxy_panel_requires_pre_cutoff_trades() -> None:
     raw = pd.DataFrame(
         {
@@ -3556,17 +3523,18 @@ def test_second_aggregates_trade_proxy_panel_requires_pre_cutoff_trades() -> Non
         }
     )
     bars = normalize_second_aggregates(raw, option_ticker="O:ABC260213C00100000")
-    selected = select_latest_proxy_price(
+    selected = select_preclose_entry_proxy_price(
         bars,
         cutoff_timestamp=pd.Timestamp("2026-02-05 16:00:00", tz="America/New_York").to_pydatetime(),
         lookback_seconds=30,
     )
     assert selected.status == TRADE_PROXY_STATUS_OK
-    assert selected.proxy_price == pytest.approx(4.2)
+    assert selected.proxy_price == pytest.approx((4.0 * 1 + 4.2 * 2) / 3)
+    assert selected.price_method == "preclose_15m_option_second_agg_vwap"
     assert selected.proxy_volume == 3
     assert selected.proxy_rows_in_window == 2
 
-    stale = select_latest_proxy_price(
+    stale = select_preclose_entry_proxy_price(
         bars,
         cutoff_timestamp=pd.Timestamp("2026-02-05 16:00:00", tz="America/New_York").to_pydatetime(),
         lookback_seconds=1,
@@ -3590,33 +3558,123 @@ def test_second_aggregates_trade_proxy_panel_requires_pre_cutoff_trades() -> Non
     )
 
 
+def test_post_open_option_vwap_windows_use_trade_weighted_prices() -> None:
+    exit_date = date(2026, 2, 6)
+    selected = pd.DataFrame(
+        {
+            "event_id": ["ABC_2026Q1"],
+            "exit_date": [exit_date],
+            "call_options_ticker": ["O:ABC260220C00100000"],
+            "put_options_ticker": ["O:ABC260220P00100000"],
+        }
+    )
+
+    def bars(ticker: str, first: float, second: float, third: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "options_ticker": [ticker, ticker, ticker],
+                "timestamp_et": [
+                    pd.Timestamp("2026-02-06 09:31:00", tz="America/New_York"),
+                    pd.Timestamp("2026-02-06 09:36:00", tz="America/New_York"),
+                    pd.Timestamp("2026-02-06 09:40:00", tz="America/New_York"),
+                ],
+                "option_vwap": [first, second, third],
+                "option_close": [first, second, third],
+                "volume": [1, 2, 3],
+                "transactions": [1, 2, 3],
+            }
+        )
+
+    call_ticker = "O:ABC260220C00100000"
+    put_ticker = "O:ABC260220P00100000"
+    out = build_post_open_option_vwap_frame(
+        selected,
+        {
+            (call_ticker, exit_date): bars(call_ticker, 5.0, 6.0, 7.0),
+            (put_ticker, exit_date): bars(put_ticker, 4.0, 5.0, 6.0),
+        },
+    )
+    assert set(out["window_label"]) == {"0_5", "5_15"}
+    call_5_15 = out.loc[
+        out["options_ticker"].eq(call_ticker) & out["window_label"].eq("5_15"),
+        "option_exit_vwap",
+    ].iloc[0]
+    assert call_5_15 == pytest.approx((6.0 * 2 + 7.0 * 3) / 5)
+
+    direct = select_option_window_vwap(
+        bars(call_ticker, 5.0, 6.0, 7.0),
+        window_start=pd.Timestamp("2026-02-06 09:30:00", tz="America/New_York").to_pydatetime(),
+        window_end=pd.Timestamp("2026-02-06 09:35:00", tz="America/New_York").to_pydatetime(),
+        include_end=False,
+    )
+    assert direct.proxy_price == pytest.approx(5.0)
+    assert direct.proxy_volume == 1
+
+    exit_out = build_exit_preclose_option_vwap_frame(
+        selected,
+        {
+            (call_ticker, exit_date): pd.DataFrame(
+                {
+                    "options_ticker": [call_ticker, call_ticker, call_ticker],
+                    "timestamp_et": [
+                        pd.Timestamp("2026-02-06 15:44:00", tz="America/New_York"),
+                        pd.Timestamp("2026-02-06 15:46:00", tz="America/New_York"),
+                        pd.Timestamp("2026-02-06 15:59:00", tz="America/New_York"),
+                    ],
+                    "option_vwap": [4.0, 6.0, 8.0],
+                    "option_close": [4.0, 6.0, 8.0],
+                    "volume": [99, 2, 3],
+                    "transactions": [1, 2, 3],
+                }
+            ),
+            (put_ticker, exit_date): pd.DataFrame(
+                {
+                    "options_ticker": [put_ticker, put_ticker],
+                    "timestamp_et": [
+                        pd.Timestamp("2026-02-06 15:50:00", tz="America/New_York"),
+                        pd.Timestamp("2026-02-06 15:58:00", tz="America/New_York"),
+                    ],
+                    "option_vwap": [5.0, 7.0],
+                    "option_close": [5.0, 7.0],
+                    "volume": [1, 3],
+                    "transactions": [1, 3],
+                }
+            ),
+        },
+    )
+    call_exit = exit_out.loc[exit_out["options_ticker"].eq(call_ticker), "option_exit_vwap"].iloc[0]
+    put_exit = exit_out.loc[exit_out["options_ticker"].eq(put_ticker), "option_exit_vwap"].iloc[0]
+    assert call_exit == pytest.approx((6.0 * 2 + 8.0 * 3) / 5)
+    assert put_exit == pytest.approx((5.0 * 1 + 7.0 * 3) / 4)
+
+
 def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
     empty_normalized = normalize_second_aggregates(pd.DataFrame(), option_ticker="O:ABC")
     assert list(empty_normalized.columns)[0] == "options_ticker"
     with pytest.raises(ValueError, match="missing required columns"):
         normalize_second_aggregates(pd.DataFrame({"t": [1]}), option_ticker="O:ABC")
     with pytest.raises(ValueError, match="lookback_seconds"):
-        select_latest_proxy_price(
+        select_preclose_entry_proxy_price(
             pd.DataFrame(), cutoff_timestamp=datetime(2026, 2, 5), lookback_seconds=0
         )
     with pytest.raises(ValueError, match="price_field"):
-        select_latest_proxy_price(
+        select_preclose_entry_proxy_price(
             pd.DataFrame(), cutoff_timestamp=datetime(2026, 2, 5), price_field="bad"
         )
     with pytest.raises(ValueError, match="timestamp_et"):
-        select_latest_proxy_price(
+        select_preclose_entry_proxy_price(
             pd.DataFrame({"option_vwap": [1.0]}),
             cutoff_timestamp=datetime(2026, 2, 5),
         )
     assert (
-        select_latest_proxy_price(
+        select_preclose_entry_proxy_price(
             pd.DataFrame(),
             cutoff_timestamp=datetime(2026, 2, 5),
         ).status
         == TRADE_PROXY_STATUS_NO_TRADE_IN_WINDOW
     )
     with pytest.raises(ValueError, match="timezone-aware"):
-        select_latest_proxy_price(
+        select_preclose_entry_proxy_price(
             pd.DataFrame(
                 {
                     "timestamp_et": ["2026-02-05 15:59:59"],
@@ -3734,7 +3792,7 @@ def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
         windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
     ).empty
 
-    exit_close_straddle = build_proxy_straddle_diagnostics(
+    exit_preclose_straddle = build_proxy_straddle_diagnostics(
         pd.DataFrame(
             {
                 "event_id": ["ABC_2026Q1", "ABC_2026Q1"],
@@ -3748,41 +3806,101 @@ def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
                 "proxy_transactions_window": [1, 2],
             }
         ),
-        windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
-        option_exit_prices=pd.DataFrame(
-            {
-                "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
-                "date": [date(2026, 2, 6), date(2026, 2, 6)],
-                "option_close": [6.0, 3.5],
-            }
+        windows.assign(
+            s_after=101.0,
+            open_after=105.0,
+            entry_date=date(2026, 2, 5),
+            exit_date=date(2026, 2, 6),
         ),
-    )
-    assert exit_close_straddle["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_OK
-    assert bool(exit_close_straddle["used_intrinsic_fallback"].iloc[0]) is False
-    assert exit_close_straddle["exit_option_value_usd"].iloc[0] == pytest.approx(950.0)
-    assert exit_close_straddle["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(50.0)
-
-    missing_exit_close = build_proxy_straddle_diagnostics(
-        pd.DataFrame(
+        exit_preclose_option_prices=pd.DataFrame(
             {
                 "event_id": ["ABC_2026Q1", "ABC_2026Q1"],
-                "expiration": [date(2026, 2, 20), date(2026, 2, 20)],
                 "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
-                "proxy_status": [TRADE_PROXY_STATUS_OK, TRADE_PROXY_STATUS_OK],
-                "right": ["call", "put"],
-                "strike": [100.0, 100.0],
-                "proxy_price": [5.0, 4.0],
-                "proxy_volume_window": [10, 20],
-                "proxy_transactions_window": [1, 2],
+                "option_exit_vwap": [5.8, 4.4],
+                "volume": [30, 40],
+                "transactions": [3, 4],
+                "rows_in_window": [2, 2],
+                "status": ["ok", "ok"],
             }
         ),
-        windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
-        option_exit_prices=pd.DataFrame(),
+        post_open_option_prices=pd.DataFrame(
+            {
+                "event_id": ["ABC_2026Q1"] * 4,
+                "options_ticker": [
+                    "O:ABC260220C00100000",
+                    "O:ABC260220P00100000",
+                    "O:ABC260220C00100000",
+                    "O:ABC260220P00100000",
+                ],
+                "window_label": ["0_5", "0_5", "5_15", "5_15"],
+                "option_exit_vwap": [5.5, 3.5, 6.0, 4.0],
+                "volume": [10, 10, 20, 20],
+                "transactions": [1, 1, 2, 2],
+                "rows_in_window": [1, 1, 2, 2],
+                "status": ["ok"] * 4,
+            }
+        ),
     )
     assert (
-        missing_exit_close["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_MISSING_DAY_AGG
+        exit_preclose_straddle["option_exit_price_status"].iloc[0]
+        == EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK
     )
-    assert bool(missing_exit_close["used_intrinsic_fallback"].iloc[0]) is True
+    assert bool(exit_preclose_straddle["used_intrinsic_fallback"].iloc[0]) is False
+    assert exit_preclose_straddle["exit_option_value_usd"].iloc[0] == pytest.approx(1020.0)
+    assert exit_preclose_straddle["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(120.0)
+    assert exit_preclose_straddle["gross_exit_option_vwap_preclose_15m_proxy_pnl_usd"].iloc[
+        0
+    ] == pytest.approx(120.0)
+    assert exit_preclose_straddle["c2o_exit_intrinsic_usd"].iloc[0] == pytest.approx(500.0)
+    assert exit_preclose_straddle["gross_c2o_intrinsic_proxy_pnl_usd"].iloc[0] == pytest.approx(
+        -400.0
+    )
+    assert exit_preclose_straddle["c2o_proxy_pnl_status"].iloc[0] == "vendor_open_intrinsic_proxy"
+    assert exit_preclose_straddle["gross_post_open_option_vwap_0_5_proxy_pnl_usd"].iloc[
+        0
+    ] == pytest.approx(0.0)
+    assert exit_preclose_straddle["gross_post_open_option_vwap_5_15_proxy_pnl_usd"].iloc[
+        0
+    ] == pytest.approx(100.0)
+    assert exit_preclose_straddle["post_open_option_vwap_5_15_status"].iloc[0] == "ok"
+    assert exit_preclose_straddle["open_option_vwap_5_15_anchor_usd"].iloc[0] == pytest.approx(
+        1000.0
+    )
+    assert exit_preclose_straddle[
+        "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd"
+    ].iloc[0] == pytest.approx(20.0)
+    assert exit_preclose_straddle["option_proxy_decomposition_residual_5_15_usd"].iloc[
+        0
+    ] == pytest.approx(0.0)
+    assert exit_preclose_straddle[
+        "gross_reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy_pnl_usd"
+    ].iloc[0] == pytest.approx(120.0)
+    assert exit_preclose_straddle["option_proxy_decomposition_residual_0_5_usd"].iloc[
+        0
+    ] == pytest.approx(0.0)
+
+    missing_exit_preclose = build_proxy_straddle_diagnostics(
+        pd.DataFrame(
+            {
+                "event_id": ["ABC_2026Q1", "ABC_2026Q1"],
+                "expiration": [date(2026, 2, 20), date(2026, 2, 20)],
+                "options_ticker": ["O:ABC260220C00100000", "O:ABC260220P00100000"],
+                "proxy_status": [TRADE_PROXY_STATUS_OK, TRADE_PROXY_STATUS_OK],
+                "right": ["call", "put"],
+                "strike": [100.0, 100.0],
+                "proxy_price": [5.0, 4.0],
+                "proxy_volume_window": [10, 20],
+                "proxy_transactions_window": [1, 2],
+            }
+        ),
+        windows.assign(s_after=101.0, entry_date=date(2026, 2, 5), exit_date=date(2026, 2, 6)),
+    )
+    assert (
+        missing_exit_preclose["option_exit_price_status"].iloc[0]
+        == OPTION_EXIT_STATUS_MISSING_PRECLOSE_VWAP
+    )
+    assert bool(missing_exit_preclose["used_intrinsic_fallback"].iloc[0]) is True
+    assert missing_exit_preclose["c2o_proxy_pnl_status"].iloc[0] == "missing_open_after"
 
     empty_panel = pd.DataFrame()
     empty_summary = summarize_trade_proxy_panel(
@@ -3954,7 +4072,7 @@ def test_trade_proxy_ivar_and_gross_straddle_diagnostics_are_no_nbbo() -> None:
     assert empty_input_panel["trade_proxy_ivar_event"].isna().all()
     assert empty_input_panel["ivar_failure_reason"].iloc[0] == "no_two_event_covering_expiries"
     assert straddles["gross_proxy_pnl_usd"].iloc[0] == pytest.approx(-380.0)
-    assert straddles["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_MISSING_DAY_AGG
+    assert straddles["option_exit_price_status"].iloc[0] == OPTION_EXIT_STATUS_MISSING_PRECLOSE_VWAP
     assert bool(straddles["used_intrinsic_fallback"].iloc[0]) is True
     assert straddles["haircut_pnl_usd"].iloc[0] < straddles["gross_proxy_pnl_usd"].iloc[0]
 
@@ -4815,6 +4933,9 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
             "universe_rank": list(range(1, 41)),
             "entry_premium_usd": np.linspace(300, 500, 40),
             "gross_proxy_pnl_usd": np.linspace(-50, 80, 40),
+            "gross_c2o_intrinsic_proxy_pnl_usd": np.linspace(-120, 60, 40),
+            "gross_post_open_option_vwap_0_5_proxy_pnl_usd": np.linspace(-100, 70, 40),
+            "gross_post_open_option_vwap_5_15_proxy_pnl_usd": np.linspace(-90, 90, 40),
             "haircut_pnl_usd": np.linspace(-55, 70, 40),
         }
     )
@@ -4849,14 +4970,15 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         sequence_by_event=by_event,
         sequence_aggregates=aggregates,
     )
+    features = features.assign(
+        RVAR_event_jump_c2o=features["rvar_event"] * 0.8,
+        RVAR_event_day_c2c=features["rvar_event"],
+        RVAR_event_reaction_o2c=features["rvar_event"] * 0.2,
+    )
     target_rows = pd.concat(
         [
             prepare_target_frame(
-                features.assign(
-                    RVAR_event_jump_c2o=features["rvar_event"] * 0.8,
-                    RVAR_event_day_c2c=features["rvar_event"],
-                    RVAR_event_reaction_o2c=features["rvar_event"] * 0.2,
-                ),
+                features,
                 target_id=target_id,
             )
             for target_id in ["jump_c2o", "day_c2c", "reaction_o2c"]
@@ -4993,6 +5115,17 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
     )
     assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
+    metric_paths = build_metric_tables(target_rows, out_dir=tmp_path / "metrics")
+    strategy = pd.read_csv(metric_paths["strategy_metrics"])
+    assert {"day_c2c", "jump_c2o"}.issubset(set(strategy["target_id"]))
+    c2o_strategy = strategy.loc[strategy["target_id"].eq("jump_c2o")]
+    assert {
+        "c2o_intrinsic_open_diagnostic",
+        "post_open_option_vwap_0_5_proxy",
+        "post_open_option_vwap_5_15_proxy",
+    }.issubset(set(c2o_strategy["strategy_proxy_kind"]))
+    assert c2o_strategy["pnl_headline_eligible"].astype(str).str.lower().eq("false").all()
+    assert "reaction_o2c" not in set(strategy["target_id"])
 
 
 def test_market_index_second_surface_and_underlying_features() -> None:

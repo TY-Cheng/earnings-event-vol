@@ -1627,6 +1627,15 @@ def enrich_feature_matrix_for_research(
         )
     else:
         out["proxy_cost_usd"] = np.nan
+    for label in ("0_5", "5_15"):
+        premium_col = f"open_option_vwap_{label}_anchor_usd"
+        cost_col = f"open_option_vwap_{label}_proxy_cost_usd"
+        if premium_col in out.columns:
+            out[cost_col] = proxy_transaction_cost(
+                pd.to_numeric(out[premium_col], errors="coerce").fillna(0.0)
+            )
+        else:
+            out[cost_col] = np.nan
     out["cost_model"] = "proxy_haircut"
     out["haircut_bps"] = DEFAULT_HAIRCUT_BPS
     out["bid_ask_costs_unavailable"] = True
@@ -1658,6 +1667,7 @@ def prepare_target_frame(base: pd.DataFrame, *, target_id: str) -> pd.DataFrame:
     out["rvar_event"] = pd.to_numeric(out[label_col], errors="coerce")
     out["edge_var_realized"] = out["rvar_event"] - pd.to_numeric(out["ivar_event"], errors="coerce")
     out["target_has_strategy_pnl"] = target_id == "day_c2c"
+    out["target_has_diagnostic_c2o_proxy_pnl"] = target_id == "jump_c2o"
     if target_id == "reaction_o2c":
         out["ivar_baseline_interpretation"] = "weak_comparator_only"
     elif target_id == "jump_c2o":
@@ -2412,44 +2422,92 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                 edge_decile_table(scored, score_col=f"score_{model_id}").to_csv(
                     out_dir / f"edge_deciles_{target_id}_{model_id}.csv", index=False
                 )
-            if target_id != "day_c2c":
+            strategy_specs = {
+                "day_c2c": [
+                    {
+                        "realized_col": "gross_proxy_pnl_usd",
+                        "proxy_kind": "day_c2c_exit_preclose_15m_proxy",
+                        "headline_eligible": True,
+                        "trade_prefix": "strategy_trades",
+                    }
+                ],
+                "jump_c2o": [
+                    {
+                        "realized_col": "gross_post_open_option_vwap_5_15_proxy_pnl_usd",
+                        "proxy_kind": "post_open_option_vwap_5_15_proxy",
+                        "headline_eligible": False,
+                        "trade_prefix": "c2o_option_vwap_5_15_strategy_trades",
+                    },
+                    {
+                        "realized_col": "gross_post_open_option_vwap_0_5_proxy_pnl_usd",
+                        "proxy_kind": "post_open_option_vwap_0_5_proxy",
+                        "headline_eligible": False,
+                        "trade_prefix": "c2o_option_vwap_0_5_strategy_trades",
+                    },
+                    {
+                        "realized_col": "gross_c2o_intrinsic_proxy_pnl_usd",
+                        "proxy_kind": "c2o_intrinsic_open_diagnostic",
+                        "headline_eligible": False,
+                        "trade_prefix": "c2o_intrinsic_strategy_trades",
+                    },
+                ],
+            }.get(target_id, [])
+            if not strategy_specs:
                 continue
-            if {"gross_proxy_pnl_usd", "entry_premium_usd"}.issubset(scored.columns):
-                strategy = build_proxy_strategy_frame(
-                    scored,
-                    forecast_col=column,
-                    cost_col="proxy_cost_usd",
-                    min_edge_var=0.0,
-                )
-                trades = strategy.loc[strategy["should_trade"].astype(bool)].copy()
-                trades.to_csv(out_dir / f"strategy_trades_{model_id}.csv", index=False)
-                strategy_rows.append(
-                    {"target_id": target_id, "model_id": model_id, **strategy_metrics(trades)}
-                )
-                sensitivity = cost_sensitivity(
-                    trades,
-                    gross_pnl_col="gross_strategy_pnl_usd",
-                    cost_col="estimated_transaction_cost_usd",
-                    multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
-                )
-                sensitivity.insert(0, "target_id", target_id)
-                sensitivity.insert(1, "model_id", model_id)
-                cost_rows.append(sensitivity)
-                for breakdown in (
-                    "dte_bucket",
-                    "is_main_dte_5_14",
-                    "announcement_timing",
-                    "ticker",
-                    "event_year",
-                    "regime",
-                    "liquidity_bucket",
-                ):
-                    if breakdown in trades.columns and not trades.empty:
-                        table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
-                        table.insert(0, "target_id", target_id)
-                        table.insert(1, "model_id", model_id)
-                        table.insert(2, "breakdown", breakdown)
-                        breakdown_frames.append(table)
+            for strategy_spec in strategy_specs:
+                realized_col = str(strategy_spec["realized_col"])
+                if {realized_col, "entry_premium_usd"}.issubset(scored.columns):
+                    proxy_kind = str(strategy_spec["proxy_kind"])
+                    headline_eligible = bool(strategy_spec["headline_eligible"])
+                    trade_prefix = str(strategy_spec["trade_prefix"])
+                    strategy = build_proxy_strategy_frame(
+                        scored,
+                        forecast_col=column,
+                        realized_long_pnl_col=realized_col,
+                        cost_col="proxy_cost_usd",
+                        min_edge_var=0.0,
+                    )
+                    strategy["strategy_proxy_kind"] = proxy_kind
+                    strategy["pnl_headline_eligible"] = headline_eligible
+                    trades = strategy.loc[strategy["should_trade"].astype(bool)].copy()
+                    trades.to_csv(out_dir / f"{trade_prefix}_{model_id}.csv", index=False)
+                    strategy_rows.append(
+                        {
+                            "target_id": target_id,
+                            "model_id": model_id,
+                            "strategy_proxy_kind": proxy_kind,
+                            "pnl_headline_eligible": headline_eligible,
+                            **strategy_metrics(trades, gross_pnl_col="gross_strategy_pnl_usd"),
+                        }
+                    )
+                    sensitivity = cost_sensitivity(
+                        trades,
+                        gross_pnl_col="gross_strategy_pnl_usd",
+                        cost_col="estimated_transaction_cost_usd",
+                        multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
+                    )
+                    sensitivity.insert(0, "target_id", target_id)
+                    sensitivity.insert(1, "model_id", model_id)
+                    sensitivity.insert(2, "strategy_proxy_kind", proxy_kind)
+                    sensitivity.insert(3, "pnl_headline_eligible", headline_eligible)
+                    cost_rows.append(sensitivity)
+                    for breakdown in (
+                        "dte_bucket",
+                        "is_main_dte_5_14",
+                        "announcement_timing",
+                        "ticker",
+                        "event_year",
+                        "regime",
+                        "liquidity_bucket",
+                    ):
+                        if breakdown in trades.columns and not trades.empty:
+                            table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
+                            table.insert(0, "target_id", target_id)
+                            table.insert(1, "model_id", model_id)
+                            table.insert(2, "strategy_proxy_kind", proxy_kind)
+                            table.insert(3, "pnl_headline_eligible", headline_eligible)
+                            table.insert(4, "breakdown", breakdown)
+                            breakdown_frames.append(table)
     forecast_path = out_dir / "forecast_metrics.csv"
     ranking_path = out_dir / "ranking_metrics.csv"
     strategy_path = out_dir / "strategy_metrics.csv"
@@ -2670,6 +2728,20 @@ def write_proxy_research_report(
         if "target_id" in strategy
         else strategy.copy()
     )
+    c2o_strategy_diag = (
+        strategy.loc[strategy["target_id"].astype(str).eq("jump_c2o")].copy()
+        if "target_id" in strategy
+        else pd.DataFrame()
+    )
+    c2o_strategy_primary = (
+        c2o_strategy_diag.loc[
+            c2o_strategy_diag.get("strategy_proxy_kind", pd.Series(dtype=str))
+            .astype(str)
+            .eq("post_open_option_vwap_5_15_proxy")
+        ].copy()
+        if not c2o_strategy_diag.empty and "strategy_proxy_kind" in c2o_strategy_diag
+        else pd.DataFrame()
+    )
     if not forecast_main.empty:
         summary = forecast_main.merge(
             ranking_main, on="model_id", how="left", suffixes=("", "_ranking")
@@ -2694,6 +2766,18 @@ def write_proxy_research_report(
             "max_drawdown_usd",
         ]
         summary = summary[[column for column in keep if column in summary.columns]].round(4)
+        summary = summary.rename(
+            columns={
+                "mae": "mae_jump_c2o",
+                "rmse": "rmse_jump_c2o",
+                "oos_r2_vs_ivar": "oos_r2_vs_ivar_jump_c2o",
+                "top_decile_precision": "top_decile_precision_jump_c2o",
+                "auc": "auc_jump_c2o",
+                "net_pnl_usd": "net_pnl_usd_day_c2c",
+                "return_on_premium": "return_on_premium_day_c2c",
+                "max_drawdown_usd": "max_drawdown_usd_day_c2c",
+            }
+        )
     else:
         summary = pd.DataFrame()
 
@@ -2814,7 +2898,7 @@ def write_proxy_research_report(
                 f"Mamba have forecast correlation {corr:.3f}; their mean absolute "
                 f"forecast difference is {mean_abs_diff:.4f}. The hybrid proxy-Mamba "
                 "forecast has correlation "
-                f"{mamba_target_corr:.3f} with realized event variance, versus "
+                f"{mamba_target_corr:.3f} with realized `jump_c2o` variance, versus "
                 f"{mask_target_corr:.3f} for the mask-only ablation."
             )
 
@@ -2825,6 +2909,7 @@ def write_proxy_research_report(
     best_edge_monotone = _best(ranking_main, "edge_decile_spearman", higher_is_better=True)
     best_net = _best(strategy_main, "net_pnl_usd", higher_is_better=True)
     best_return = _best(strategy_main, "return_on_premium", higher_is_better=True)
+    best_c2o_diag_net = _best(c2o_strategy_primary, "net_pnl_usd", higher_is_better=True)
     qlike_worst = _best(qlike, "raw_qlike", higher_is_better=True)
     qlike_share_worst = _best(
         qlike,
@@ -2868,6 +2953,26 @@ def write_proxy_research_report(
     else:
         cost_snapshot = pd.DataFrame()
 
+    c2o_strategy_table = pd.DataFrame()
+    if not c2o_strategy_diag.empty:
+        c2o_strategy_table = (
+            c2o_strategy_diag.loc[c2o_strategy_diag["model_id"].isin(selected_models)]
+            .copy()
+            .sort_values(["strategy_proxy_kind", "model_id"])
+        )
+        keep = [
+            "strategy_proxy_kind",
+            "model_id",
+            "n",
+            "net_pnl_usd",
+            "return_on_premium",
+            "sharpe",
+            "max_drawdown_usd",
+        ]
+        c2o_strategy_table = c2o_strategy_table[
+            [column for column in keep if column in c2o_strategy_table.columns]
+        ].round(4)
+
     diagnostics_model_id = diagnostics.get("model_id", pd.Series(dtype=str)).astype(str)
     diagnostics_snapshot = diagnostics.loc[diagnostics_model_id.isin(selected_models)].copy()
     if not diagnostics_snapshot.empty:
@@ -2875,6 +2980,7 @@ def write_proxy_research_report(
             [
                 column
                 for column in [
+                    "target_id",
                     "model_id",
                     "status",
                     "feature_count",
@@ -2902,16 +3008,27 @@ def write_proxy_research_report(
         "",
         "This is a proxy-stage report based on no_nbbo_trade_proxy data.",
         "Results are not paper-grade execution evidence.",
-        "proxy-Mamba uses 20-day close-trade-implied option-surface summaries from day "
-        "aggregates. It is not trained on NBBO-mid IV surfaces.",
+        "proxy-Mamba uses daily close-trade-implied proxy surfaces and, for the hybrid "
+        "variant, a 31-step tensor with 19 daily steps plus 12 entry-day five-minute "
+        "trade-aggregate proxy bins. It is not trained on NBBO-mid IV surfaces.",
         "",
         "### Research Question",
         "",
         "The question is whether models improve trading decisions around option-implied "
-        "earnings event variance mispricing. The forecast target is realized event variance "
-        "`RVAR_event`. The market baseline is implied event variance `IVAR_event`. Ex post "
-        "mispricing is `RVAR_event - IVAR_event`. Trading decisions are evaluated in "
-        "premium space through proxy PnL and cost-aware edge, not by forecast error alone.",
+        "earnings event variance mispricing. The target system has three realized-variance "
+        "labels: `jump_c2o` is the primary scientific target for close-to-open earnings "
+        "jump variance; `day_c2c` is the literature-compatible target and the only V1 "
+        "proxy-PnL headline; `reaction_o2c` is a diagnostic target for post-open digestion. "
+        "The market baseline is implied event variance `IVAR_event`. C2C ex post "
+        "mispricing is `RVAR_event_day_c2c - IVAR_event`; C2O is reported as "
+        "forecast/ranking evidence plus post-open option-VWAP proxy diagnostics. Trading "
+        "decisions are evaluated in premium space through proxy PnL and cost-aware edge, "
+        "not by forecast error alone.",
+        "The unified option open anchor is same-contract option VWAP from 5 to 15 "
+        "minutes after the regular-session open. It is the primary C2O exit proxy "
+        "and the O2C realized-decomposition entry proxy; O2C is not a V1 "
+        "model-driven strategy headline because no post-open residual-IV baseline is "
+        "estimated.",
         "",
         "## Materials: Data",
         "",
@@ -2922,8 +3039,14 @@ def write_proxy_research_report(
         "- Universe: dynamic monthly top-50 liquid option underlyings within the available sample.",
         "- Timing: BMO and AMC only.",
         "- Entry proxy: Massive option second aggregates before the event cutoff.",
-        "- Exit proxy: same-contract option day-aggregate close on the exit date.",
-        "- Surface sequence: 20 trading days of close-trade-implied option-surface summaries.",
+        (
+            "- C2C exit proxy: same-contract option second aggregates over the "
+            "final 15 minutes before the exit-date close; option day-aggregate "
+            "close is fallback/diagnostic only."
+        ),
+        "- Daily sequence: 20 trading days of close-trade-implied option-surface summaries.",
+        "- Hybrid sequence: 31 steps, with 19 prior daily proxy-surface states and 12 "
+        "entry-day five-minute trade-aggregate proxy bins.",
         (
             f"- Sequence coverage: {sequence_report.get('eligible_events', 'NA')} "
             f"eligible events out of {sequence_report.get('total_events', 'NA')}; "
@@ -2949,13 +3072,13 @@ def write_proxy_research_report(
             "event-level features; GBDT models also receive sequence aggregates."
         ),
         (
-            f"- Sequence model: proxy-Mamba uses a 20 x {len(SEQUENCE_FEATURE_NAMES)} "
-            "tensor with time and feature masks; mask-only Mamba is the missingness "
-            "ablation."
+            f"- Sequence models: daily proxy-Mamba uses a 20 x {len(SEQUENCE_FEATURE_NAMES)} "
+            f"tensor; hybrid proxy-Mamba uses a 31 x {len(HYBRID_SEQUENCE_FEATURE_NAMES)} "
+            "mixed-clock tensor; intraday-only and mask-only variants are ablations."
         ),
         (
             "- proxy-Mamba loss: q=0.5 quantile loss on "
-            "`log(RVAR_event + forecast_floor)` with `forecast_floor=1e-6`."
+            "`log(target_rvar + forecast_floor)` with `forecast_floor=1e-6`."
         ),
         "- Full fit status and hyperparameter diagnostics are in Appendix B.",
         "",
@@ -2965,6 +3088,9 @@ def write_proxy_research_report(
         "",
         "#### Main Result Table",
         "",
+        "Forecast and ranking columns use the primary `jump_c2o` target. Strategy and "
+        "PnL columns use `day_c2c`, the only V1 proxy-PnL headline.",
+        "",
         _markdown_table(summary, "_No summary metrics written._"),
         "",
     ]
@@ -2972,21 +3098,22 @@ def write_proxy_research_report(
         lines,
         [
             (
-                f"{_label(best_oos[0])} has the best OOS R2 versus IVAR "
+                f"For `jump_c2o`, {_label(best_oos[0])} has the best OOS R2 versus IVAR "
                 f"({_fmt(best_oos[1])}), while {_label(best_mae[0])} has the lowest MAE "
                 f"({_fmt(best_mae[1])})."
                 if best_oos and best_mae
                 else "Forecast metrics were not available for model comparison."
             ),
             (
-                f"{_label(best_auc[0])} leads ranking quality with AUC {_fmt(best_auc[1])}; "
+                f"For `jump_c2o`, {_label(best_auc[0])} leads ranking quality with AUC "
+                f"{_fmt(best_auc[1])}; "
                 f"{_label(best_top_decile[0])} has top-decile precision "
                 f"{_fmt(best_top_decile[1], pct=True)}."
                 if best_auc and best_top_decile
                 else "Ranking metrics were not available for model comparison."
             ),
             (
-                f"{_label(best_net[0])} has the strongest proxy net PnL "
+                f"For `day_c2c`, {_label(best_net[0])} has the strongest proxy net PnL "
                 f"({_fmt(best_net[1], money=True)}), and {_label(best_return[0])} has the best "
                 f"return on premium ({_fmt(best_return[1], pct=True)})."
                 if best_net and best_return
@@ -3004,13 +3131,14 @@ def write_proxy_research_report(
         title="Forecast Performance",
         bullets=[
             (
-                f"Best variance-level forecast improvement is {_label(best_oos[0])} "
+                f"For `jump_c2o`, best variance-level forecast improvement is "
+                f"{_label(best_oos[0])} "
                 f"with OOS R2 {_fmt(best_oos[1])} versus IVAR."
                 if best_oos
                 else "Forecast comparison was unavailable."
             ),
             (
-                f"Best absolute-error model is {_label(best_mae[0])} with MAE "
+                f"For `jump_c2o`, best absolute-error model is {_label(best_mae[0])} with MAE "
                 f"{_fmt(best_mae[1])}; this is separate from ranking quality."
                 if best_mae
                 else "MAE comparison was unavailable."
@@ -3028,8 +3156,8 @@ def write_proxy_research_report(
         bullets=[
             ranking_winner_text,
             (
-                "This is the main sellable result: the task is not only level forecasting, "
-                "but sorting event-variance mispricing into tradable opportunities."
+                "This is the main sellable `jump_c2o` result: the task is not only level "
+                "forecasting, but sorting event-jump variance opportunities."
             ),
             (
                 "The deterministic IVAR baseline is intentionally neutral in ranking because "
@@ -3049,8 +3177,8 @@ def write_proxy_research_report(
                 else "Edge-decile monotonicity was unavailable."
             ),
             (
-                "A useful model should concentrate positive realized mispricing in high "
-                "predicted-edge deciles."
+                "For `jump_c2o`, a useful model should concentrate positive realized "
+                "jump-variance mispricing in high predicted-edge deciles."
             ),
             "This figure is closer to the paper's economic question than MAE alone.",
         ],
@@ -3061,17 +3189,54 @@ def write_proxy_research_report(
         title="Strategy PnL by Edge Decile",
         bullets=[
             (
-                f"{_label(best_net[0])} produces the best net proxy PnL in the current "
-                f"test sample ({_fmt(best_net[1], money=True)})."
+                f"For `day_c2c`, {_label(best_net[0])} produces the best net proxy PnL "
+                f"in the current test sample ({_fmt(best_net[1], money=True)})."
                 if best_net
                 else "Strategy PnL comparison was unavailable."
             ),
             (
-                "The strategy layer evaluates premium-space outcomes and proxy costs, which "
-                "is the intended target for selling the project."
+                "The strategy layer evaluates premium-space C2C outcomes and proxy costs, "
+                "which is the intended V1 economic target for selling the project."
+            ),
+            (
+                "O2C option PnL uses the same 5-15 minute open anchor as a realized "
+                "decomposition diagnostic, but it is not converted into an IVAR-based "
+                "strategy in V1."
             ),
             "These are still no-NBBO proxy economics, not paper-grade execution evidence.",
         ],
+    )
+    lines.extend(
+        [
+            "### C2O Post-Open Proxy PnL",
+            "",
+            (
+                "The primary C2O option proxy uses same-contract option VWAP from "
+                "5 to 15 minutes after the regular-session open. The 0 to 5 minute "
+                "VWAP is an opening-microstructure stress test, and the intrinsic-open "
+                "mark `abs(open_after - strike) * 100` remains a jump diagnostic only. "
+                "The same 5 to 15 minute option VWAP is also the O2C diagnostic entry "
+                "anchor for realized decomposition to the primary C2C exit mark. All "
+                "marks are no-NBBO trade-aggregate proxies, not executable NBBO PnL."
+            ),
+            "",
+            _markdown_table(
+                c2o_strategy_table,
+                "C2O post-open proxy PnL was unavailable.",
+            ),
+            "",
+            (
+                f"Best C2O 5-15 minute option-VWAP proxy net PnL is "
+                f"{_label(best_c2o_diag_net[0])} at {_fmt(best_c2o_diag_net[1], money=True)}."
+                if best_c2o_diag_net
+                else "C2O 5-15 minute option-VWAP proxy strategy metrics were unavailable."
+            ),
+            (
+                "Interpret the 5-15 minute mark as the V1 C2O trade-aggregate comparison "
+                "against C2C; the intrinsic mark is not an option-price exit."
+            ),
+            "",
+        ]
     )
     lines.extend(["### Other Results and Diagnostics", ""])
     _figure_block(
@@ -3080,8 +3245,8 @@ def write_proxy_research_report(
         title="Calibration",
         bullets=[
             (
-                "Calibration checks whether forecasted event variance is on the same scale as "
-                "realized event variance, not just correctly ranked."
+                "Calibration checks whether `jump_c2o` forecasted event-jump variance is on "
+                "the same scale as realized jump variance, not just correctly ranked."
             ),
             (
                 "The current proxy evidence is stronger for ranking than for perfectly "
@@ -3124,7 +3289,7 @@ def write_proxy_research_report(
         lines,
         [
             (
-                "The snapshot keeps the main tabular contenders and proxy-Mamba at "
+                "The snapshot keeps the main tabular contenders and hybrid proxy-Mamba at "
                 "multipliers 0, 1, 3, and 5."
             ),
             (
@@ -3157,11 +3322,12 @@ def write_proxy_research_report(
         lines,
         [
             (
-                f"proxy-Mamba AUC is {_fmt(mamba_auc)} versus mask-only AUC {_fmt(mask_auc)}; "
-                f"net PnL is {_fmt(mamba_net, money=True)} versus "
+                f"Hybrid proxy-Mamba `jump_c2o` AUC is {_fmt(mamba_auc)} versus mask-only "
+                f"AUC {_fmt(mask_auc)}; `day_c2c` net PnL is {_fmt(mamba_net, money=True)} versus "
                 f"{_fmt(mask_net, money=True)}."
             ),
-            "proxy-Mamba trains successfully, but it is not the headline model in this proxy run.",
+            "Daily, hybrid, intraday-only, and mask-only Mamba variants train successfully, "
+            "but they are not the headline models in this proxy run.",
             (
                 "The sequence result should be read as diagnostic because the sequence coverage "
                 "drop rate is above 10%."

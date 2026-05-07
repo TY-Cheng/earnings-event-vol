@@ -18,7 +18,7 @@ from earnings_event_vol.schemas import OptionRight
 from earnings_event_vol.trade_proxy import (
     TRADE_PROXY_PANEL_GRADE,
     filter_pre_cutoff_buffer,
-    select_latest_proxy_price,
+    select_preclose_entry_proxy_price,
 )
 
 MARKET_INDEX_SYMBOLS = ("SPY", "QQQ")
@@ -341,7 +341,7 @@ def market_index_surface_features(
     priced_rows: list[dict[str, object]] = []
     for record in candidates.to_dict("records"):
         option_ticker = str(record["options_ticker"])
-        selection = select_latest_proxy_price(
+        selection = select_preclose_entry_proxy_price(
             bar_frames.get(option_ticker, pd.DataFrame()),
             cutoff_timestamp=cutoff_timestamp,
             lookback_seconds=lookback_seconds,

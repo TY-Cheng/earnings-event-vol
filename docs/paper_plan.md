@@ -105,7 +105,7 @@ comparison.
 | --- | --- | --- |
 | [Patell & Wolfson (1981)](https://ideas.repec.org/a/bla/joares/v19y1981i2p434-458.html) | Earnings announcements in option and stock prices. | Establishes the pre/post-announcement uncertainty pattern. |
 | [Dubinsky, Johannes, Kaeck & Seeger (2019)](https://research.vu.nl/en/publications/option-pricing-of-earnings-announcement-risks/) | Option pricing with scheduled earnings jumps. | Supports extracting event variance separately instead of using `IV^2 * T`. |
-| [Barth & So (2014)](https://www.gsb.stanford.edu/faculty-research/publications/non-diversifiable-volatility-risk-risk-premiums-earnings) | Implied versus realized announcement volatility. | Closest risk-premium object: `IVAR_event - RVAR_event`. |
+| [Barth & So (2014)](https://www.gsb.stanford.edu/faculty-research/publications/non-diversifiable-volatility-risk-risk-premiums-earnings) | Implied versus realized announcement volatility. | Closest literature-compatible risk-premium object: `IVAR_event - RVAR_event_day_c2c`; this paper separately reports the `jump_c2o` forecast/ranking target. |
 | [Donders, Kouwenberg & Vorst (2000)](https://ideas.repec.org/a/bla/eufman/v6y2000i2p149-171.html) | Volume, open interest, and liquidity around earnings. | Motivates liquidity filters and cost sensitivity. |
 | [Gao, Xing & Zhang (2018)](https://www.cambridge.org/core/journals/journal-of-financial-and-quantitative-analysis/article/abs/anticipating-uncertainty-straddles-around-earnings-announcements/7B34877AD5E06304BA3C55FBA3219FDD) | ATM straddle returns around earnings. | Directly supports testing earnings volatility trades, with liquidity caveats. |
 | [Chung & Louis (2017)](https://pure.psu.edu/en/publications/earnings-announcements-and-option-returns/) | Before- and after-earnings straddle returns. | Supports the before-event long-volatility test and transaction-cost reporting. |
@@ -200,8 +200,9 @@ flowchart TB
     iv_proxy["Daily local IV proxy\nfrom options day-agg close trade price\nclose_trade_implied\nnot NBBO-mid IV"]
     ivar["Market baseline\nIVAR_event from two adjacent event-covering expiries\nfailure reasons: missing expiries, negative IVAR, nonmonotone variance"]
     second_buffer["Entry proxy bars\noption second aggregates only before cutoff\ndefault buffer: 60 minutes before cutoff\nentry lookback: final 900 seconds"]
-    entry_price["Entry price proxy\nlatest positive option_vwap\noption_close fallback\ntrade-price proxy only"]
-    exit_price["Exit mark\nsame-contract options day-agg close\nintrinsic fallback only if exit close missing or 0DTE"]
+    entry_price["Entry price proxy\ntrue per-leg 15-minute option_vwap\nvolume-weighted over final 900 seconds\ntrade-price proxy only"]
+    post_open_exit["Unified option open anchor\n5-15 minute post-open VWAP\nC2O exit proxy\nO2C diagnostic entry proxy\n0-5 minute VWAP = opening stress\nno NBBO claim"]
+    exit_price["C2C exit mark\nexit-date preclose 15-minute option VWAP\nno option day-close exit fallback\nintrinsic fallback only if mark missing or 0DTE"]
   end
 
   event_filter --> contract_discovery
@@ -215,6 +216,7 @@ flowchart TB
   opt_sec --> second_buffer
   entry_cutoff --> second_buffer
   second_buffer --> entry_price
+  entry_price --> post_open_exit
   ref_validation --> exit_price
   opt_day --> exit_price
   rvar --> ivar
@@ -269,7 +271,7 @@ flowchart TB
     long_straddle["Long ATM straddle\nused when event vol is predicted cheap"]
     short_iron_fly["Short iron fly\nused when event vol is predicted rich\nrisk-defined short-vol proxy"]
     cost_model["Proxy cost model\nproxy_cost_usd = 0.005 * entry_premium_usd\ncost multipliers: 0, 0.5, 1, 1.5, 2, 3, 5\nmultiplier 0 is diagnostic only"]
-    pnl["Proxy PnL\nentry from second bars\nexit from option day close\npaper_grade = false\npanel_grade = no_nbbo_trade_proxy"]
+    pnl["Proxy PnL\nentry from second bars\nC2C exit from exit preclose second bars\nno option day-close exit fallback\npaper_grade = false\npanel_grade = no_nbbo_trade_proxy"]
   end
 
   baseline_models --> forecasts
@@ -450,8 +452,11 @@ RVAR_cross_term = 2 * r_event_jump_c2o * r_event_reaction_o2c
 ```
 
 `RVAR_event_jump_c2o` is the primary scientific target. `RVAR_event_day_c2c`
-is the literature-compatible robustness target and the only V1 proxy-PnL target.
-`RVAR_event_reaction_o2c` is diagnostic.
+is the literature-compatible robustness target and the only V1 proxy-PnL
+headline. `RVAR_event_reaction_o2c` is diagnostic and uses the full regular
+session from the first vendor daily open after the announcement window to that
+day's close. Shorter post-open windows such as 30, 60, or 120 minutes are a
+future intraday extension that require post-open underlying and option marks.
 
 The implied event variance baseline uses total ATM implied variance:
 
@@ -664,10 +669,18 @@ Premium-space valuation:
 
 - Use deterministic quadrature under a zero-mean Gaussian event-return
   distribution with variance `forecast_RVAR_event_day_c2c`.
-- Proxy route entry prices use pre-cutoff option second aggregates.
-- Proxy route exit marks use same-contract option day-aggregate close when
-  available; intrinsic payoff is only a flagged fallback for missing exit close
-  or 0DTE expiry.
+- Proxy route C2C entry prices use pre-cutoff option second aggregates and true
+  per-leg VWAP over the final 15 minutes before cutoff.
+- The unified option open anchor is same-contract option VWAP from 5-15 minutes
+  after the regular-session open. C2O uses this as the primary post-open exit
+  proxy; O2C uses the same mark as the diagnostic post-open entry proxy.
+- Proxy route C2C exits use same-contract option VWAP over the final 15 minutes
+  before the exit-date close. Same-contract option day-aggregate close is not
+  used for strategy exits; intrinsic payoff is only a flagged fallback for a
+  missing trade-aggregate exit mark or 0DTE expiry.
+- O2C option PnL is a realized decomposition diagnostic in V1, not a
+  model-driven strategy headline, because the project does not yet estimate a
+  post-open residual-IV baseline.
 
 Proxy transaction-cost model:
 
