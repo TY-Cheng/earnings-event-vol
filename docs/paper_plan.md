@@ -3,435 +3,58 @@ hide:
   - navigation
 ---
 
-# Paper Plan
+# Manuscript Skeleton
 
 Working title:
 
-**Can Deep Learning Improve Earnings Volatility Trading? Evidence from U.S. Equity Options**
+**Can Machine Learning Improve Earnings Event-Variance Trading? Evidence from
+U.S. Equity Options**
 
-Technical title:
+This page is organized like a paper draft rather than a project plan. It keeps
+the current evidence conservative: the results are based on a
+`no_nbbo_trade_proxy` route and are not paper-grade executable trading results.
 
-**State-Selective Event Variance Forecasting for Earnings Options: A Mamba-Based Approach with Risk-Defined Backtests**
+## Abstract
 
-This document is organized as a paper-facing experimental design. It is not a
-generic implied-volatility forecasting plan. The central object is whether
-models improve tradable decisions around option-implied earnings event variance
-mispricing.
+This paper asks whether machine-learning models can improve trading decisions
+around option-implied earnings event variance mispricing. The object is not
+generic implied-volatility forecasting. Models forecast realized earnings-event
+variance, the market benchmark is option-implied event variance
+`IVAR_event`, and the tradable question is whether predicted mispricing improves
+premium-space trade selection after proxy transaction costs.
+
+The current study uses a SEC-first earnings calendar and Massive market-data
+proxy route for U.S. single-name equity options from 2022-12-01 through
+2025-12-31. The sample contains 810 BMO/AMC earnings events, of which 693 have a
+trade-proxy `IVAR_event`. The primary scientific target is close-to-open
+earnings jump variance (`jump_c2o`); the V1 proxy-PnL headline is
+close-to-close event variance (`day_c2c`); post-open digestion (`reaction_o2c`)
+is diagnostic.
+
+In the current proxy run, XGBoost has the strongest `jump_c2o` ranking result
+with AUC 0.781 and edge-decile Spearman 0.927. LightGBM produces the strongest
+`day_c2c` net proxy PnL, about 69,908 USD, followed by XGBoost at about
+68,344 USD. Daily and hybrid proxy-Mamba variants are implemented but are not
+headline results because sequence coverage has selection risk and current
+economic performance is weak. The defensible conclusion is that nonlinear
+tabular models show preliminary cross-sectional ranking signal for earnings
+event-variance mispricing in a no-NBBO proxy sample. Paper-grade claims require
+historical quote/NBBO or equivalent data, quote-based IVAR, and leg-level
+execution with realistic bid/ask crossing.
 
 ## 1. Introduction
 
-### 1.1 Core Question
+Earnings announcements create scheduled jumps in uncertainty. Option prices
+embed a market forecast of this event variance, but the central empirical
+question is whether observable pre-event state and option-surface information
+can improve the cross-sectional ranking of event variance mispricing.
 
 The paper asks:
 
-> Can machine-learning models improve the cross-sectional ranking of
-> option-implied earnings event variance mispricing, and does that improvement
-> survive realistic proxy transaction costs?
+> Can models improve trading decisions around option-implied earnings event
+> variance mispricing?
 
-The primary scientific forecast target is close-to-open realized jump variance:
-
-```text
-RVAR_event_jump_c2o = log(open_after / close_before)^2
-```
-
-The literature-compatible and V1 proxy-PnL target remains close-to-close:
-
-```text
-RVAR_event_day_c2c = log(close_after / close_before)^2
-rvar_event = RVAR_event_day_c2c
-```
-
-The post-open digestion diagnostic is:
-
-```text
-RVAR_event_reaction_o2c = log(close_after / open_after)^2
-```
-
-The market baseline is option-implied event variance:
-
-```text
-IVAR_event
-```
-
-The ex post C2C mispricing label is:
-
-```text
-RVAR_event_day_c2c - IVAR_event
-```
-
-The strategy layer is evaluated in premium space:
-
-```text
-expected_strategy_edge_usd
-  = expected_strategy_value_usd - market_entry_cost_usd
-```
-
-The first entry rule is:
-
-```text
-expected_strategy_edge_usd > 1.5 * estimated_transaction_cost_usd
-```
-
-Forecast error is therefore supportive evidence. The paper-facing result is
-whether a model improves ranking, edge selection, and net proxy performance in
-the tradable tail.
-
-### 1.2 Contribution
-
-The contribution is not "Mamba predicts IV better." The intended contribution is:
-
-> State-dependent pre-earnings option-surface dynamics may contain incremental
-> information about event variance mispricing beyond market-implied event
-> variance, historical earnings moves, and GBDT tabular baselines.
-
-The interpretation is outcome-dependent:
-
-- If Mamba wins, pre-event sequence dynamics matter.
-- If LightGBM wins, event-level nonlinear tabular interactions are enough.
-- If IVAR wins after costs, the evidence is consistent with a hard-to-beat
-  earnings option market under realistic frictions.
-- If gains appear only in thin liquidity buckets, the result is not yet
-  paper-grade execution evidence.
-
-### 1.3 Literature Review and Positioning
-
-The paper sits at the intersection of earnings-announcement option pricing,
-event-volatility trading, option-return predictability, and modern model
-comparison.
-
-**Earnings option and event-volatility literature**
-
-| Study | Object | Main implication for this paper |
-| --- | --- | --- |
-| [Patell & Wolfson (1981)](https://ideas.repec.org/a/bla/joares/v19y1981i2p434-458.html) | Earnings announcements in option and stock prices. | Establishes the pre/post-announcement uncertainty pattern. |
-| [Dubinsky, Johannes, Kaeck & Seeger (2019)](https://research.vu.nl/en/publications/option-pricing-of-earnings-announcement-risks/) | Option pricing with scheduled earnings jumps. | Supports extracting event variance separately instead of using `IV^2 * T`. |
-| [Barth & So (2014)](https://www.gsb.stanford.edu/faculty-research/publications/non-diversifiable-volatility-risk-risk-premiums-earnings) | Implied versus realized announcement volatility. | Closest literature-compatible risk-premium object: `IVAR_event - RVAR_event_day_c2c`; this paper separately reports the `jump_c2o` forecast/ranking target. |
-| [Donders, Kouwenberg & Vorst (2000)](https://ideas.repec.org/a/bla/eufman/v6y2000i2p149-171.html) | Volume, open interest, and liquidity around earnings. | Motivates liquidity filters and cost sensitivity. |
-| [Gao, Xing & Zhang (2018)](https://www.cambridge.org/core/journals/journal-of-financial-and-quantitative-analysis/article/abs/anticipating-uncertainty-straddles-around-earnings-announcements/7B34877AD5E06304BA3C55FBA3219FDD) | ATM straddle returns around earnings. | Directly supports testing earnings volatility trades, with liquidity caveats. |
-| [Chung & Louis (2017)](https://pure.psu.edu/en/publications/earnings-announcements-and-option-returns/) | Before- and after-earnings straddle returns. | Supports the before-event long-volatility test and transaction-cost reporting. |
-| [Alexiou, Goyal, Kostakis & Rompolis (2025)](https://revfin.org/pricing-event-risk-evidence-from-concave-implied-volatility-curves/) | Concave short-term IV curves around event risk. | Supports butterfly/concavity as an incremental event-risk feature. |
-| [Goyal & Saretto (2009)](https://doi.org/10.1016/j.jfineco.2009.01.001) | Cross-section of option returns and RV-IV spreads. | Provides a required classical option-mispricing benchmark. |
-| [Chen, Gan & Vasquez (2023)](https://www.sciencedirect.com/science/article/pii/S0378426622003351) | Straddle decomposition into volatility and jump components. | Closely related to the event-jump component, but not an ML ranking test. |
-
-**ML, surface, and sequence-modeling literature**
-
-| Study | Object | Main implication for this paper |
-| --- | --- | --- |
-| [Hutchinson, Lo & Poggio (1994)](https://web.mit.edu/Alo/www/Papers/hutchinson-etal-94.html) | Neural networks for derivative pricing and hedging. | Early precedent for ML in option pricing, not an event-mispricing test. |
-| [Horvath, Muguruza & Tomas (2021)](https://portal.fis.tum.de/en/publications/deep-learning-volatility-a-deep-neural-network-perspective-on-pri/) | Deep-learning volatility surfaces for pricing/calibration. | Supports structured surface inputs, but the objective differs. |
-| [Gu, Kelly & Xiu (2020)](https://academic.oup.com/rfs/article/33/5/2223/5758276) | Empirical asset pricing with ML. | Sets the evaluation discipline: out-of-sample and economic value. |
-| [Borochin & Zhao (2025)](https://ideas.repec.org/a/eee/empfin/v82y2025ics0927539825000404.html) | Economic value of equity IV forecasting with ML. | Closest ML/economic-value comparator, but not earnings-event variance. |
-| [Hoefler (2024)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4869272) | Volatility surfaces and expected option returns. | Supports the idea that surface shape can forecast option returns. |
-| [Gorishniy et al. (2021)](https://proceedings.neurips.cc/paper/2021/hash/9d86d83f925f2149e9edb0ac3b49229c-Abstract.html) | Deep learning for tabular data. | Justifies FT-Transformer and requires GBDT comparisons. |
-| [Gu & Dao (2024)](https://openreview.net/forum?id=AL1fq05o7H) | Mamba selective state-space sequence model. | Provides architecture rationale for pre-earnings path encoding. |
-
-The positioning statement is:
-
-> Unlike prior work that documents average earnings straddle returns or
-> estimates announcement risk premia, this paper tests whether models improve
-> the cross-sectional ranking of option-implied event variance mispricing in the
-> tradable tail after costs.
-
-See Appendix A for the full citation table and Appendix B for the protocol
-mapping from each paper to implementation choices.
-
-## 2. Materials and Methods
-
-### 2.0 Full Pipeline Map
-
-This diagram is the paper workflow in one place. It separates official event
-data from vendor market data, shows which data frequency is used where, and
-keeps the proxy execution caveat visible.
-
-```mermaid
-flowchart TB
-  %% Inputs
-  subgraph raw["Raw inputs"]
-    sec["SEC EDGAR filings\n8-K / 8-K/A Item 2.02\nacceptance timestamp\nprimary filing document text"]
-    sec_meta["SEC company ticker metadata\ncommon-equity eligibility\nexclude ETF / index / fund / trust"]
-    opt_day["Massive options day aggregates\ndaily trade OHLCV by option contract"]
-    stock_day["Massive underlying day aggregates\ndaily OHLCV by stock"]
-    opt_ref["Massive option reference\n/v3/reference/options/contracts\nshares_per_contract\nadditional_underlyings\nexercise_style\ncorrection"]
-    opt_sec["Massive option second aggregates\nrange/1/second\ntrade OHLCV bars\nnot quote, not bid/ask, not NBBO"]
-    index_sec["SPY / QQQ second aggregates when available\noptions and underlying\nentry-as-of market controls"]
-    fred["FRED VIXCLS\ndaily VIX close\nprior-close aligned"]
-  end
-
-  %% Universe and event calendar
-  subgraph universe_calendar["Universe and earnings calendar"]
-    equity_filter["Eligible single-name universe filter\nNYSE / NASDAQ common-equity-like tickers\nremove SPY, QQQ, IWM, VIX, GLD, SPX, SPXW"]
-    liquidity["Monthly liquidity table\noption_premium_dollar_volume\n= option price * volume * 100\nVWAP if available, close fallback"]
-    top50["Dynamic monthly top 50\ntrailing six-month option premium dollar volume\ncurrent month excluded"]
-    sec_calendar["SEC-first event calendar\ncandidate discovery from Item 2.02\nvalidation from SEC primary document text\nMassive text only auxiliary"]
-    event_filter["Main event filters\nBMO / AMC only\nDMH and unknown timing excluded\nlatest prior universe month membership"]
-  end
-
-  sec_meta --> equity_filter
-  opt_day --> liquidity
-  equity_filter --> top50
-  liquidity --> top50
-  top50 --> sec_calendar
-  sec --> sec_calendar
-  sec_calendar --> event_filter
-
-  %% Event alignment
-  subgraph alignment["Event timing and target construction"]
-    bmo["BMO event on date d\nentry uses close d-1\nclose_before = close d-1\nopen_after = open d\nclose_after = close d"]
-    amc["AMC event on date d\nentry uses close d\nclose_before = close d\nopen_after = open d+1\nclose_after = close d+1"]
-    entry_cutoff["event_entry_timestamp\nresolved market close\nhandles early close days"]
-    rvar["Target decomposition\njump C2O primary\nC2C proxy PnL target\nO2C diagnostic"]
-    leak_gate["Leakage gate\nfeature_asof_timestamp <= event_entry_timestamp\nno exit date or post-event bars"]
-  end
-
-  event_filter --> bmo
-  event_filter --> amc
-  stock_day --> bmo
-  stock_day --> amc
-  bmo --> entry_cutoff
-  amc --> entry_cutoff
-  bmo --> rvar
-  amc --> rvar
-  entry_cutoff --> leak_gate
-
-  %% Contract and IV construction
-  subgraph contract_iv["Contracts, IVAR, and proxy entry prices"]
-    contract_discovery["Candidate option contracts\nDTE discovery 3-21\nmain flag 5-14\nmust cover event window"]
-    ref_validation["Contract reference validation\noverride multiplier / contract_size / deliverable_status\nnon-100 or adjusted deliverable -> non_standard_excluded\nfetch failure -> manifest diagnostic"]
-    iv_proxy["Daily local IV proxy\nfrom options day-agg close trade price\nclose_trade_implied\nnot NBBO-mid IV"]
-    ivar["Market baseline\nIVAR_event from two adjacent event-covering expiries\nfailure reasons: missing expiries, negative IVAR, nonmonotone variance"]
-    second_buffer["Entry proxy bars\noption second aggregates only before cutoff\ndefault buffer: 60 minutes before cutoff\nentry lookback: final 900 seconds"]
-    entry_price["Entry price proxy\ntrue per-leg 15-minute option_vwap\nvolume-weighted over final 900 seconds\ntrade-price proxy only"]
-    post_open_exit["Unified option open anchor\n5-15 minute post-open VWAP\nC2O exit proxy\nO2C diagnostic entry proxy\n0-5 minute VWAP = opening stress\nno NBBO claim"]
-    exit_price["C2C exit mark\nexit-date preclose 15-minute option VWAP\nno option day-close exit fallback\nintrinsic fallback only if mark missing or 0DTE"]
-  end
-
-  event_filter --> contract_discovery
-  opt_day --> contract_discovery
-  opt_ref --> ref_validation
-  contract_discovery --> ref_validation
-  ref_validation --> iv_proxy
-  opt_day --> iv_proxy
-  iv_proxy --> ivar
-  ref_validation --> second_buffer
-  opt_sec --> second_buffer
-  entry_cutoff --> second_buffer
-  second_buffer --> entry_price
-  entry_price --> post_open_exit
-  ref_validation --> exit_price
-  opt_day --> exit_price
-  rvar --> ivar
-
-  %% Feature engineering
-  subgraph features["Feature engineering"]
-    event_features["Event-level feature matrix\nIVAR_event\nATM IV / term spread / skew / butterfly\noption activity\nRV5 / RV20 / RV60\nlast-four earnings history\nBMO/AMC flag\nuniverse rank and liquidity bucket"]
-    daily_sequence["20-day daily sequence\nseq_t00 oldest allowed day\nseq_t19 latest allowed day\nsingle-name daily option-surface summaries\nunderlying return and RV5\nVIX daily state\nSPY / QQQ daily controls if available"]
-    hybrid_sequence["31-step hybrid proxy sequence\n19 prior daily steps\n12 entry-day 5-min bins\ntrade aggregate proxy surface\nmixed-clock time features"]
-    market_second["Availability-gated entry-as-of market controls\nSPY / QQQ ATM IV proxy\nterm slope\nskew / butterfly\nstraddle premium / spot\noption volume / transactions\nunderlying pre-cutoff return"]
-    vix_features["VIX features\nresolved_vix_date before feature_asof_date\nvix_level, 1d change, 5d change\n252d percentile, tercile regime, above 30 flag"]
-  end
-
-  ivar --> event_features
-  rvar --> event_features
-  stock_day --> event_features
-  ref_validation --> event_features
-  opt_day --> daily_sequence
-  stock_day --> daily_sequence
-  daily_sequence --> hybrid_sequence
-  opt_sec --> hybrid_sequence
-  entry_cutoff --> hybrid_sequence
-  fred --> vix_features
-  vix_features --> event_features
-  vix_features --> daily_sequence
-  index_sec --> market_second
-  entry_cutoff --> market_second
-  market_second --> event_features
-
-  %% Splits and model inputs
-  subgraph splits_models["Splits and models"]
-    split_now["Current proxy split\nchronological event-level 70 / 15 / 15\nsplit unit = event_id\nno random split\nsame event never crosses splits"]
-    split_later["Final paper robustness when longer data exists\nrolling walk-forward\ntrain 5y, validate 1y, test 1y\npurge same-ticker adjacent leakage"]
-    baseline_models["Deterministic baselines\nIVAR market baseline\nlast-four RVAR\nlast-four IVAR\nGoyal-Saretto RV-IV spread\nPatell-Wolfson diagnostics"]
-    tabular_models["Tabular models\nElastic Net\nLightGBM\nXGBoost optional\nFT-Transformer V1"]
-    mamba_models["Sequence models\ndaily proxy-Mamba\nhybrid proxy-Mamba\nintraday-only ablation\nmask-only hybrid ablation\nnot NBBO-mid surface"]
-  end
-
-  event_features --> split_now
-  daily_sequence --> split_now
-  hybrid_sequence --> split_now
-  split_now --> baseline_models
-  split_now --> tabular_models
-  split_now --> mamba_models
-  split_now -. future paper check .-> split_later
-
-  %% Forecast to trade decision
-  subgraph backtest["Backtest logic and strategy assumptions"]
-    forecasts["Model output by target_id\nforecast jump C2O\nforecast day C2C\nforecast reaction O2C\npositive floor = 1e-6"]
-    var_edge["C2C variance edge\nforecast day C2C - IVAR_event\nused for tradable ranking and diagnostics\nC2O ranking is scientific not PnL"]
-    premium_edge["Premium-space edge\nexpected_strategy_value_usd - market_entry_cost_usd\nthis drives trade selection"]
-    long_straddle["Long ATM straddle\nused when event vol is predicted cheap"]
-    short_iron_fly["Short iron fly\nused when event vol is predicted rich\nrisk-defined short-vol proxy"]
-    cost_model["Proxy cost model\nproxy_cost_usd = 0.005 * entry_premium_usd\ncost multipliers: 0, 0.5, 1, 1.5, 2, 3, 5\nmultiplier 0 is diagnostic only"]
-    pnl["Proxy PnL\nentry from second bars\nC2C exit from exit preclose second bars\nno option day-close exit fallback\npaper_grade = false\npanel_grade = no_nbbo_trade_proxy"]
-  end
-
-  baseline_models --> forecasts
-  tabular_models --> forecasts
-  mamba_models --> forecasts
-  forecasts --> var_edge
-  ivar --> var_edge
-  forecasts --> premium_edge
-  entry_price --> premium_edge
-  premium_edge --> long_straddle
-  premium_edge --> short_iron_fly
-  cost_model --> premium_edge
-  long_straddle --> pnl
-  short_iron_fly --> pnl
-  entry_price --> pnl
-  exit_price --> pnl
-
-  %% Evaluation
-  subgraph evaluation["Evaluation outputs"]
-    forecast_metrics["Forecast metrics\nMAE\nRMSE\nQLIKE\nOOS R2 vs IVAR"]
-    ranking_metrics["Ranking and mispricing metrics\ntop-decile precision\nAUC and Brier for direction\ncalibration\nedge-decile monotonicity"]
-    strategy_metrics["Strategy metrics\ngross and net proxy PnL\nreturn on premium / capital\nSharpe / Sortino\nmax drawdown\nhit rate\naverage win / loss\ncost sensitivity"]
-    robustness["Breakdowns and inference\nDTE 5-14 vs 3-21\nBMO vs AMC\nliquidity buckets\nticker, year, regime\npaired loss differential\nclustered SE\nblock bootstrap"]
-    outputs["Paper outputs\ntables\nfigures\nproxy_research_report.md\nResults Snapshot"]
-  end
-
-  forecasts --> forecast_metrics
-  var_edge --> ranking_metrics
-  pnl --> strategy_metrics
-  forecast_metrics --> outputs
-  ranking_metrics --> outputs
-  strategy_metrics --> outputs
-  robustness --> outputs
-  split_now --> robustness
-  vix_features --> robustness
-```
-
-### 2.1 Data Sources
-
-The current proxy route uses official sources for event discovery and vendor
-market data for prices:
-
-- **SEC EDGAR** is the primary earnings-event source. The pipeline discovers
-  8-K / 8-K/A Item 2.02 candidates, uses SEC acceptance timestamps as an
-  auditable timing proxy, and validates filing text from SEC primary documents.
-- **Massive 8-K text** is auxiliary only. It can help when SEC document text is
-  unavailable or inconclusive, but it is not required for the calendar chain.
-- **Massive options day aggregates** support universe liquidity ranking,
-  contract discovery, local IV proxy inputs, same-contract exit option close,
-  and 20-day close-trade-implied option-surface sequences.
-- **Massive option contract reference metadata** validates selected candidate
-  contracts before entry-price fetching. The pipeline reads
-  `shares_per_contract`, `additional_underlyings`, `exercise_style`, and
-  `correction` from `/v3/reference/options/contracts`; non-100 or adjusted
-  deliverables are excluded from proxy trading rows.
-- **Massive underlying day aggregates** support underlying closes, vendor OHLC
-  opens, C2O/C2C/O2C event returns, exit spot, and daily market-return controls.
-- **Massive option one-second aggregates** support targeted pre-cutoff entry
-  proxy prices, availability-gated SPY/QQQ market-state controls, and the entry-day
-  intraday trade-aggregate proxy sequence.
-- **FRED VIXCLS** supplies daily VIX state and regime controls.
-
-All trade-proxy market outputs are labeled `no_nbbo_trade_proxy`. They are trade
-OHLCV aggregates, not quote, bid/ask, or NBBO records. Full paper-grade
-execution claims require a later quote/NBBO route.
-
-### 2.2 Study Sample and Universe
-
-Target paper sample:
-
-- U.S. single-name option underlyings.
-- Dynamic monthly top 50 by trailing six-month option premium dollar volume.
-- 2013-2025 target range.
-- BMO and AMC earnings only.
-- Main event-expiry DTE: 5-14.
-- Robustness DTE: 3-21.
-- DMH and unknown timing excluded.
-
-Runnable current proxy sample:
-
-- The observed Massive option day-agg entitlement in this workspace begins on
-  2022-05-04.
-- The active default therefore runs 2022-12-01 through 2025-12-31, using the
-  six-month lookback needed for the December 2022 universe.
-- The 2013-2025 paper target requires upgraded historical options entitlement
-  or another licensed historical options data route.
-
-Universe construction:
-
-```text
-option_premium_dollar_volume = option_price * contract_volume * 100
-```
-
-`option_price` uses VWAP when available and close as fallback. The universe
-filter first removes ETF, index, volatility, commodity trust, ETN, fund, and
-other non-single-name-like symbols using SEC company ticker metadata. SPY, QQQ,
-IWM, VIX, GLD, SPX, and SPXW cannot consume single-name universe slots, though
-SPY/QQQ are excluded from single-name universe slots but are used as
-availability-gated market controls when present in the current data lake.
-
-Appendix C will report universe membership, turnover, excluded tickers, and
-monthly liquidity distributions.
-
-### 2.3 Event Alignment and Preprocessing
-
-Timestamp alignment is a hard gate. Every feature row must satisfy:
-
-```text
-feature_asof_timestamp <= event_entry_timestamp
-```
-
-AMC events:
-
-- Entry is before regular-session close on announcement date `d`.
-- `close_before = close_d`.
-- `open_after = open_{d+1}`.
-- `close_after = close_{d+1}`.
-- Primary jump move is `log(open_{d+1} / close_d)`.
-- C2C robustness/PnL move is `log(close_{d+1} / close_d)`.
-
-BMO events:
-
-- Entry is before regular-session close on `d-1`.
-- `close_before = close_{d-1}`.
-- `open_after = open_d`.
-- `close_after = close_d`.
-- Primary jump move is `log(open_d / close_{d-1})`.
-- C2C robustness/PnL move is `log(close_d / close_{d-1})`.
-
-SEC acceptance time is regulatory metadata, not necessarily the company's first
-public release timestamp. The feature is named
-`hours_until_announcement_proxy`, not verified announcement lead time.
-Ambiguous events stay outside the main sample.
-
-Mechanical filters:
-
-```text
-S_t > 5
-positive option price
-paired call/put availability
-option_multiplier == 100
-contract_size == 100
-deliverable_status == standard
-main sample: 5 <= event_expiry_DTE <= 14
-robustness: 3 <= event_expiry_DTE <= 21
-```
-
-The `contract-reference-validation` stage runs after candidate discovery and
-before second-aggregate entry fetching. When reference metadata is available it
-overrides the day-agg placeholder multiplier and deliverable fields. Fetch
-failures are written to the manifest as diagnostics; they do not promote any
-contract to paper-grade status and do not change the `no_nbbo_trade_proxy`
-limitation.
-
-Appendix D will tabulate exclusions by reason, ticker, year, VIX regime, and
-BMO/AMC timing.
-
-### 2.4 Target and Market Baseline Construction
-
-The target system is:
+The realized-variance target system is:
 
 ```text
 RVAR_event_jump_c2o     = log(open_after / close_before)^2
@@ -439,404 +62,412 @@ RVAR_event_day_c2c      = log(close_after / close_before)^2
 RVAR_event_reaction_o2c = log(close_after / open_after)^2
 ```
 
-The exact return identity is:
+The market baseline is:
 
 ```text
-r_event_day_c2c = r_event_jump_c2o + r_event_reaction_o2c
+IVAR_event
 ```
 
-Variance reconstruction must include:
+The V1 tradable mispricing label is:
 
 ```text
-RVAR_cross_term = 2 * r_event_jump_c2o * r_event_reaction_o2c
+RVAR_event_day_c2c - IVAR_event
 ```
 
-`RVAR_event_jump_c2o` is the primary scientific target. `RVAR_event_day_c2c`
-is the literature-compatible robustness target and the only V1 proxy-PnL
-headline. `RVAR_event_reaction_o2c` is diagnostic and uses the full regular
-session from the first vendor daily open after the announcement window to that
-day's close. Shorter post-open windows such as 30, 60, or 120 minutes are a
-future intraday extension that require post-open underlying and option marks.
+The trade rule is evaluated in premium space:
 
-The implied event variance baseline uses total ATM implied variance:
+```text
+expected_strategy_edge_usd
+  = expected_strategy_value_usd - market_entry_cost_usd
+```
+
+Forecast error is therefore only supporting evidence. The paper-facing result is
+whether a model improves ranking, edge selection, and proxy net performance in
+the tradable tail.
+
+### Contribution
+
+The contribution is not "Mamba predicts IV better." The intended contribution is
+narrower:
+
+> State and event-history features contain preliminary cross-sectional signal
+> for earnings event-variance mispricing beyond market-implied IVAR and simple
+> historical baselines.
+
+The model comparison is outcome-dependent. If Mamba wins, pre-event sequence
+dynamics matter. If LightGBM/XGBoost win, event-level nonlinear tabular
+interactions are sufficient for the current proxy data. If IVAR wins after
+costs, the evidence supports a hard-to-beat earnings option market. The current
+proxy result favors the tabular nonlinear interpretation, not a deep-sequence
+headline.
+
+### Related Literature and Positioning
+
+| Literature stream | Closest role in this paper |
+| --- | --- |
+| Earnings option pricing and scheduled jumps | Motivates separating event variance from total short-dated variance. |
+| Earnings straddle-return studies | Motivates testing whether predicted event variance mispricing maps into option strategy returns. |
+| RV-IV spread and option-return predictability | Provides required classical benchmarks, including Goyal-Saretto-style spread signals. |
+| Empirical asset pricing with ML | Sets the discipline: out-of-sample ranking and economic value matter more than in-sample fit. |
+| Surface and sequence models | Motivates FT-Transformer and proxy-Mamba comparisons, but only after strong tabular baselines. |
+
+The paper differs from average-return earnings straddle studies by asking
+whether models sort events by expected event variance mispricing and whether
+that sorting survives proxy costs.
+
+## 2. Data
+
+### 2.1 Sources and Execution Grade
+
+The current data route uses official SEC filings for event identification and
+Massive market-data proxies for prices:
+
+- SEC EDGAR 8-K / 8-K/A Item 2.02 filings and SEC primary-document text
+  validation.
+- SEC company ticker metadata for eligible common-equity-like single-name
+  underlyings.
+- Massive options day aggregates for universe liquidity ranking, contract
+  discovery, close-trade-implied IV proxies, and daily sequence features.
+- Massive option contract reference metadata for multiplier and deliverable
+  validation.
+- Massive underlying day aggregates for event returns and vendor OHLC opens.
+- Massive option one-second aggregates for entry prices, C2C exit marks, and
+  C2O/O2C post-open diagnostic marks.
+- FRED VIXCLS for prior-close daily market-state controls.
+
+All current option second aggregates are trade OHLCV bars. They are not quote
+midpoints, bid/ask records, OPRA, or NBBO. The current panel grade is
+`no_nbbo_trade_proxy`; `paper_grade=false`.
+
+### 2.2 Sample and Universe
+
+The active proxy run covers 2022-12-01 through 2025-12-31. The target paper
+range remains 2013-2025, but that requires upgraded historical option data or a
+separate licensed route.
+
+The single-name universe is dynamic. Each month, the pipeline ranks eligible
+underlyings by trailing six-month option premium dollar volume:
+
+```text
+option_premium_dollar_volume = option_price * contract_volume * 100
+```
+
+ETF, fund, trust, ETN, index, volatility, commodity, and other non-single-name
+symbols are excluded before the top-50 ranking. BMO and AMC events are retained;
+DMH and unknown timing are excluded from the main sample.
+
+### 2.3 Current Data Coverage
+
+| Measure | Value |
+| --- | ---: |
+| Dynamic-calendar rows | 1,054 |
+| BMO/AMC main-sample candidates | 810 |
+| Trade-proxy event-panel rows | 810 |
+| Events with C2C `rvar_event` alias | 801 |
+| Events with trade-proxy `IVAR_event` | 693 |
+| Proxy contract candidates | 12,038 |
+| Contracts with usable pre-cutoff proxy price | 10,165 |
+| Contracts with no trade in cutoff window | 1,873 |
+| Contracts with local IV proxy | 10,138 |
+| Main DTE 5-14 contracts | 5,098 |
+| Robustness DTE 3-21 contracts | 12,038 |
+| Proxy straddle diagnostic rows | 779 |
+
+IVAR failure diagnostics:
+
+| Failure reason | Events |
+| --- | ---: |
+| No two event-covering expiries | 103 |
+| Nonmonotone total variance | 7 |
+| Negative extracted IVAR | 7 |
+
+The event panel is large enough for proxy-stage model comparison, but IVAR
+coverage is still a material screen: 117 of 810 events lack a usable
+trade-proxy IVAR.
+
+## 3. Methods
+
+### 3.1 Pipeline
+
+The pipeline separates event discovery, market-data construction, feature
+engineering, model training, and proxy backtesting. The diagram keeps the
+execution caveat explicit: current prices are trade-aggregate proxies.
+
+```mermaid
+flowchart TB
+  sec["SEC EDGAR 8-K Item 2.02\nprimary filing text"] --> cal["BMO/AMC event calendar"]
+  secmeta["SEC company ticker metadata"] --> universe["Eligible monthly top-50\nsingle-name option universe"]
+  optday["Massive option day aggregates"] --> universe
+  universe --> cal
+  cal --> align["Event alignment\nBMO/AMC entry timestamps"]
+  stockday["Underlying day aggregates"] --> targets["C2O/C2C/O2C targets"]
+  align --> targets
+  optref["Option reference metadata"] --> contracts["Standard contract validation"]
+  optday --> contracts
+  contracts --> ivar["IVAR_event\n2-expiry event variance extraction"]
+  optsec["Option one-second trade aggregates\nnot quote, not NBBO"] --> entry["Pre-cutoff entry VWAP"]
+  optsec --> exit["C2C exit preclose VWAP\nC2O/O2C post-open VWAP diagnostics"]
+  ivar --> features["Feature matrix and sequences"]
+  targets --> features
+  entry --> features
+  features --> models["Benchmarks, tabular models,\nFT-Transformer, proxy-Mamba"]
+  models --> metrics["Forecast, ranking,\nproxy strategy metrics"]
+  exit --> metrics
+  metrics --> docs["Tables, figures,\nproxy report, docs"]
+```
+
+### 3.2 Event Alignment and Leakage Control
+
+Feature construction uses a hard as-of gate:
+
+```text
+feature_asof_timestamp <= event_entry_timestamp
+```
+
+AMC events enter before the announcement-date close. BMO events enter before the
+previous trading-day close. Vendor daily OHLC opens are used for C2O target
+construction and labeled as vendor regular OHLC assumptions, not verified
+auction prints.
+
+### 3.3 IVAR Construction
+
+For two event-covering expiries, total ATM implied variance is:
 
 ```text
 w(T) = sigma_ATM(T)^2 * T
 ```
 
-For two expiries that both cover the earnings event:
+The implied event variance is extracted as:
 
 ```text
-w1 = d*T1 + v_e
-w2 = d*T2 + v_e
 IVAR_event = (T2*w1 - T1*w2) / (T2 - T1)
 ```
 
-`T_j` follows the IV source's year-fraction convention. The proxy route uses
-ACT/365 unless vendor documentation requires otherwise. Negative or nonmonotone
-event-variance extraction is excluded from tradable samples and reported as an
-extraction failure.
-
-ATM selection:
-
-- Prefer ATMF when a liquid near-ATM call/put pair supports a put-call-parity
-  implied forward.
-- Treat parity forward as an approximation for short-DTE U.S. single-name
-  American options.
-- Fall back to nearest-spot ATM when parity is weak, dividend-contaminated, or
-  unavailable.
-
-Appendix E will list IVAR failures with selected expiries, DTEs, IVs, total
-variances, and failure reasons.
-
-### 2.5 Feature Engineering
-
-Event-level features:
-
-- `IVAR_event`.
-- ATM IV for event and adjacent expiries.
-- Term spread.
-- Skew and butterfly/concavity proxies.
-- Option volume and transaction activity.
-- RV5/RV20/RV60.
-- Prior earnings move and last-four earnings statistics.
-- BMO/AMC timing.
-- Liquidity bucket and universe rank.
-- Daily VIX state and VIX regime.
-- SPY/QQQ second-level entry controls when available in the data lake.
-
-VIX features:
-
-- Source: public FRED `VIXCLS` graph CSV.
-- Bronze raw: `data/bronze/market_covariates/fred_vixcls.csv`.
-- Silver normalized:
-  `data/silver/market_covariates/daily_market_covariates.parquet`.
-- Headline alignment: `vix_alignment = prior_close_default`.
-- Both BMO and AMC require `vix_date < feature_asof_date`.
-- `max_vix_lag_days = 5`.
-
-VIX changes use valid-observation lags:
-
-```text
-vix_change_1d = VIX(resolved_vix_date) - VIX(previous valid VIX date)
-vix_change_5d = VIX(resolved_vix_date) - VIX(5th previous valid VIX observation)
-```
-
-Rolling VIX percentile/regime uses only observations with
-`vix_date < resolved_vix_date`. The fixed flag `vix_above_30` uses the resolved
-VIX level directly.
-
-Sequence features:
-
-- The daily Mamba path is daily-frequency.
-- Each event has up to 20 pre-entry trading-day timesteps.
-- `seq_t00` is the oldest allowed day.
-- `seq_t19` is the latest allowed day.
-- Daily states include single-name close-trade-implied option-surface summaries,
-  underlying RV/return, SPY/QQQ daily returns, SPY/QQQ daily surface summaries
-  when available, and daily VIX features.
-- The hybrid Mamba path adds a 31-step mixed-frequency tensor: 19 prior daily
-  steps plus 12 entry-day five-minute bins from cutoff minus 60 minutes through
-  cutoff.
-- Hybrid rows include `step_type`, `is_intraday_bin`,
-  `log_delta_minutes_from_prev_step`, `normalized_time_to_entry`,
-  `hours_until_announcement_proxy`, and `iv_extraction_source`.
-- The final 30 minutes may contain MOC, benchmark, and closing-auction
-  microstructure; this is a report caveat and robustness target.
-
-Second-level market controls:
-
-- `market-second-covariates` fetches SPY/QQQ option one-second aggregates when
-  available in the current data lake.
-- Features include SPY/QQQ ATM IV proxy, term slope, skew, butterfly, straddle
-  premium over spot, option volume/transaction count, and underlying pre-cutoff
-  return.
-- These are event-entry market controls; single-name option second aggregates
-  feed the hybrid proxy sequence.
-
-Appendix F will define the feature schema and source/as-of timestamp for every
-column family.
-
-### 2.6 Models
-
-Financial and deterministic baselines:
-
-1. Market-implied baseline: `forecast_RVAR_event_<target> = IVAR_event`, with
-   target-specific interpretation.
-2. Last-four RVAR baseline.
-3. Last-four IVAR baseline.
-4. Goyal-Saretto-style RV-IV spread baseline.
-5. Patell-Wolfson-style diagnostics.
-
-Trainable tabular models:
-
-1. Linear / Elastic Net.
-2. LightGBM.
-3. XGBoost when dependency is available.
-4. FT-Transformer.
-
-Sequence models:
-
-1. Daily proxy-Mamba on the 20-step daily sequence.
-2. Hybrid proxy-Mamba on 19 daily steps plus 12 entry-day five-minute bins.
-3. Intraday-only 12-bin Mamba ablation.
-4. Mask-only hybrid Mamba ablation.
-
-The hybrid sequence is a mixed-clock tensor. It includes `step_type`,
-`is_intraday_bin`, `log_delta_minutes_from_prev_step`, `normalized_time_to_entry`,
-`hours_until_announcement_proxy`, and `iv_extraction_source` so the model can
-distinguish daily close-trade observations from intraday five-minute
-trade-aggregate observations. The intraday leg is a proxy surface, not an
-NBBO-mid IV surface.
-
-Model input policy:
-
-| Model | Event-level features | Sequence aggregates | Ordered sequence tensor | Mask |
-| --- | --- | --- | --- | --- |
-| IVAR baseline | IVAR only | No | No | No |
-| Last-four baselines | Prior events only | No | No | No |
-| Elastic Net | Yes | No | No | No |
-| LightGBM/XGBoost | Yes | Mean/last/slope/std aggregates | No | No |
-| FT-Transformer | Yes | No | No | No |
-| daily proxy-Mamba | Optional late fusion | No | 20 daily steps | Yes |
-| hybrid proxy-Mamba | Optional late fusion | No | 19 daily + 12 intraday bins | Yes |
-| intraday-only Mamba | Optional late fusion | No | 12 intraday bins | Yes |
-| mask-only hybrid Mamba | No values | No | Zeroed hybrid tensor | Yes |
-
-### 2.7 Loss Functions and Forecast Postprocessing
+Negative extracted event variance and nonmonotone total variance are excluded
+from tradable samples and reported as diagnostics.
+
+### 3.4 Features
 
-Mamba uses q=0.5 quantile loss on log-transformed realized event variance for
-each target:
-
-```text
-log_target = log(RVAR_target + forecast_floor)
-forecast_floor = 1e-6
-```
+The feature matrix combines event-level state, realized history, option-surface
+proxies, market controls, and sequence inputs:
+
+- `IVAR_event`, ATM IV, term spread, skew, butterfly/concavity proxies.
+- Option activity and liquidity measures.
+- RV5/RV20/RV60 and last-four earnings history.
+- BMO/AMC timing and universe rank.
+- Prior-close VIX level, changes, percentile, and regime.
+- SPY/QQQ controls when available.
+- Daily 20-step close-trade-implied option-surface sequences.
+- Hybrid 31-step sequences with 19 daily states and 12 entry-day five-minute
+  trade-aggregate proxy bins.
 
-Predictions are transformed back to variance space before all economic metrics:
-
-```text
-forecast_rvar = max(exp(log_forecast) - forecast_floor, forecast_floor)
-```
-
-The q=0.5 loss optimizes median/MAE-style behavior. RMSE and QLIKE are reported
-as comparison metrics, not optimized objectives.
-
-### 2.8 Splits, Resampling, and Inference
-
-No random split is used. The proxy-stage default is chronological event-level
-holdout:
-
-```text
-train:      first 70% of events by event_entry_timestamp
-validation: next 15%
-test:       last 15%
-```
-
-The split unit is `event_id`; all target rows for the same event remain in the
-same split, so an event cannot have C2O in train and C2C/O2C in validation/test.
-The final paper design should move to rolling walk-forward:
+Sequence coverage is 678 eligible events out of 810. The default drop rate is
+16.3%, so sequence results are diagnostic in the current run.
 
-- Train five years.
-- Validate one year.
-- Test the next year.
-- Purge adjacent same-ticker earnings leakage.
-- Keep same-date peer-firm events out of random splits.
-
-Inference layer:
-
-- Paired loss differential versus IVAR baseline.
-- Event-date clustered standard errors.
-- Ticker clustered standard errors.
-- Two-way clustered standard errors where feasible.
-- Event-month block bootstrap confidence intervals.
-- SPA or model-confidence-set tests only if many models/thresholds are compared.
+### 3.5 Models
+
+| Family | Models | Purpose |
+| --- | --- | --- |
+| Market benchmark | Market-implied IVAR | Central level and no-edge baseline. |
+| Historical baselines | Last-four RVAR, last-four IVAR | Tests whether simple earnings history is enough. |
+| Classical mispricing benchmark | Goyal-Saretto-style RV-IV spread | Required option-return predictability comparator. |
+| Linear tabular | Elastic Net | Sparse linear event-level benchmark. |
+| Nonlinear tabular | LightGBM, XGBoost | Main current contenders. |
+| Neural tabular | FT-Transformer | Deep tabular comparator. |
+| Sequence models | Daily proxy-Mamba, hybrid proxy-Mamba, intraday-only Mamba, mask-only hybrid Mamba | Tests whether ordered pre-event paths add value. |
+
+Mamba variants use a q=0.5 quantile loss on log-transformed realized variance
+with `forecast_floor=1e-6`. Forecasts are transformed back to variance space
+before all ranking and economic metrics.
+
+### 3.6 Splits, Strategy, and Metrics
+
+The current proxy run uses chronological event-level 70/15/15 train,
+validation, and test splits. The split unit is `event_id`, so C2O/C2C/O2C rows
+for the same event cannot cross splits.
+
+The V1 strategy headline is `day_c2c` only. Entry uses per-leg option VWAP over
+the final 900 seconds before cutoff. The primary C2C exit uses same-contract
+option VWAP over the final 15 minutes before the exit-date close. C2O and O2C
+option-PnL rows are diagnostic decompositions.
 
-If clusters are insufficient, the result is reported as
-`status=insufficient_clusters`, not silently dropped.
-
-### 2.9 Backtest Setup
-
-Primary strategies:
-
-1. Long ATM straddle for predicted cheap event volatility.
-2. Short iron fly for predicted rich event volatility.
-
-Calendar straddles are deferred. They mix event variance, post-event vega, theta,
-front/back gamma mismatch, skew, dividends, borrow, and assignment risk.
-
-Premium-space valuation:
-
-- Use deterministic quadrature under a zero-mean Gaussian event-return
-  distribution with variance `forecast_RVAR_event_day_c2c`.
-- Proxy route C2C entry prices use pre-cutoff option second aggregates and true
-  per-leg VWAP over the final 15 minutes before cutoff.
-- The unified option open anchor is same-contract option VWAP from 5-15 minutes
-  after the regular-session open. C2O uses this as the primary post-open exit
-  proxy; O2C uses the same mark as the diagnostic post-open entry proxy.
-- Proxy route C2C exits use same-contract option VWAP over the final 15 minutes
-  before the exit-date close. Same-contract option day-aggregate close is not
-  used for strategy exits; intrinsic payoff is only a flagged fallback for a
-  missing trade-aggregate exit mark or 0DTE expiry.
-- O2C option PnL is a realized decomposition diagnostic in V1, not a
-  model-driven strategy headline, because the project does not yet estimate a
-  post-open residual-IV baseline.
+Performance metrics:
+
+| Metric family | Metrics |
+| --- | --- |
+| Forecast | MAE, RMSE, QLIKE diagnostic, OOS R2 versus IVAR |
+| Ranking and mispricing | AUC, Brier, calibration, top-decile precision, edge-decile monotonicity |
+| Strategy | Gross/net proxy PnL, return on premium/capital, Sharpe, Sortino, max drawdown, hit rate, average win/loss, cost sensitivity |
+| Risk and coverage | IVAR failure counts, sequence drop rate, high sequence-selection risk, extreme prediction diagnostics |
 
-Proxy transaction-cost model:
+## 4. Results
 
-```text
-proxy_cost_usd = haircut_bps * entry_premium_usd
-haircut_bps = 0.005
-```
+### 4.1 Main Result Table
 
-`multiplier=0` in cost sensitivity is a diagnostic anchor, not realistic
-execution. Full bid/ask or NBBO costs require paper-grade quote data.
+Forecast and ranking columns use `jump_c2o`. Strategy columns use `day_c2c`, the
+only V1 proxy-PnL headline.
 
-### 2.10 Performance Metrics and Diagnostics
+| Model | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Day-C2C net proxy PnL |
+|:---|---:|---:|---:|---:|---:|---:|
+| Market IVAR | 0.0097 | 0.0145 | 0.000 | 0.000 | 0.500 | n/a |
+| Goyal-Saretto spread | 0.0076 | 0.0134 | 0.141 | 0.300 | 0.602 | -461 |
+| Elastic Net | 0.0095 | 0.0213 | 0.323 | 0.500 | 0.629 | 47,938 |
+| LightGBM | 0.0077 | 0.0192 | 0.355 | 0.500 | 0.745 | 69,908 |
+| XGBoost | 0.0074 | 0.0191 | 0.380 | 0.500 | 0.781 | 68,344 |
+| FT-Transformer | 0.0374 | 0.0396 | -5.487 | 0.200 | 0.525 | -4,793 |
+| Daily Mamba 20-step | 0.0067 | 0.0136 | 0.106 | 0.111 | 0.495 | -9,370 |
+| Hybrid Mamba 31-step | 0.0082 | 0.0228 | 0.194 | 0.100 | 0.498 | -35 |
+| Intraday-only Mamba 12-step | 0.0083 | 0.0228 | 0.192 | 0.100 | 0.498 | -35 |
+| Mask-only hybrid Mamba | 0.0088 | 0.0242 | -0.036 | 0.100 | 0.500 | 101 |
 
-Forecast metrics:
+The central result is not that the lowest MAE model wins economically. Daily
+Mamba has the lowest `jump_c2o` MAE, but XGBoost and LightGBM produce the best
+ranking and proxy economic results.
 
-- MAE.
-- RMSE.
-- QLIKE.
-- Out-of-sample `R2` versus IVAR baseline.
+### 4.2 Forecast Accuracy
 
-Mispricing and ranking metrics:
+![Forecast performance](assets/images/modeling/forecast_performance.png)
 
-- AUC for mispricing direction.
-- Brier score.
-- Calibration curve.
-- Top-decile precision.
-- Edge-decile monotonicity.
+**Interpretation.** Forecast error is useful but not decisive. XGBoost leads the
+reported `jump_c2o` OOS R2 versus IVAR, while daily Mamba has the lowest MAE.
+The split between forecast accuracy and economic value is why the paper does not
+claim that lower RMSE alone proves tradability.
+
+### 4.3 Ranking Quality
+
+![AUC and top-decile precision](assets/images/modeling/auc_top_decile_precision.png)
+
+**Interpretation.** Ranking quality is closer to the paper's question than level
+forecast accuracy. XGBoost leads AUC at 0.781; Elastic Net, LightGBM, and
+XGBoost each reach 0.500 top-decile precision on the current proxy test rows.
+The market IVAR baseline is neutral in ranking because it generates no positive
+premium edge against itself.
+
+### 4.4 Mispricing Monotonicity
 
-Strategy metrics:
+![Edge decile realized mispricing](assets/images/modeling/edge_decile_realized_mispricing.png)
 
-- Gross and net proxy PnL.
-- Return on premium/capital.
-- Sharpe and Sortino.
-- Max drawdown.
-- Hit rate.
-- Average win/loss.
-- Cost sensitivity.
-- Breakdowns by DTE, BMO/AMC, liquidity, ticker, year, and regime.
-
-Sanity diagnostics:
-
-- Raw, floored, and winsorized QLIKE.
-- Top-1% QLIKE contribution share.
-- Extreme prediction table.
-- Sequence coverage and sequence-selection risk.
-- Mask-only Mamba ablation.
-- IVAR extraction failure diagnostics.
-
-## 3. Planned Results Section
-
-The Results section should follow the experimental logic rather than the order
-in which scripts run.
-
-### 3.1 Sample Construction
-
-Report:
-
-- Universe size and monthly turnover.
-- Event counts before and after BMO/AMC filtering.
-- Contract coverage.
-- IVAR/RVAR coverage.
-- Sequence coverage.
-- Proxy versus missing exit-pricing diagnostics.
-
-### 3.2 Forecasting Results
-
-Main table:
-
-- IVAR baseline.
-- Last-four baselines.
-- Goyal-Saretto baseline.
-- Elastic Net.
-- LightGBM/XGBoost.
-- FT-Transformer.
-- proxy-Mamba.
-- mask-only Mamba.
-
-Headline statistics:
-
-- MAE.
-- RMSE.
-- OOS `R2` versus IVAR.
-- Floored/winsorized QLIKE.
-
-### 3.3 Ranking and Mispricing Results
-
-Main evidence:
-
-- Top-decile precision.
-- AUC/Brier.
-- Calibration.
-- Edge-decile realized mispricing monotonicity.
-
-The relevant question is whether predicted edge ranks events better than IVAR
-alone, not whether a model merely lowers average squared error.
-
-### 3.4 Strategy Results
-
-Report gross and net proxy PnL by model and edge bucket:
-
-- Long-vol trades.
-- Short-vol trades.
-- Cost multipliers.
-- Liquidity buckets.
-- BMO versus AMC.
-- Main DTE 5-14 versus robustness DTE 3-21.
-
-The paper-facing claim should be conservative unless performance survives cost
-sensitivity and liquidity controls.
-
-### 3.5 Robustness and Heterogeneity
-
-Required robustness:
-
-- DTE buckets.
-- BMO/AMC.
-- Liquidity.
-- Ticker/year.
-- VIX regime.
-- SPY/QQQ market-state controls.
-- Cost multipliers.
-- Sequence eligibility thresholds.
-
-## 4. Appendix Map
-
-Appendix references should be cited from the main text when those checks matter
-for identification, data quality, or interpretation.
-
-- **Appendix A: Literature Tables.** Full citation details and implementation
-  relevance.
-- **Appendix B: Protocol Crosswalk.** Mapping from each prior paper to target,
-  features, filters, and evaluation choices.
-- **Appendix C: Universe Construction.** Monthly top-50 membership, turnover,
-  exclusions, and liquidity distributions.
-- **Appendix D: Event Calendar Audit.** SEC accessions, timing flags, text
-  validation, and BMO/AMC exclusion reasons.
-- **Appendix E: IVAR Diagnostics.** Negative IVAR, nonmonotone total variance,
-  selected expiries, DTEs, and extraction failures.
-- **Appendix F: Feature Schema.** Event-level, sequence, VIX, SPY/QQQ, and
-  source/as-of fields.
-- **Appendix G: Model Hyperparameters.** Train/validation/test rules, seeds,
-  early stopping, and model-specific settings.
-- **Appendix H: Inference and Bootstrap.** Clustered standard errors, block
-  bootstrap settings, and insufficient-cluster cases.
-- **Appendix I: Additional Robustness.** Cost sensitivity, liquidity buckets,
-  DTE ranges, timing splits, and regime breakdowns.
-
-## 5. Conservative Claim Boundary
-
-The current proxy-stage report is useful for deciding whether the research
-question has signal. It is not paper-grade execution evidence. The conclusion
-must stay disciplined:
-
-> Deep learning is useful only if it improves the ranking of event variance
-> mispricing in the tradable tail of the distribution after costs.
-
-If the proxy evidence is weak, the paper can still make a defensible negative
-claim: market-implied event variance and simple nonlinear tabular baselines are
+**Interpretation.** A useful mispricing model should sort realized mispricing
+monotonically across predicted-edge buckets. XGBoost has the strongest
+edge-decile Spearman relationship in the current run, consistent with the
+ranking evidence.
+
+### 4.5 Proxy Strategy Performance
+
+![Strategy PnL by edge decile](assets/images/modeling/strategy_pnl_by_edge_decile.png)
+
+Selected `day_c2c` proxy strategy metrics:
+
+| Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
+|:---|---:|---:|---:|---:|---:|
+| Last-four RVAR | 100 | -3,482 | -0.021 | -0.268 | -16,789 |
+| Last-four IVAR | 100 | -15,904 | -0.094 | -1.235 | -16,132 |
+| Goyal-Saretto spread | 100 | -461 | -0.003 | -0.036 | -17,145 |
+| Elastic Net | 100 | 47,938 | 0.283 | 4.007 | -3,202 |
+| LightGBM | 100 | 69,908 | 0.413 | 6.476 | -1,416 |
+| XGBoost | 100 | 68,344 | 0.403 | 6.271 | -1,695 |
+| FT-Transformer | 100 | -4,793 | -0.028 | -0.370 | -15,366 |
+| Daily Mamba 20-step | 87 | -9,370 | -0.066 | -0.765 | -14,012 |
+| Hybrid Mamba 31-step | 93 | -35 | -0.000 | -0.003 | -11,928 |
+| Mask-only hybrid Mamba | 93 | 101 | 0.001 | 0.008 | -11,928 |
+
+**Interpretation.** The strongest proxy economics come from LightGBM and
+XGBoost. This supports the conservative tabular-model claim, not a Mamba
+headline. The strategy table remains a screening result because prices are
+trade-aggregate proxies rather than executable bid/ask marks.
+
+### 4.6 Cost Sensitivity
+
+![Cost sensitivity](assets/images/modeling/cost_sensitivity.png)
+
+**Interpretation.** The default proxy cost model is a haircut on entry premium.
+Cost multiplier 0 is an anchor, not an execution assumption. Persistence across
+higher multipliers matters because the current route lacks bid/ask data.
+LightGBM and XGBoost remain the main proxy-stage contenders in the displayed
+cost stress.
+
+### 4.7 Calibration
+
+![Calibration plot](assets/images/modeling/calibration_plot.png)
+
+**Interpretation.** Calibration checks whether forecast variance is on the
+right scale, not only correctly ranked. The current evidence is stronger for
+ranking than for perfectly calibrated variance levels.
+
+### 4.8 QLIKE Diagnostic
+
+![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
+
+**Interpretation.** Raw QLIKE is unstable when forecasts are clipped near zero.
+The QLIKE figure is a diagnostic guardrail, not a headline metric. It prevents
+the paper from over-weighting a loss function dominated by a small number of
+near-zero forecast cases.
+
+### 4.9 C2O Post-Open Diagnostic
+
+Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
+
+| Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
+|:---|---:|---:|---:|---:|---:|
+| Last-four RVAR | 93 | -805 | -0.005 | -0.074 | -10,017 |
+| Goyal-Saretto spread | 93 | -1,531 | -0.009 | -0.141 | -12,854 |
+| Elastic Net | 93 | 14,324 | 0.085 | 1.335 | -5,844 |
+| LightGBM | 93 | 28,911 | 0.171 | 2.782 | -3,910 |
+| XGBoost | 93 | 41,456 | 0.245 | 4.190 | -1,698 |
+| FT-Transformer | 93 | 4,113 | 0.024 | 0.380 | -9,347 |
+| Hybrid Mamba 31-step | 88 | -7,438 | -0.047 | -0.689 | -10,293 |
+| Mask-only hybrid Mamba | 88 | -8,021 | -0.050 | -0.743 | -10,148 |
+
+**Interpretation.** The C2O diagnostic is consistent with the tabular ranking
+story: XGBoost and LightGBM perform best under the post-open option-VWAP proxy.
+These rows are not V1 proxy-PnL headlines and have
+`pnl_headline_eligible=false`.
+
+## 5. Limitations
+
+The current evidence is not final paper-grade executable evidence. The main
+limitations are:
+
+| Limitation | Consequence |
+| --- | --- |
+| No historical bid/ask, quote midpoint, OPRA, or NBBO records | Cannot claim full-spread executable strategy performance. |
+| Option second aggregates are trade OHLCV bars | IV surfaces and strategy marks are trade-price proxies. |
+| Current sample starts in 2022 | Does not yet cover the target 2013-2025 paper window. |
+| 117 of 810 events lack usable trade-proxy IVAR | IVAR coverage is a material sample screen. |
+| Sequence eligibility is 678 of 810 events | Mamba results carry selection risk and are diagnostic. |
+| C2O/O2C option PnL is diagnostic | V1 tradable mispricing headline remains `day_c2c`. |
+| Proxy haircut cost model | Full bid/ask crossing remains future paper-grade work. |
+
+Paper-grade claims require historical quote/NBBO or equivalent data, quote-based
+IVAR, leg-level execution with realistic bid/ask crossing, DTE and liquidity
+robustness, and clustered or bootstrap inference.
+
+## 6. Conclusion
+
+The current proxy-stage evidence supports a disciplined, limited conclusion.
+Nonlinear tabular models improve the ranking of earnings event-variance
+mispricing relative to market IVAR and simple historical benchmarks, and the
+best tabular models map this ranking signal into positive `day_c2c`
+premium-space proxy economics. XGBoost leads `jump_c2o` ranking quality, while
+LightGBM leads the current `day_c2c` proxy strategy screen.
+
+The result is not a final execution claim. It is a credible signal-screening
+result that justifies either a paper-grade quote/NBBO extension or a conservative
+proxy-stage manuscript. If the next paper-grade route confirms the same ranking
+and cost robustness under bid/ask execution, the sell is an earnings
+event-variance mispricing paper. If it does not, the paper still has a useful
+negative result: market-implied event variance and strong tabular baselines are
 hard to beat under realistic earnings-option frictions.
+
+## Appendix Plan
+
+| Appendix | Contents |
+| --- | --- |
+| A. Literature and Positioning | Earnings option pricing, event volatility, option-return predictability, and ML comparisons. |
+| B. Universe Construction | Monthly top-50 membership, turnover, exclusions, and liquidity distributions. |
+| C. Event Calendar Audit | SEC accessions, timing flags, text validation, and BMO/AMC exclusions. |
+| D. IVAR Diagnostics | Expiry selection, DTEs, total variances, negative IVAR, and nonmonotone failures. |
+| E. Feature Schema | Event-level, VIX, SPY/QQQ, daily sequence, hybrid sequence, and as-of timestamps. |
+| F. Model Configuration | Splits, hyperparameters, seeds, training status, and fit diagnostics. |
+| G. Robustness and Inference | DTE windows, liquidity buckets, timing splits, ticker/year concentration, clustered SEs, and bootstrap checks. |
+
