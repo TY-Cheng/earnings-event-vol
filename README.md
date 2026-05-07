@@ -57,11 +57,11 @@ Latest proxy data artifacts:
 - Dynamic calendar: 1,054 SEC-first candidate rows; 810 BMO/AMC main-sample
   candidates after universe and text-validation filters.
 - Trade-proxy panel: 810 events, 801 with the backward-compatible C2C
-  `rvar_event` alias, 690 with trade-proxy `IVAR_event`.
+  `rvar_event` alias, 693 with trade-proxy `IVAR_event`.
 - Proxy contracts: 12,038 candidates; 10,165 with usable pre-cutoff
   second-aggregate prices.
-- Proxy straddle diagnostics: 779 rows; mean gross proxy PnL about 12.41 USD,
-  mean haircut PnL about -159.98 USD.
+- Proxy straddle diagnostics: 779 rows; mean gross C2C primary exit-preclose
+  VWAP proxy PnL about -100.72 USD, mean haircut proxy PnL about -250.54 USD.
 
 Latest proxy modeling artifacts:
 
@@ -72,9 +72,10 @@ Latest proxy modeling artifacts:
   and mask-only Mamba ablations.
 - Sequence audit: 678 eligible events out of 810 under the default path
   coverage rule; flagged as high sequence-selection risk.
-- In the current no-NBBO proxy run, LightGBM and XGBoost look strongest on
-  `jump_c2o` ranking and `day_c2c` proxy strategy metrics. This is
-  signal-screening evidence, not a paper-grade executable trading result.
+- In the current no-NBBO proxy run, XGBoost leads `jump_c2o` ranking AUC
+  (0.781), while LightGBM leads `day_c2c` net proxy PnL (about 69,908 USD).
+  This is signal-screening evidence, not a paper-grade executable trading
+  result.
 - Proxy-Mamba is implemented for both the 20-step daily tensor and the 31-step
   hybrid tensor, but it is not a headline model in the current run.
 
@@ -87,17 +88,18 @@ just status
 just check
 just data args="--dry-run"
 just data
-just research args="--allow-high-sequence-risk"
+just research args="--allow-high-sequence-risk --split-design chronological_proxy_70_15_15"
 just docs
 ```
 
 `just check` formats, fixes lint, runs mypy, pytest, MkDocs strict build,
 status, and source probes.
 
-`just data` runs:
+`just data` runs the active proxy-all DAG:
 
 ```text
-options-day-aggs-bulk -> universe -> dynamic-calendar -> pilot-panel -> trade-proxy-panel
+options-day-aggs-bulk -> universe -> dynamic-calendar -> event-window-panel
+  -> contract-reference-validation -> trade-proxy-panel
 ```
 
 Default data parameters:
@@ -168,8 +170,9 @@ The defensible near-term claim is narrower:
 
 > In a no-NBBO proxy sample, state and event-history features show preliminary
 > cross-sectional ranking signal for earnings event-variance mispricing beyond
-> the market-implied IVAR baseline. Paper-grade claims require quote/NBBO data
-> and robust cost/inference checks.
+> the market-implied IVAR baseline, and the best tabular models map that ranking
+> signal into positive premium-space proxy economics. Paper-grade claims require
+> quote/NBBO data and robust cost/inference checks.
 
 ## Docs
 

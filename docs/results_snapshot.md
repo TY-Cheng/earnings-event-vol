@@ -6,91 +6,58 @@ hide:
 # Results Snapshot
 
 This page is the curated reader-facing snapshot. Raw generated outputs live
-under ignored `artifacts/`, `data/`, and `reports/` paths; only selected
-results and figures are copied into `docs/` for publication.
+under ignored `artifacts/`, `data/`, and `reports/` paths; selected figures are
+copied into `docs/` for publication.
 
 ## Status
 
-Current local run state, verified on 2026-05-07:
+Current local run state, verified on 2026-05-07 from
+`artifacts/modeling/*`, `artifacts/data_pipeline/*`, and
+`reports/modeling/proxy_research_report.md`:
 
 | Item | Current state |
 | --- | --- |
 | Data route | SEC-first event calendar plus Massive market-data proxy |
 | Execution grade | `no_nbbo_trade_proxy`, `paper_grade=false` |
-| Study window in current run | 2022-12-01 to 2025-12-31 |
+| Current study window | 2022-12-01 to 2025-12-31 |
 | Target paper window | 2013-2025, pending historical quote/NBBO or equivalent data |
 | Universe | Monthly top 50 liquid U.S. single-name option underlyings |
-| Market data route | Options day aggregates, underlying day aggregates, and targeted option one-second trade aggregates |
 | Event source | SEC EDGAR submissions plus SEC primary filing document text |
 | Main timing sample | BMO and AMC only |
-| Research package | Target-aware C2O/C2C/O2C feature matrix, model metrics, proxy strategy diagnostics, figures |
+| Research package | C2O/C2C/O2C feature matrix, model metrics, proxy strategy diagnostics, figures |
 
-The current evidence is useful for engineering validation and signal screening.
-It is not paper-grade execution evidence because it does not use historical
-bid/ask or NBBO quotes.
+The current evidence is suitable for engineering validation, signal screening,
+and a conservative draft of the empirical story. It is not paper-grade execution
+evidence because it does not use historical bid/ask or NBBO quotes.
 
 ## Data and Backtest Setup
 
-The current proxy route uses three required market-data inputs:
+The proxy route uses:
 
 - **Options day aggregates** for dynamic-universe liquidity ranking, contract
-  discovery, local IV/IVAR proxy inputs, fallback exit diagnostics, and the
-  daily close-trade-implied option-surface sequence.
+  discovery, local IV/IVAR proxy inputs, fallback diagnostics, and the daily
+  close-trade-implied option-surface sequence.
 - **Underlying stock day aggregates** for underlying closes, vendor OHLC opens,
   C2O/C2C/O2C event returns, and exit spot.
-- **Option one-second trade aggregates** for targeted pre-cutoff entry proxies,
-  primary C2C exit proxies, and post-open option open-anchor proxies. Massive REST is queried with
-  `/range/1/second/<date>/<date>`. The entry cache keeps only bars in the
-  resolved pre-cutoff buffer, default 60 minutes before the event cutoff.
-  Entry pricing uses the true per-leg volume-weighted `option_vwap` over the
-  final 900 seconds before cutoff. The unified option open anchor is
-  same-contract option VWAP from 5-15 minutes after open: it is the primary C2O
-  exit proxy and the O2C diagnostic entry proxy. The 0-5 minute VWAP remains an
-  opening-microstructure stress test. C2C exits use same-contract option VWAP
-  over the final 15 minutes before the exit-date close; option day-aggregate
-  close is fallback/diagnostic only. The same pre-cutoff cached bars can feed the
-  12-bin entry-day intraday proxy sequence.
+- **Option one-second trade aggregates** for targeted pre-cutoff entry prices,
+  primary C2C exit prices, and post-open C2O/O2C anchor prices. These are trade
+  OHLCV bars, not quote midpoints, bid/ask records, or NBBO.
 
-Candidate contracts are validated against Massive option reference metadata
-before entry proxy fetching. Non-100 or adjusted deliverables are marked
-`non_standard_excluded`; reference-fetch failures are diagnostics and do not
-create paper-grade execution claims.
+Entry pricing uses per-leg option VWAP over the final 900 seconds before the
+event cutoff. The primary C2C exit uses same-contract option VWAP over the final
+15 minutes before the exit-date close. The C2O diagnostic exit and O2C diagnostic
+entry use same-contract option VWAP from 5-15 minutes after the regular-session
+open; 0-5 minutes is retained as an opening-microstructure stress test.
 
-The one-second aggregates are trade OHLCV bars. They are not quote midpoints,
-bid/ask records, or NBBO. Intraday sequence features are therefore
-trade-aggregate proxy surfaces, not observed NBBO-mid IV surfaces.
+The target system is:
 
-Market-state controls are availability-gated with `just data
-market-second-covariates`: SPY/QQQ option one-second aggregates and SPY/QQQ
-underlying one-second aggregates at the event entry cutoff. When present, those
-controls add entry-as-of ATM IV proxy, term slope, skew, butterfly, straddle
-premium over spot, option activity, and underlying pre-cutoff return. Missing
-coverage is reported and the no-market-control specification remains valid.
-They follow the same `no_nbbo_trade_proxy` caveat.
+- `jump_c2o`: primary scientific target, close-to-open earnings jump variance.
+- `day_c2c`: literature-compatible target and the only V1 proxy-PnL headline.
+- `reaction_o2c`: post-open digestion diagnostic.
 
-The underlying universe is dynamic rather than a fixed ticker list:
-
-1. Start from SEC company ticker metadata and keep eligible U.S. common-equity
-   tickers on supported exchanges.
-2. Exclude ETF, fund, trust, ETN, index, volatility, commodity, and other
-   non-single-name-like symbols before liquidity ranking.
-3. Parse each option ticker to its underlying and compute monthly option
-   premium dollar volume:
-
-   ```text
-   option_premium_dollar_volume = option_price * contract_volume * 100
-   ```
-
-   where `option_price` uses VWAP when available and close as the fallback.
-4. For each universe month, rank underlyings by trailing six-month option
-   premium dollar volume, excluding the current month to avoid look-ahead.
-5. Keep the top 50 underlyings and pass their ticker union to the SEC-first
-   earnings-calendar stage. Each event is then annotated with
-   `universe_month`, `universe_rank`, and `universe_filter_status`.
-
-This setup is part of both the data construction and the model/backtest design:
-it defines the tradable sample, the entry/exit proxy, and which observations
-enter the feature matrix and strategy diagnostics.
+The market baseline is `IVAR_event`. C2C ex post mispricing is
+`RVAR_event_day_c2c - IVAR_event`. Strategy entry is evaluated in premium space,
+not from raw variance edge alone.
 
 ## Data Coverage
 
@@ -106,6 +73,7 @@ Latest proxy data pipeline outputs:
 | Proxy contract candidates | 12,038 |
 | Contracts with usable pre-cutoff proxy price | 10,165 |
 | Contracts with no trade in cutoff window | 1,873 |
+| Contracts with local IV proxy | 10,138 |
 | Main DTE 5-14 contracts | 5,098 |
 | Robustness DTE 3-21 contracts | 12,038 |
 | Proxy straddle diagnostic rows | 779 |
@@ -122,115 +90,131 @@ Proxy straddle diagnostics:
 
 | Measure | Value |
 | --- | ---: |
-| Mean gross C2C primary proxy PnL | 18.15 USD |
-| Mean haircut C2C proxy PnL | -153.42 USD |
+| Mean gross proxy PnL, all recorded marks | -78.97 USD |
+| Mean gross C2C primary exit-preclose VWAP proxy PnL | -100.72 USD |
+| Mean haircut proxy PnL | -250.54 USD |
 | Mean C2O intrinsic-open gross diagnostic PnL | -384.24 USD |
 | Mean C2O post-open option VWAP 0-5m proxy PnL | -21.14 USD |
 | Mean C2O post-open option VWAP 5-15m proxy PnL | -7.31 USD |
-| Mean O2C option VWAP 5-15m to primary C2C exit diagnostic PnL | 8.65 USD |
+| Mean O2C option VWAP 5-15m to primary C2C exit diagnostic PnL | -24.31 USD |
 | Mean option-proxy decomposition residual, 5-15m | 0.00 USD |
 
-Interpretation: the proxy route produces a usable event panel, but the IVAR
-coverage gap is still material. The main loss channel is missing a valid pair of
-event-covering expiries, followed by smaller term-structure extraction failures.
+Interpretation: the event panel is large enough for proxy-stage model
+comparison, but IVAR coverage remains a material screen. The main IVAR loss
+channel is missing two event-covering expiries.
 
 ## Model Results
 
-The feature matrix has 810 rows. The current chronological proxy split trains on
-567 rows, validates on 121 rows, and tests on 122 rows for tabular models. The
-target system is:
-
-- `jump_c2o`: primary scientific target, close-to-open earnings jump variance.
-- `day_c2c`: literature-compatible target and the only V1 proxy-PnL headline.
-- `reaction_o2c`: full regular-session open-to-close diagnostic for post-open
-  digestion.
-
-Daily Mamba uses a 20 x 37 tensor. Hybrid Mamba uses a 31 x 21 mixed-clock tensor
-with 19 prior daily proxy-surface states plus 12 entry-day five-minute
-trade-aggregate proxy bins. Sequence coverage is 678 eligible events out of 810,
-so Mamba results are diagnostic rather than headline.
+The feature matrix has 810 rows. The chronological proxy split trains on 567
+rows, validates on 121 rows, and tests on 122 rows for tabular models. Daily
+Mamba uses a 20 x 37 tensor; hybrid Mamba uses a 31 x 21 mixed-clock tensor with
+19 prior daily proxy-surface states plus 12 entry-day five-minute trade-aggregate
+proxy bins. Sequence coverage is 678 eligible events out of 810, so Mamba
+results are diagnostic rather than headline evidence.
 
 Selected `jump_c2o` forecast metrics:
 
 | Model | N | MAE | RMSE | OOS R2 vs IVAR |
 |:---|---:|---:|---:|---:|
-| Market IVAR | 99 | 0.0097 | 0.0146 | 0.000 |
-| Goyal-Saretto spread | 99 | 0.0079 | 0.0138 | 0.107 |
-| Elastic Net | 122 | 0.0093 | 0.0211 | 0.334 |
-| LightGBM | 122 | 0.0079 | 0.0193 | 0.416 |
-| XGBoost | 122 | 0.0077 | 0.0190 | 0.409 |
-| FT-Transformer | 122 | 0.0374 | 0.0395 | -5.357 |
-| Daily Mamba 20-step | 100 | 0.0067 | 0.0136 | 0.121 |
-| Hybrid Mamba 31-step | 100 | 0.0082 | 0.0228 | 0.192 |
-| Intraday-only Mamba 12-step | 100 | 0.0083 | 0.0228 | 0.190 |
-| Mask-only hybrid Mamba | 100 | 0.0088 | 0.0242 | -0.040 |
+| Market IVAR | 100 | 0.0097 | 0.0145 | 0.000 |
+| Goyal-Saretto spread | 100 | 0.0076 | 0.0134 | 0.141 |
+| Elastic Net | 122 | 0.0095 | 0.0213 | 0.323 |
+| LightGBM | 122 | 0.0077 | 0.0192 | 0.355 |
+| XGBoost | 122 | 0.0074 | 0.0191 | 0.380 |
+| FT-Transformer | 122 | 0.0374 | 0.0396 | -5.487 |
+| Daily Mamba 20-step | 100 | 0.0067 | 0.0136 | 0.106 |
+| Hybrid Mamba 31-step | 100 | 0.0082 | 0.0228 | 0.194 |
+| Intraday-only Mamba 12-step | 100 | 0.0083 | 0.0228 | 0.192 |
+| Mask-only hybrid Mamba | 100 | 0.0088 | 0.0242 | -0.036 |
 
 Selected `jump_c2o` ranking metrics:
 
-| Model | N | Top-decile precision | AUC | Brier |
+| Model | N | Top-decile precision | AUC | Edge-decile Spearman |
 |:---|---:|---:|---:|---:|
-| Market IVAR | 99 | 0.000 | 0.500 | 0.254 |
-| Goyal-Saretto spread | 99 | 0.300 | 0.606 | 0.310 |
-| Elastic Net | 99 | 0.600 | 0.594 | 0.313 |
-| LightGBM | 99 | 0.500 | 0.697 | 0.286 |
-| XGBoost | 99 | 0.300 | 0.733 | 0.277 |
-| FT-Transformer | 99 | 0.100 | 0.496 | 0.338 |
-| Daily Mamba 20-step | 86 | 0.222 | 0.487 | 0.341 |
-| Hybrid Mamba 31-step | 92 | 0.200 | 0.452 | 0.349 |
-| Intraday-only Mamba 12-step | 92 | 0.100 | 0.451 | 0.350 |
-| Mask-only hybrid Mamba | 92 | 0.200 | 0.466 | 0.346 |
+| Market IVAR | 100 | 0.000 | 0.500 | -0.006 |
+| Goyal-Saretto spread | 100 | 0.300 | 0.602 | 0.685 |
+| Elastic Net | 100 | 0.500 | 0.629 | 0.855 |
+| LightGBM | 100 | 0.500 | 0.745 | 0.903 |
+| XGBoost | 100 | 0.500 | 0.781 | 0.927 |
+| FT-Transformer | 100 | 0.200 | 0.525 | 0.758 |
+| Daily Mamba 20-step | 87 | 0.111 | 0.495 | 0.406 |
+| Hybrid Mamba 31-step | 93 | 0.100 | 0.498 | 0.600 |
+| Intraday-only Mamba 12-step | 93 | 0.100 | 0.498 | 0.673 |
+| Mask-only hybrid Mamba | 93 | 0.100 | 0.500 | 0.685 |
 
 Selected `day_c2c` proxy strategy metrics:
 
 | Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
 |:---|---:|---:|---:|---:|---:|
-| Last-four RVAR | 100 | 2,611.31 | 0.015 | 0.207 | -12,290.67 |
-| Last-four IVAR | 100 | -8,783.43 | -0.052 | -0.697 | -9,976.33 |
-| Goyal-Saretto spread | 100 | 3,429.89 | 0.020 | 0.272 | -16,624.92 |
-| Elastic Net | 100 | 52,032.24 | 0.307 | 4.560 | -2,328.78 |
-| LightGBM | 100 | 68,251.65 | 0.403 | 6.502 | -1,272.29 |
-| XGBoost | 100 | 66,912.65 | 0.395 | 6.321 | -1,037.01 |
-| FT-Transformer | 100 | 3,440.02 | 0.020 | 0.273 | -9,853.08 |
-| Daily Mamba 20-step | 87 | -8,588.00 | -0.061 | -0.714 | -14,517.46 |
-| Hybrid Mamba 31-step | 93 | -3,163.55 | -0.020 | -0.253 | -12,213.45 |
-| Intraday-only Mamba 12-step | 93 | -3,163.55 | -0.020 | -0.253 | -12,213.45 |
-| Mask-only hybrid Mamba | 93 | -3,027.79 | -0.019 | -0.242 | -12,213.45 |
+| Last-four RVAR | 100 | -3,481.69 | -0.021 | -0.268 | -16,788.67 |
+| Last-four IVAR | 100 | -15,904.43 | -0.094 | -1.235 | -16,131.89 |
+| Goyal-Saretto spread | 100 | -461.11 | -0.003 | -0.036 | -17,144.74 |
+| Elastic Net | 100 | 47,937.75 | 0.283 | 4.007 | -3,201.65 |
+| LightGBM | 100 | 69,908.11 | 0.413 | 6.476 | -1,416.38 |
+| XGBoost | 100 | 68,343.93 | 0.403 | 6.271 | -1,694.94 |
+| FT-Transformer | 100 | -4,792.98 | -0.028 | -0.370 | -15,366.08 |
+| Daily Mamba 20-step | 87 | -9,370.00 | -0.066 | -0.765 | -14,011.80 |
+| Hybrid Mamba 31-step | 93 | -34.55 | -0.000 | -0.003 | -11,928.45 |
+| Intraday-only Mamba 12-step | 93 | -34.55 | -0.000 | -0.003 | -11,928.45 |
+| Mask-only hybrid Mamba | 93 | 101.21 | 0.001 | 0.008 | -11,928.45 |
 
-Selected `jump_c2o` post-open option-VWAP proxy PnL:
+Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 
-The primary C2O option proxy exits the same selected straddle using
-same-contract option VWAP from 5-15 minutes after the regular-session open.
-The 0-5 minute VWAP is an opening-microstructure stress test, and the
-intrinsic-open mark remains a pure underlying-jump diagnostic. All are
-`no_nbbo_trade_proxy`, not NBBO-executable PnL.
+| Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
+|:---|---:|---:|---:|---:|---:|
+| Last-four RVAR | 93 | -804.97 | -0.005 | -0.074 | -10,016.79 |
+| Goyal-Saretto spread | 93 | -1,531.36 | -0.009 | -0.141 | -12,854.27 |
+| Elastic Net | 93 | 14,324.21 | 0.085 | 1.335 | -5,844.42 |
+| LightGBM | 93 | 28,911.28 | 0.171 | 2.782 | -3,909.83 |
+| XGBoost | 93 | 41,455.71 | 0.245 | 4.190 | -1,697.70 |
+| FT-Transformer | 93 | 4,112.63 | 0.024 | 0.380 | -9,347.18 |
+| Hybrid Mamba 31-step | 88 | -7,438.48 | -0.047 | -0.689 | -10,292.62 |
+| Mask-only hybrid Mamba | 88 | -8,020.68 | -0.050 | -0.743 | -10,147.87 |
 
-The same 5-15 minute option VWAP is also the unified O2C open anchor. O2C PnL
-is reported as a realized decomposition diagnostic from that open anchor to the
-primary C2C exit mark, not as a model-driven strategy headline; a true O2C
-strategy needs a post-open residual-IV baseline.
+The C2O proxy rows are diagnostic and have
+`pnl_headline_eligible=false`. The V1 proxy-PnL headline remains `day_c2c`.
 
-| Proxy | Model | Trades | Net proxy PnL | Return on premium | Sharpe | Max drawdown |
-|:---|:---|---:|---:|---:|---:|---:|
-| C2O VWAP 5-15m | Elastic Net | 93 | 14,324.21 | 0.085 | 1.335 | -5,844.42 |
-| C2O VWAP 5-15m | LightGBM | 93 | 36,405.45 | 0.215 | 3.599 | -3,629.01 |
-| C2O VWAP 5-15m | XGBoost | 93 | 38,878.75 | 0.230 | 3.884 | -1,941.38 |
-| C2O VWAP 5-15m | Hybrid Mamba 31-step | 88 | -7,438.48 | -0.047 | -0.689 | -10,292.62 |
-| C2O VWAP 0-5m | LightGBM | 95 | 32,297.13 | 0.191 | 3.341 | -4,423.65 |
-| C2O VWAP 0-5m | XGBoost | 95 | 38,509.78 | 0.227 | 4.092 | -1,980.30 |
-| C2O intrinsic-open | LightGBM | 100 | 59,591.91 | 0.352 | 5.052 | -3,681.98 |
-| C2O intrinsic-open | XGBoost | 100 | 52,011.49 | 0.307 | 4.277 | -3,654.03 |
+## Conservative Results
 
-Interpretation: in this no-NBBO proxy run, the strongest evidence is the
-`jump_c2o` ranking signal from tabular models and the `day_c2c` proxy economic
-screen from XGBoost, LightGBM, and Elastic Net. The C2O 5-15m option-VWAP proxy
-confirms the same tabular ranking story under a more realistic post-open trade
-aggregate mark, while the intrinsic-open diagnostic is only a lower-bound jump
-diagnostic. Mamba is implemented across daily, hybrid, intraday-only, and
-mask-only variants, but it is not the headline model in the current run.
+The current proxy evidence supports three narrow statements:
 
-The market-implied IVAR baseline is still the central benchmark. It generates no
-trades under the premium-edge rule because its forecast edge is zero by
-construction.
+- Nonlinear tabular models, especially XGBoost and LightGBM, improve
+  `jump_c2o` ranking metrics relative to the market-implied IVAR baseline and
+  simple historical baselines.
+- The strongest tabular models also improve the premium-space `day_c2c` proxy
+  strategy screen after the current proxy haircut cost model.
+- The sequence-model route is implemented, including daily, hybrid,
+  intraday-only, and mask-only variants, but it is not the current headline
+  result because coverage selection risk remains high and economic results are
+  weak.
+
+The defensible near-term claim is:
+
+> In a no-NBBO proxy sample, state and event-history features show preliminary
+> cross-sectional ranking signal for earnings event-variance mispricing beyond
+> the market-implied IVAR baseline, and this ranking signal maps into positive
+> premium-space proxy economics for the best tabular models.
+
+## Limitations
+
+These results should not be described as paper-grade executable performance.
+The current route has the following limits:
+
+- There are no historical bid/ask, quote midpoint, OPRA, or NBBO records.
+- One-second option aggregates are trade OHLCV bars, so all IV surfaces and
+  strategy marks are trade-price proxies.
+- The sample begins in 2022 because the observed options day-aggregate
+  entitlement does not cover the 2013-2025 target paper window.
+- IVAR coverage is incomplete: 117 of 810 events lack a usable trade-proxy IVAR.
+- Mamba sequence coverage is incomplete: 678 of 810 events pass the default
+  sequence rule, a 16.3% drop rate.
+- C2O and O2C option-PnL rows are diagnostic decompositions, not V1 tradable
+  mispricing headlines.
+- Cost sensitivity uses a proxy haircut, not full bid/ask crossing.
+
+Paper-grade claims require historical quote/NBBO or equivalent data, quote-based
+IVAR, leg-level execution with realistic bid/ask crossing, DTE and liquidity
+robustness, and clustered or bootstrap inference.
 
 ## Figures
 
@@ -262,34 +246,6 @@ QLIKE contribution diagnostic:
 
 ![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
 
-## What This Means
-
-Current proxy-stage takeaways:
-
-- The pipeline is now beyond toy smoke tests: it has a dynamic top-50 universe,
-  SEC-first event validation, an event panel, a feature matrix, model metrics,
-  proxy strategy diagnostics, and figures.
-- The signal-screening result is encouraging for tabular nonlinear models,
-  especially LightGBM and XGBoost.
-- The Mamba route is present but currently weaker than the tabular baselines.
-  Because the V1 sequence drop rate is 16.3%, it remains diagnostic rather than
-  a paper headline.
-- No current result supports full-spread executable trading claims.
-
-The defensible near-term claim is:
-
-> In a no-NBBO proxy sample, state and event-history features show preliminary
-> cross-sectional ranking signal for earnings event-variance mispricing beyond
-> the market-implied IVAR baseline.
-
-The paper-grade claim requires:
-
-- historical bid/ask or NBBO-equivalent option data;
-- quote-based IVAR and leg-level strategy construction;
-- full bid-ask crossing as the main cost assumption;
-- robustness across DTE windows, years, liquidity regimes, and BMO/AMC timing;
-- clustered or bootstrap inference.
-
 ## Artifact Map
 
 Local raw outputs:
@@ -297,16 +253,15 @@ Local raw outputs:
 | Purpose | Path |
 | --- | --- |
 | Data pipeline manifest | `artifacts/data_pipeline/data_pipeline_manifest.json` |
-| Universe manifest | `artifacts/data_pipeline/universe/universe_manifest.json` |
 | Dynamic calendar report | `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json` |
 | Trade-proxy panel report | `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` |
 | Feature matrix | `data/gold/modeling/feature_matrix.parquet` |
 | Daily sequence tensor | `data/gold/modeling/sequence_tensor.npz` |
 | Hybrid sequence tensor | `data/gold/modeling/hybrid_sequence_tensor.npz` |
-| Proxy surface distribution audit | `artifacts/modeling/proxy_surface_distribution_audit.csv` |
 | Forecast metrics | `artifacts/modeling/forecast_metrics.csv` |
 | Ranking metrics | `artifacts/modeling/ranking_metrics.csv` |
 | Strategy metrics | `artifacts/modeling/strategy_metrics.csv` |
+| Cost sensitivity | `artifacts/modeling/cost_sensitivity.csv` |
 | Model diagnostics | `artifacts/modeling/model_fit_diagnostics.csv` |
 | Proxy report | `reports/modeling/proxy_research_report.md` |
 
@@ -317,17 +272,3 @@ Published docs assets:
 | Curated results page | `docs/results_snapshot.md` |
 | Published figure copies | `docs/assets/images/modeling/*.png` |
 
-## Docs Structure
-
-The reader-facing docs intentionally stay small:
-
-- Home: short project overview and current status.
-- Results Snapshot: current curated data/model/proxy-strategy results and
-  analysis.
-- Paper Plan: research protocol, target variables, model ladder, and evaluation
-  design.
-- Audit Prompts: implementation and manuscript review checklists.
-- Future Work: paper blockers and deferred extensions.
-
-`SPEC.md` remains the repo-root implementation contract and is not a separate
-nav page.

@@ -16,7 +16,7 @@ from earnings_event_vol.backtest import (
 from earnings_event_vol.config import ProjectConfig, load_project_config
 from earnings_event_vol.data_audit import audit_data_fields
 from earnings_event_vol.data_pipeline import (
-    DEFAULT_PILOT_TICKERS,
+    DEFAULT_STATIC_TICKERS,
     parse_text_list,
     run_data_pipeline,
 )
@@ -44,7 +44,7 @@ from earnings_event_vol.models import (
     prediction_column_for_model,
     run_model_suite,
 )
-from earnings_event_vol.research import run_proxy_research_package
+from earnings_event_vol.research import remove_model_level_csv_artifacts, run_proxy_research_package
 from earnings_event_vol.schemas import EarningsEvent, OptionRight, OptionSide, TradeLeg
 from earnings_event_vol.variance import (
     TotalVariancePoint,
@@ -370,7 +370,7 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         out_root=args.out_root,
         force=args.force,
         jobs=args.jobs,
-        tickers=parse_text_list(args.tickers) or list(DEFAULT_PILOT_TICKERS),
+        tickers=parse_text_list(args.tickers) or list(DEFAULT_STATIC_TICKERS),
         start_date=pd.Timestamp(args.start).date(),
         end_date=pd.Timestamp(args.end).date(),
         dates=[pd.Timestamp(value).date() for value in parse_text_list(args.dates)],
@@ -430,7 +430,6 @@ def _model_ids_from_args(values: list[str]) -> list[str]:
             "lightgbm",
             "xgboost",
             "ft_transformer",
-            "mamba_sequence_encoder",
         ]
     parsed: list[str] = []
     for value in values:
@@ -451,6 +450,7 @@ def _train_models(args: argparse.Namespace) -> int:
     )
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    remove_model_level_csv_artifacts(out)
     predictions_path = out / "model_predictions.parquet"
     predictions.to_parquet(predictions_path, index=False)
     diagnostics = model_diagnostics_as_frame(fit_results)
@@ -727,11 +727,10 @@ def build_parser() -> argparse.ArgumentParser:
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
-            "calendar-pilot",
             "contracts",
             "contract-reference-validation",
             "panel",
-            "pilot-panel",
+            "event-window-panel",
             "trade-proxy-panel",
         ],
         default="proxy-all",
@@ -742,7 +741,7 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument(
         "--tickers",
         nargs="*",
-        default=list(DEFAULT_PILOT_TICKERS),
+        default=list(DEFAULT_STATIC_TICKERS),
         help="Ticker list; accepts repeated, comma-separated, or space-separated values.",
     )
     data.add_argument("--start", default="2022-12-01")

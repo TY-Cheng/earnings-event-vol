@@ -134,13 +134,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Deep tabular architecture for mixed event features.",
         risk="May not beat GBDT on small tabular panels.",
     ),
-    "mamba_sequence_encoder": ModelSpec(
-        model_id="mamba_sequence_encoder",
-        role="deep_model",
-        implemented=True,
-        justification="Selective sequence encoder for 20-day pre-event option-surface paths.",
-        risk="Requires sequence features; tabular proxy panels alone are not enough.",
-    ),
     "daily_mamba_20step": ModelSpec(
         model_id="daily_mamba_20step",
         role="deep_model",
@@ -610,7 +603,6 @@ def prediction_column_for_model(model_id: str) -> str:
         "lightgbm": "forecast_lightgbm",
         "xgboost": "forecast_xgboost",
         "ft_transformer": "forecast_ft_transformer",
-        "mamba_sequence_encoder": "forecast_mamba_sequence_encoder",
         "daily_mamba_20step": "forecast_daily_mamba_20step",
         "hybrid_mamba_31step": "forecast_hybrid_mamba_31step",
         "intraday_only_mamba_12step": "forecast_intraday_only_mamba_12step",
@@ -656,40 +648,6 @@ def sequence_tensor_from_frame(frame: pd.DataFrame, columns: Sequence[str]) -> t
     return torch.tensor(np.stack(arrays, axis=1), dtype=torch.float32)
 
 
-def fit_mamba_sequence_encoder(
-    frame: pd.DataFrame,
-    *,
-    target_col: str = TARGET_COL,
-    sequence_columns: Sequence[str] | None = None,
-    split_date: str | pd.Timestamp | None = None,
-    epochs: int = 40,
-) -> ModelFitResult:
-    columns = list(sequence_columns or sequence_feature_columns(frame))
-    train, test = temporal_train_test_split(frame, split_date=split_date)
-    train_fit, y_train_array = _finite_target_training_frame(train, target_col)
-    x_train = sequence_tensor_from_frame(train_fit, columns)
-    x_test = sequence_tensor_from_frame(test, columns)
-    y_train = torch.tensor(y_train_array, dtype=torch.float32)
-    model = MambaSequenceEncoder(n_features=x_train.shape[-1])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    for _ in range(max(1, epochs)):
-        optimizer.zero_grad()
-        loss = torch.mean(torch.square(model(x_train) - y_train))
-        loss.backward()  # type: ignore[no-untyped-call]
-        optimizer.step()
-    with torch.no_grad():
-        pred = model(x_test).detach().numpy()
-    predictions = test.copy()
-    predictions["forecast_mamba_sequence_encoder"] = pred
-    return ModelFitResult(
-        model_id="mamba_sequence_encoder",
-        predictions=predictions,
-        feature_columns=columns,
-        diagnostics={"train_rows": int(len(train)), "test_rows": int(len(test)), "epochs": epochs},
-        model=model,
-    )
-
-
 def run_model_suite(
     frame: pd.DataFrame,
     *,
@@ -726,22 +684,7 @@ def run_model_suite(
                 )
             )
             continue
-        if model_id == "mamba_sequence_encoder":
-            columns = sequence_feature_columns(base)
-            if not columns:
-                results.append(
-                    ModelFitResult(
-                        model_id=model_id,
-                        predictions=pd.DataFrame(),
-                        feature_columns=[],
-                        diagnostics={"status": "skipped_no_sequence_features"},
-                    )
-                )
-                continue
-            result = fit_mamba_sequence_encoder(
-                base, split_date=split_date, sequence_columns=columns
-            )
-        elif model_id in trainable:
+        if model_id in trainable:
             try:
                 result = fit_model(model_id, base, split_date=split_date)
             except RuntimeError as exc:

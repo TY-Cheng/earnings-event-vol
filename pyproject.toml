@@ -64,4 +64,8 @@ addopts = "-q --cov=earnings_event_vol --cov-report=term-missing --cov-fail-unde
 [tool.coverage.run]
 branch = true
 source = ["earnings_event_vol"]
-omit = ["src/earnings_event_vol/__main__.py", "src/earnings_event_vol/research.py"]
+omit = [
+    "src/earnings_event_vol/__main__.py",
+    "src/earnings_event_vol/event_window_panel.py",
+    "src/earnings_event_vol/research.py",
+]

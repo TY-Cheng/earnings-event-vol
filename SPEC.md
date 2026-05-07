@@ -11,7 +11,7 @@ variance edge.
 - Final proxy data-engineering entrypoint:
   - The public command remains `just data` / `proxy-all`.
   - `proxy-all` runs `options-day-aggs-bulk -> universe ->
-    dynamic-calendar -> pilot-panel -> contract-reference-validation ->
+    dynamic-calendar -> event-window-panel -> contract-reference-validation ->
     trade-proxy-panel`.
   - The runnable Massive-entitlement default is 2022-12-01 through
     2025-12-31. Universe construction downloads the trailing six-month lookback
@@ -26,8 +26,8 @@ variance edge.
     and GLD must not consume top-50 slots. The eligibility cache records source,
     snapshot date, rule version, exchange/name filter reason, and cache
     invalidation diagnostics.
-  - `calendar-pilot` is a static ticker smoke/debug stage and is not part of the
-    default final proxy DAG.
+  - Legacy static calendar pilot/debug stages are removed from the public data
+    DAG; use `dynamic-calendar` plus `event-window-panel` for active setup.
 - Event targets are decomposed:
   - Primary scientific target: `RVAR_event_jump_c2o`.
     - AMC: `close_d -> open_{d+1}`.

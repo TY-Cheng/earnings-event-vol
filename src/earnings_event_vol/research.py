@@ -1679,7 +1679,6 @@ def prepare_target_frame(base: pd.DataFrame, *, target_id: str) -> pd.DataFrame:
 
 def research_prediction_column(model_id: str) -> str:
     mapping = {
-        "mask_only_mamba_sequence_encoder": "forecast_mask_only_mamba_sequence_encoder",
         "daily_mamba_20step": "forecast_daily_mamba_20step",
         "hybrid_mamba_31step": "forecast_hybrid_mamba_31step",
         "intraday_only_mamba_12step": "forecast_intraday_only_mamba_12step",
@@ -2153,12 +2152,10 @@ def run_proxy_model_suite(
             pred, diag, _ = _train_xgboost(predictions, features=tree_features)
         elif model_id == "ft_transformer":
             pred, diag, _ = _train_ft_transformer(predictions, features=event_features)
-        elif model_id in {"mamba_sequence_encoder", "daily_mamba_20step"}:
+        elif model_id == "daily_mamba_20step":
             pred, diag, _ = _train_proxy_mamba(
                 predictions, tensor_path=tensor_path, mask_only=False
             )
-        elif model_id == "mask_only_mamba_sequence_encoder":
-            pred, diag, _ = _train_proxy_mamba(predictions, tensor_path=tensor_path, mask_only=True)
         elif model_id == "hybrid_mamba_31step":
             pred, diag, _ = _train_proxy_mamba(
                 predictions,
@@ -2381,8 +2378,30 @@ def append_day_c2c_additive_naive_diagnostics(predictions: pd.DataFrame) -> pd.D
     return out
 
 
+MODEL_LEVEL_CSV_ARTIFACT_GLOBS = (
+    "edge_deciles_*.csv",
+    "strategy_trades_*.csv",
+    "c2o_option_vwap_5_15_strategy_trades_*.csv",
+    "c2o_option_vwap_0_5_strategy_trades_*.csv",
+    "c2o_intrinsic_strategy_trades_*.csv",
+)
+
+
+def remove_model_level_csv_artifacts(out_dir: Path) -> list[Path]:
+    removed: list[Path] = []
+    if not out_dir.exists():
+        return removed
+    for pattern in MODEL_LEVEL_CSV_ARTIFACT_GLOBS:
+        for path in sorted(out_dir.glob(pattern)):
+            if path.is_file():
+                path.unlink()
+                removed.append(path)
+    return removed
+
+
 def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    remove_model_level_csv_artifacts(out_dir)
     forecast_columns = model_forecast_columns(predictions)
     forecast_rows: list[dict[str, object]] = []
     ranking_rows: list[dict[str, object]] = []

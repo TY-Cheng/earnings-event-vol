@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gzip
-import importlib
 import json
 import subprocess
 import sys
@@ -151,7 +150,6 @@ from earnings_event_vol.models import (
     add_benchmark_predictions,
     fit_ft_transformer,
     fit_linear_elastic_net,
-    fit_mamba_sequence_encoder,
     fit_model,
     get_model_spec,
     model_diagnostics_as_frame,
@@ -254,26 +252,6 @@ def _write_eligible_equity_cache(
     frame = build_eligible_equity_tickers(rows, source_snapshot_date=date(2026, 5, 6))
     pl.from_pandas(frame).write_parquet(path)
     return path
-
-
-def _calendar_pipeline_params(
-    *,
-    tickers: Sequence[str],
-    start_date: date,
-    end_date: date,
-    validate_with_massive: bool = True,
-) -> dict[str, object]:
-    return {
-        "pipeline_params": {
-            "stage": "calendar-pilot",
-            "tickers": sorted({ticker.upper() for ticker in tickers if ticker.strip()}),
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "sec_submissions_dir": None,
-            "massive_8k_text_dir": None,
-            "validate_with_massive": validate_with_massive,
-        }
-    }
 
 
 def _sec_submissions_payload(rows: list[dict[str, str]]) -> dict[str, object]:
@@ -2282,29 +2260,6 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     fixture_force = run_data_pipeline(config, stage="fixture-audit", out_root=out_root, force=True)
     assert _pipeline_steps(fixture_force)[0]["status"] == "ran"
 
-    calendar_out = out_root / "earnings_calendar_pilot"
-    calendar_out.mkdir(parents=True)
-    (calendar_out / "earnings_calendar_candidates.csv").write_text("ticker\nAAPL\n")
-    (calendar_out / "earnings_calendar_report.json").write_text(
-        json.dumps(
-            _calendar_pipeline_params(
-                tickers=["AAPL"],
-                start_date=date(2026, 1, 1),
-                end_date=date(2026, 12, 31),
-            )
-        ),
-        encoding="utf-8",
-    )
-    calendar_skip = run_data_pipeline(
-        config,
-        stage="calendar-pilot",
-        out_root=out_root,
-        tickers=["AAPL"],
-        start_date=date(2026, 1, 1),
-        end_date=date(2026, 12, 31),
-    )
-    assert _pipeline_steps(calendar_skip)[0]["status"] == "skipped"
-
     massive_out = out_root / "massive_probe" / "2025-02-05"
     massive_out.mkdir(parents=True)
     (massive_out / "massive_flat_file_manifest.json").write_text("{}")
@@ -2406,7 +2361,7 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="start_date"):
         run_data_pipeline(
             config,
-            stage="calendar-pilot",
+            stage="dynamic-calendar",
             out_root=out_root,
             start_date=date(2026, 12, 31),
             end_date=date(2026, 1, 1),
@@ -2442,7 +2397,7 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         "options-day-aggs-bulk",
         "universe",
         "dynamic-calendar",
-        "pilot-panel",
+        "event-window-panel",
         "contract-reference-validation",
         "trade-proxy-panel",
     ]
@@ -2977,44 +2932,71 @@ def test_dynamic_calendar_blocks_and_membership_edge_cases(tmp_path: Path) -> No
     assert counts == {"bad_event_month": 1, "no_universe_membership": 1}
 
 
-def test_calendar_pilot_step_runs_static_debug_calendar(
+def test_event_window_panel_step_uses_dynamic_calendar_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_project_config()
+    config = replace(
+        load_project_config(),
+        silver_data_dir=tmp_path / "data" / "silver",
+    )
     out_root = tmp_path / "pipeline"
+    calendar = out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
+    calendar.parent.mkdir(parents=True)
+    calendar.write_text("ticker,announcement_date,is_main_sample_candidate\nAAPL,2025-01-30,true\n")
 
-    def fake_calendar(**kwargs: object) -> tuple[pd.DataFrame, dict[str, object]]:
-        return (
-            pd.DataFrame(
-                [
-                    {
-                        "ticker": "AAPL",
-                        "announcement_date": "2025-01-30",
-                        "announcement_timing": "AMC",
-                        "is_main_sample_candidate": True,
+    def fake_event_window_panel(**kwargs: object) -> dict[str, object]:
+        assert kwargs["calendar_path"] == calendar
+        windows = config.silver_data_dir / "event_windows" / "event_windows.parquet"
+        contracts = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+        report = out_root / "event_window_panel" / "event_window_panel_report.json"
+        windows.parent.mkdir(parents=True, exist_ok=True)
+        contracts.parent.mkdir(parents=True, exist_ok=True)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        windows.write_text("parquet-placeholder", encoding="utf-8")
+        contracts.write_text("parquet-placeholder", encoding="utf-8")
+        report.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": {
+                        "stage": "event-window-panel",
+                        "calendar": str(calendar),
+                        "dte_min": 3,
+                        "dte_max": 21,
+                        "ivar_support_dte_max": 35,
+                        "max_events": 7,
                     }
-                ]
+                }
             ),
-            {"row_count": 1, "main_sample_candidate_rows": 1},
+            encoding="utf-8",
         )
+        return {"events": 1, "contracts": 2, "quote_pool_contracts": 2}
 
     monkeypatch.setattr(
-        "earnings_event_vol.data_pipeline.build_earnings_calendar_candidates",
-        fake_calendar,
+        "earnings_event_vol.data_pipeline.build_event_window_panel",
+        fake_event_window_panel,
     )
-    step = data_pipeline._calendar_pilot_step(
+    step = data_pipeline._event_window_panel_step(
         config,
         out_root=out_root,
-        tickers=["AAPL"],
-        start_date=date(2025, 1, 1),
-        end_date=date(2025, 12, 31),
-        sec_submissions_dir=None,
-        massive_8k_text_dir=None,
-        validate_with_massive=True,
+        dte_min=3,
+        dte_max=21,
+        max_events=7,
+        calendar_path=calendar,
         force=False,
     )
     assert step.status == "ran"
-    assert (out_root / "earnings_calendar_pilot" / "earnings_calendar_candidates.csv").exists()
+    assert step.name == "event-window-panel"
+
+    skipped = data_pipeline._event_window_panel_step(
+        config,
+        out_root=out_root,
+        dte_min=3,
+        dte_max=21,
+        max_events=7,
+        calendar_path=calendar,
+        force=False,
+    )
+    assert skipped.status == "skipped"
 
 
 def test_data_pipeline_contracts_and_panel_stages(tmp_path: Path) -> None:
@@ -3080,57 +3062,58 @@ def test_data_pipeline_contracts_and_panel_stages(tmp_path: Path) -> None:
     assert pd.read_csv(panel_output)["forward_source"].iloc[0] == FORWARD_SOURCE_PUT_CALL_PARITY
 
 
-def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
+def test_data_pipeline_event_window_panel_stage_uses_lake_outputs_and_max_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(
         load_project_config(),
         repo_root=tmp_path,
-        gold_data_dir=tmp_path / "data" / "gold",
+        silver_data_dir=tmp_path / "data" / "silver",
     )
     out_root = tmp_path / "artifacts" / "data_pipeline"
-    captured: dict[str, object] = {}
+    calendar = out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
+    calendar.parent.mkdir(parents=True, exist_ok=True)
+    calendar.write_text("ticker,announcement_date,is_main_sample_candidate\nAAPL,2025-01-30,true\n")
 
-    def fake_run(
-        command: Sequence[str],
-        *,
-        cwd: Path,
-        label: str,
-    ) -> subprocess.CompletedProcess[str]:
-        captured["command"] = list(command)
-        captured["cwd"] = cwd
-        captured["label"] = label
-        gold_output = config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet"
-        report = out_root / "event_panel" / "pilot_panel_report.json"
-        gold_output.parent.mkdir(parents=True, exist_ok=True)
+    def fake_event_window_panel(**kwargs: object) -> dict[str, object]:
+        assert kwargs["calendar_path"] == calendar
+        assert kwargs["dte_min"] == 3
+        assert kwargs["dte_max"] == 21
+        assert kwargs["max_events"] == 7
+        windows = config.silver_data_dir / "event_windows" / "event_windows.parquet"
+        contracts = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+        report = out_root / "event_window_panel" / "event_window_panel_report.json"
+        windows.parent.mkdir(parents=True, exist_ok=True)
+        contracts.parent.mkdir(parents=True, exist_ok=True)
         report.parent.mkdir(parents=True, exist_ok=True)
-        gold_output.write_text("parquet-placeholder", encoding="utf-8")
+        windows.write_text("parquet-placeholder", encoding="utf-8")
+        contracts.write_text("parquet-placeholder", encoding="utf-8")
         report.write_text(
             json.dumps(
                 {
                     "pipeline_params": {
-                        "stage": "pilot-panel",
-                        "calendar": str(
-                            out_root
-                            / "earnings_calendar_pilot"
-                            / "earnings_calendar_candidates.csv"
-                        ),
+                        "stage": "event-window-panel",
+                        "calendar": str(calendar),
                         "dte_min": 3,
                         "dte_max": 21,
+                        "ivar_support_dte_max": 35,
                         "max_events": 7,
                     }
                 }
             ),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(command, 0, stdout="pilot ok", stderr="")
+        return {"events": 1, "contracts": 2, "quote_pool_contracts": 2}
 
-    monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.build_event_window_panel",
+        fake_event_window_panel,
+    )
 
     result = run_data_pipeline(
         config,
-        stage="pilot-panel",
+        stage="event-window-panel",
         out_root=out_root,
         force=True,
         dte_min=3,
@@ -3142,18 +3125,14 @@ def test_data_pipeline_pilot_panel_stage_uses_lake_outputs_and_max_events(
     step = _pipeline_steps(result)[0]
     assert step["status"] == "ran"
     outputs = cast(list[str], step["outputs"])
-    assert str(config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet") in outputs
-    command = cast(list[str], captured["command"])
-    assert command[-3:] == ["--force", "--max-events", "7"]
-    assert "--calendar" in command
-    assert "--dte-min" in command
-    assert "--dte-max" in command
-    assert captured["cwd"] == tmp_path
-    assert captured["label"] == "pilot-panel"
+    assert str(config.silver_data_dir / "event_windows" / "event_windows.parquet") in outputs
+    assert (
+        str(config.silver_data_dir / "contracts" / "event_contract_candidates.parquet") in outputs
+    )
 
     skipped = run_data_pipeline(
         config,
-        stage="pilot-panel",
+        stage="event-window-panel",
         out_root=out_root,
         dte_min=3,
         dte_max=21,
@@ -3292,8 +3271,11 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
             (csv_path, parquet_path, report_path),
         )
 
-    def fail_calendar_pilot(*args: object, **kwargs: object) -> DataPipelineStep:
-        raise AssertionError("calendar-pilot must not run inside proxy-all")
+    def fake_event_window_panel(*args: object, **kwargs: object) -> DataPipelineStep:
+        assert kwargs["calendar_path"] == out_root / "dynamic_calendar" / (
+            "earnings_calendar_candidates.csv"
+        )
+        return DataPipelineStep("event-window-panel", "ran")
 
     def fake_contract_reference(*args: object, **kwargs: object) -> DataPipelineStep:
         return DataPipelineStep("contract-reference-validation", "ran")
@@ -3306,34 +3288,12 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
     ) -> subprocess.CompletedProcess[str]:
         assert cwd == tmp_path
         captured_commands.append(list(command))
-        if "build_pilot_panel.py" in command[1]:
-            gold_output = config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet"
-            report = out_root / "event_panel" / "pilot_panel_report.json"
-        else:
-            gold_output = config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
-            report = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
+        gold_output = config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
+        report = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
         gold_output.parent.mkdir(parents=True, exist_ok=True)
         report.parent.mkdir(parents=True, exist_ok=True)
         gold_output.write_text("parquet-placeholder", encoding="utf-8")
-        if "build_pilot_panel.py" in command[1]:
-            report.write_text(
-                json.dumps(
-                    {
-                        "pipeline_params": {
-                            "stage": "pilot-panel",
-                            "calendar": str(
-                                out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
-                            ),
-                            "dte_min": 3,
-                            "dte_max": 21,
-                            "max_events": 5,
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-        else:
-            report.write_text("{}", encoding="utf-8")
+        report.write_text("{}", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
     monkeypatch.setattr("earnings_event_vol.data_pipeline._options_day_aggs_bulk_step", fake_bulk)
@@ -3342,7 +3302,7 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
         "earnings_event_vol.data_pipeline._dynamic_calendar_step", fake_dynamic_calendar
     )
     monkeypatch.setattr(
-        "earnings_event_vol.data_pipeline._calendar_pilot_step", fail_calendar_pilot
+        "earnings_event_vol.data_pipeline._event_window_panel_step", fake_event_window_panel
     )
     monkeypatch.setattr(
         "earnings_event_vol.data_pipeline._contract_reference_validation_step",
@@ -3367,18 +3327,14 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
         "options-day-aggs-bulk",
         "universe",
         "dynamic-calendar",
-        "pilot-panel",
+        "event-window-panel",
         "contract-reference-validation",
         "trade-proxy-panel",
     ]
     assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran", "ran"]
-    assert len(captured_commands) == 2
-    pilot_command, trade_command = captured_commands
-    assert "build_pilot_panel.py" in pilot_command[1]
+    assert len(captured_commands) == 1
+    trade_command = captured_commands[0]
     assert "build_trade_proxy_panel.py" in trade_command[1]
-    assert str(out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv") in pilot_command
-    assert "--dte-min" in pilot_command
-    assert "--dte-max" in pilot_command
     assert "--max-contracts" in trade_command
 
 
@@ -3687,25 +3643,6 @@ def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
         )
     with pytest.raises(ValueError, match="contract frame missing"):
         build_trade_proxy_price_frame(pd.DataFrame({"event_id": ["x"]}), {})
-
-    pilot_panel_script = cast(Any, importlib.import_module("scripts.build_pilot_panel"))
-    pilot_no_inputs = pilot_panel_script._extract_event_ivar(
-        pd.DataFrame(),
-        pd.DataFrame(
-            {
-                "event_id": ["ABC_2026Q1"],
-                "ticker": ["ABC"],
-                "announcement_date": [date(2026, 2, 5)],
-                "exit_date": [date(2026, 2, 6)],
-                "s_before": [100.0],
-                "rvar_event": [0.01],
-            }
-        ),
-    )
-    assert pilot_no_inputs["ivar_event"].isna().all()
-    assert pilot_no_inputs["ivar_failure_reason"].iloc[0] == (
-        IVARFailureReason.NO_TWO_EVENT_COVERING_EXPIRIES.value
-    )
 
     windows = pd.DataFrame({"event_id": ["ABC_2026Q1"], "ticker": ["ABC"], "s_before": [100.0]})
     invalid_proxy_iv = attach_trade_proxy_local_iv(
@@ -4658,7 +4595,9 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     assert "implemented as a deterministic baseline" in unimplemented_model_message(
         "market_implied_event_variance"
     ) or "implemented and available" in unimplemented_model_message("market_implied_event_variance")
-    assert "implemented and available" in unimplemented_model_message("mamba_sequence_encoder")
+    assert "mamba_sequence_encoder" not in MODEL_REGISTRY
+    with pytest.raises(KeyError):
+        get_model_spec("mamba_sequence_encoder")
 
 
 def test_patell_wolfson_registry_text() -> None:
@@ -5115,7 +5054,13 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
     )
     assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
-    metric_paths = build_metric_tables(target_rows, out_dir=tmp_path / "metrics")
+    metrics_dir = tmp_path / "metrics"
+    (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").parent.mkdir()
+    (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").write_text("stale\n")
+    (metrics_dir / "strategy_trades_mask_only_mamba_sequence_encoder.csv").write_text("stale\n")
+    metric_paths = build_metric_tables(target_rows, out_dir=metrics_dir)
+    assert not (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").exists()
+    assert not (metrics_dir / "strategy_trades_mask_only_mamba_sequence_encoder.csv").exists()
     strategy = pd.read_csv(metric_paths["strategy_metrics"])
     assert {"day_c2c", "jump_c2o"}.issubset(set(strategy["target_id"]))
     c2o_strategy = strategy.loc[strategy["target_id"].eq("jump_c2o")]
@@ -5520,7 +5465,6 @@ def test_research_model_suite_and_error_paths() -> None:
             "last_four_ivar",
             "goyal_saretto_rv_iv_spread",
             "linear_elastic_net",
-            "mamba_sequence_encoder",
         ],
         split_date="2024-06-01",
     )
@@ -5533,7 +5477,6 @@ def test_research_model_suite_and_error_paths() -> None:
         "last_four_ivar",
         "goyal_saretto_rv_iv_spread",
         "linear_elastic_net",
-        "mamba_sequence_encoder",
     }
     assert (
         diagnostics.loc[diagnostics["model_id"].eq("market_implied_event_variance"), "status"].iloc[
@@ -5541,11 +5484,6 @@ def test_research_model_suite_and_error_paths() -> None:
         ]
         == "evaluated"
     )
-    assert (
-        diagnostics.loc[diagnostics["model_id"].eq("mamba_sequence_encoder"), "status"].iloc[0]
-        == "skipped_no_sequence_features"
-    )
-
     ft_fit = fit_ft_transformer(feature_frame, split_date="2024-06-01", epochs=1)
     assert ft_fit.predictions["forecast_ft_transformer"].ge(0).all()
     seq_frame = feature_frame.assign(
@@ -5560,9 +5498,6 @@ def test_research_model_suite_and_error_paths() -> None:
         "seq_t01_atm_iv",
         "seq_t01_volume",
     ]
-    mamba_fit = fit_mamba_sequence_encoder(seq_frame, split_date="2024-06-01", epochs=1)
-    assert mamba_fit.predictions["forecast_mamba_sequence_encoder"].ge(0).all()
-
     assert prediction_column_for_model("linear_elastic_net") == "forecast_linear_elastic_net"
     with pytest.raises(ValueError, match="unknown model_id"):
         run_model_suite(feature_frame, model_ids=["not_a_model"])

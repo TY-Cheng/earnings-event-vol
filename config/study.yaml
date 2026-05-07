@@ -47,7 +47,8 @@ baselines:
 
 models:
   - ft_transformer
-  - mamba_sequence_encoder
+  - daily_mamba_20step
+  - hybrid_mamba_31step
 
 strategies:
   main:

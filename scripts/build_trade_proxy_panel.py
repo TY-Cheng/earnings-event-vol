@@ -727,8 +727,8 @@ def build_trade_proxy_panel(
     contracts_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
     if not windows_path.exists() or not contracts_path.exists():
         raise FileNotFoundError(
-            "trade-proxy-panel requires an existing pilot-panel run with event windows and "
-            "candidate contracts."
+            "trade-proxy-panel requires an existing event-window-panel run with event windows "
+            "and candidate contracts."
         )
 
     silver_proxy_dir = config.silver_data_dir / "trade_proxy"

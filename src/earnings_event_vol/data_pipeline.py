@@ -25,6 +25,7 @@ from earnings_event_vol.contract_reference import (
 from earnings_event_vol.data_audit import audit_data_fields
 from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
+from earnings_event_vol.event_window_panel import build_event_window_panel
 from earnings_event_vol.market_covariates import (
     MARKET_COVARIATE_SCHEMA_VERSION,
     normalize_fred_vixcls_csv,
@@ -62,7 +63,7 @@ from earnings_event_vol.universe import (
     eligible_equity_cache_matches_rule,
 )
 
-DEFAULT_PILOT_TICKERS: tuple[str, ...] = (
+DEFAULT_STATIC_TICKERS: tuple[str, ...] = (
     "AAPL",
     "MSFT",
     "NVDA",
@@ -98,11 +99,10 @@ SUPPORTED_DATA_STAGES = {
     "market-second-covariates",
     "universe",
     "dynamic-calendar",
-    "calendar-pilot",
+    "event-window-panel",
     "contracts",
     "contract-reference-validation",
     "panel",
-    "pilot-panel",
     "trade-proxy-panel",
 }
 
@@ -1744,65 +1744,6 @@ def _options_day_aggs_bulk_step(
     )
 
 
-def _calendar_pilot_step(
-    config: ProjectConfig,
-    *,
-    out_root: Path,
-    tickers: Sequence[str],
-    start_date: date,
-    end_date: date,
-    sec_submissions_dir: Path | None,
-    massive_8k_text_dir: Path | None,
-    validate_with_massive: bool,
-    force: bool,
-) -> DataPipelineStep:
-    out = out_root / "earnings_calendar_pilot"
-    outputs = (out / "earnings_calendar_candidates.csv", out / "earnings_calendar_report.json")
-    params = {
-        "stage": "calendar-pilot",
-        "tickers": sorted({ticker.upper() for ticker in tickers if ticker.strip()}),
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "sec_submissions_dir": str(sec_submissions_dir) if sec_submissions_dir else None,
-        "massive_8k_text_dir": str(massive_8k_text_dir) if massive_8k_text_dir else None,
-        "validate_with_massive": validate_with_massive,
-    }
-    if not force and _complete_with_params(
-        outputs,
-        params_path=outputs[1],
-        expected_params=params,
-    ):
-        return DataPipelineStep(
-            "calendar-pilot",
-            "skipped",
-            outputs,
-            reason="outputs_exist_params_match",
-        )
-
-    frame, report = build_earnings_calendar_candidates(
-        config=config,
-        tickers=tickers,
-        start_date=start_date,
-        end_date=end_date,
-        sec_submissions_dir=sec_submissions_dir,
-        massive_8k_text_dir=massive_8k_text_dir,
-        validate_with_massive=validate_with_massive,
-    )
-    out.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(outputs[0], index=False)
-    report["pipeline_params"] = params
-    outputs[1].write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    return DataPipelineStep(
-        "calendar-pilot",
-        "ran",
-        outputs,
-        metadata={
-            "rows": int(report["row_count"]),
-            "main_sample_candidate_rows": int(report["main_sample_candidate_rows"]),
-        },
-    )
-
-
 def _path_signature(path: Path) -> dict[str, object]:
     if not path.exists():
         return {"path": str(path), "exists": False}
@@ -2086,7 +2027,7 @@ def _panel_step(
     )
 
 
-def _pilot_panel_step(
+def _event_window_panel_step(
     config: ProjectConfig,
     *,
     out_root: Path,
@@ -2096,69 +2037,73 @@ def _pilot_panel_step(
     max_events: int | None,
     calendar_path: Path | None = None,
 ) -> DataPipelineStep:
-    outputs = (
-        config.gold_data_dir / "event_panel" / "pilot_event_panel.parquet",
-        out_root / "event_panel" / "pilot_panel_report.json",
+    effective_calendar_path = calendar_path or (
+        out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
     )
-    if calendar_path is not None and not calendar_path.exists():
+    report_path = out_root / "event_window_panel" / "event_window_panel_report.json"
+    outputs = (
+        config.silver_data_dir / "event_windows" / "event_windows.parquet",
+        config.silver_data_dir / "contracts" / "event_contract_candidates.parquet",
+        report_path,
+    )
+    if not effective_calendar_path.exists():
         return DataPipelineStep(
-            "pilot-panel",
+            "event-window-panel",
             "blocked",
             outputs,
             reason="requires dynamic-calendar earnings_calendar_candidates.csv",
         )
-    effective_calendar_path = calendar_path or (
-        out_root / "earnings_calendar_pilot" / "earnings_calendar_candidates.csv"
-    )
+    second_expiry_dte_max = max(dte_max + 14, 28)
     params = {
-        "stage": "pilot-panel",
+        "stage": "event-window-panel",
         "calendar": str(effective_calendar_path),
         "dte_min": dte_min,
         "dte_max": dte_max,
+        "ivar_support_dte_max": second_expiry_dte_max,
         "max_events": max_events,
     }
-    outputs_complete = _complete(outputs)
     if not force and _complete_with_params(
         outputs,
-        params_path=outputs[1],
+        params_path=report_path,
         expected_params=params,
     ):
         return DataPipelineStep(
-            "pilot-panel",
+            "event-window-panel",
             "skipped",
             outputs,
             reason="outputs_exist_params_match",
         )
-    command = [
-        sys.executable,
-        str(config.repo_root / "scripts" / "build_pilot_panel.py"),
-        "--out-root",
-        str(out_root),
-        "--dte-min",
-        str(dte_min),
-        "--dte-max",
-        str(dte_max),
-    ]
-    command.extend(["--calendar", str(effective_calendar_path)])
-    if force or outputs_complete:
-        command.append("--force")
-    if max_events is not None:
-        command.extend(["--max-events", str(max_events)])
-    result = _run_command_with_progress(
-        command,
-        cwd=config.repo_root,
-        label="pilot-panel",
-    )
-    metadata: dict[str, object] = {"returncode": result.returncode}
-    if result.stdout.strip():
-        metadata["stdout_tail"] = result.stdout[-1000:]
-    if result.stderr.strip():
-        metadata["stderr_tail"] = result.stderr[-1000:]
+    try:
+        report = build_event_window_panel(
+            config=config,
+            calendar_path=effective_calendar_path,
+            out_root=out_root,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            strikes_per_expiry=3,
+            max_events=max_events,
+        )
+    except Exception as exc:
+        return DataPipelineStep(
+            "event-window-panel",
+            "blocked",
+            outputs,
+            reason="event_window_panel_failed",
+            metadata={"error": str(exc)},
+        )
+    metadata: dict[str, object] = {
+        key: int(value) if isinstance(value, int | float | str) else 0
+        for key, value in {
+            "events": report.get("events"),
+            "contracts": report.get("contracts"),
+            "quote_pool_contracts": report.get("quote_pool_contracts"),
+        }.items()
+    }
     return DataPipelineStep(
-        "pilot-panel",
-        "ran" if result.returncode == 0 and _complete(outputs) else "blocked",
+        "event-window-panel",
+        "ran" if _complete(outputs) else "blocked",
         outputs,
-        reason=None if result.returncode == 0 else "pilot_panel_script_failed",
+        reason=None if _complete(outputs) else "event_window_panel_outputs_missing",
         metadata=metadata,
     )
 
@@ -2474,7 +2419,7 @@ def _dry_run_estimate(
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
-            "pilot-panel",
+            "event-window-panel",
             "contract-reference-validation",
             "trade-proxy-panel",
         ]
@@ -2515,7 +2460,7 @@ def run_data_pipeline(
     out_root: Path,
     force: bool = False,
     jobs: int = 1,
-    tickers: Sequence[str] = DEFAULT_PILOT_TICKERS,
+    tickers: Sequence[str] = DEFAULT_STATIC_TICKERS,
     start_date: date = date(2013, 1, 1),
     end_date: date = date(2025, 12, 31),
     dates: Sequence[date] = (),
@@ -2578,10 +2523,9 @@ def run_data_pipeline(
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
-            "calendar-pilot",
             "contracts",
             "panel",
-            "pilot-panel",
+            "event-window-panel",
             "contract-reference-validation",
         ]
     elif normalized_stage == "proxy-all":
@@ -2589,7 +2533,7 @@ def run_data_pipeline(
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
-            "pilot-panel",
+            "event-window-panel",
             "contract-reference-validation",
             "trade-proxy-panel",
         ]
@@ -2597,7 +2541,7 @@ def run_data_pipeline(
         stages = [normalized_stage]
     normalized_tickers = sorted({ticker.upper() for ticker in tickers if ticker.strip()})
     if not normalized_tickers:
-        normalized_tickers = list(DEFAULT_PILOT_TICKERS)
+        normalized_tickers = list(DEFAULT_STATIC_TICKERS)
 
     stage_force = force
     step_builders: dict[str, Callable[[], list[DataPipelineStep]]] = {
@@ -2664,19 +2608,6 @@ def run_data_pipeline(
                 force=stage_force,
             )
         ],
-        "calendar-pilot": lambda: [
-            _calendar_pilot_step(
-                config,
-                out_root=out_root,
-                tickers=normalized_tickers,
-                start_date=start_date,
-                end_date=end_date,
-                sec_submissions_dir=sec_submissions_dir,
-                massive_8k_text_dir=massive_8k_text_dir,
-                validate_with_massive=validate_with_massive,
-                force=stage_force,
-            )
-        ],
         "contracts": lambda: [
             _contracts_step(
                 out_root=out_root,
@@ -2698,8 +2629,8 @@ def run_data_pipeline(
                 force=stage_force,
             )
         ],
-        "pilot-panel": lambda: [
-            _pilot_panel_step(
+        "event-window-panel": lambda: [
+            _event_window_panel_step(
                 config,
                 out_root=out_root,
                 force=stage_force,
@@ -2708,7 +2639,7 @@ def run_data_pipeline(
                 max_events=max_events,
                 calendar_path=(
                     out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
-                    if normalized_stage == "proxy-all"
+                    if normalized_stage in {"proxy-all", "event-window-panel"}
                     else None
                 ),
             )
