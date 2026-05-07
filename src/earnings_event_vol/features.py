@@ -88,9 +88,24 @@ def build_model_feature_matrix(
     date_col = _event_date_column(out)
     out["event_date"] = pd.to_datetime(out[date_col], errors="coerce").dt.date
     out["ticker"] = out["ticker"].astype(str).str.upper()
-    out["rvar_event"] = _numeric_or_nan(out, "rvar_event")
+    if "RVAR_event_day_c2c" in out.columns:
+        out["rvar_event"] = _numeric_or_nan(out, "RVAR_event_day_c2c")
+    else:
+        out["rvar_event"] = _numeric_or_nan(out, "rvar_event")
     out["ivar_event"] = _numeric_or_nan(out, "ivar_event")
     out["edge_var_realized"] = out["rvar_event"] - out["ivar_event"]
+    if "RVAR_event_jump_c2o" in out.columns:
+        out["edge_var_realized_jump_c2o"] = (
+            _numeric_or_nan(out, "RVAR_event_jump_c2o") - out["ivar_event"]
+        )
+    if "RVAR_event_day_c2c" in out.columns:
+        out["edge_var_realized_day_c2c"] = (
+            _numeric_or_nan(out, "RVAR_event_day_c2c") - out["ivar_event"]
+        )
+    if "RVAR_event_reaction_o2c" in out.columns:
+        out["edge_var_realized_reaction_o2c"] = (
+            _numeric_or_nan(out, "RVAR_event_reaction_o2c") - out["ivar_event"]
+        )
     if "dte_1" in out.columns:
         dte = pd.to_numeric(out["dte_1"], errors="coerce")
     elif "dte" in out.columns:

@@ -71,6 +71,11 @@ from earnings_event_vol.event_panel import (
     flag_possible_preannouncement_or_prior_guidance,
     select_forward_and_atm,
 )
+from earnings_event_vol.event_targets import (
+    add_event_return_targets,
+    available_target_columns,
+    target_label_column,
+)
 from earnings_event_vol.events import (
     align_event_window,
     has_ex_dividend_between,
@@ -159,12 +164,17 @@ from earnings_event_vol.models import (
 )
 from earnings_event_vol.research import (
     FORECAST_FLOOR,
+    HYBRID_SEQUENCE_FEATURE_NAMES,
+    HYBRID_STEPS,
     SEQUENCE_FEATURE_NAMES,
     aggregate_sequence_features,
     assign_event_splits,
     build_sequence_tensor,
     enrich_feature_matrix_for_research,
+    hybrid_sequence_coverage_by_event,
     inference_table,
+    prepare_target_frame,
+    proxy_surface_distribution_audit,
     proxy_transaction_cost,
     qlike_sanity_table,
     run_proxy_model_suite,
@@ -4614,6 +4624,79 @@ def test_feature_matrix_benchmarks_models_and_metrics() -> None:
     assert cost_sensitivity(trades).shape[0] == 5
 
 
+def test_event_target_decomposition_amc_bmo_and_open_audit() -> None:
+    windows = pd.DataFrame(
+        {
+            "event_id": ["AMC", "BMO"],
+            "ticker": ["AAA", "BBB"],
+            "announcement_timing": ["AMC", "BMO"],
+            "entry_date": [date(2026, 2, 5), date(2026, 2, 4)],
+            "exit_date": [date(2026, 2, 6), date(2026, 2, 5)],
+        }
+    )
+    bars = pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA", "BBB", "BBB"],
+            "date": [date(2026, 2, 5), date(2026, 2, 6), date(2026, 2, 4), date(2026, 2, 5)],
+            "open": [99.0, 108.0, 49.0, 55.0],
+            "close": [100.0, 110.0, 50.0, 54.0],
+            "volume": [10, 11, 12, 13],
+        }
+    )
+    out = add_event_return_targets(windows, bars)
+    assert out.loc[0, "close_before"] == pytest.approx(100.0)
+    assert out.loc[0, "open_after"] == pytest.approx(108.0)
+    assert out.loc[0, "close_after"] == pytest.approx(110.0)
+    assert out.loc[1, "close_before"] == pytest.approx(50.0)
+    assert out.loc[1, "open_after"] == pytest.approx(55.0)
+    np.testing.assert_allclose(out["return_decomposition_residual"], 0.0, atol=1e-7)
+    np.testing.assert_allclose(out["RVAR_day_reconstructed"], out["RVAR_event_day_c2c"])
+    assert out["rvar_event"].equals(out["RVAR_event_day_c2c"])
+    assert set(out["open_after_status"]) == {"vendor_regular_ohlc_assumed"}
+
+    missing = add_event_return_targets(windows.iloc[[0]], bars.iloc[[0]])
+    assert missing["open_after_status"].iloc[0] == "unavailable"
+    assert pd.isna(missing["RVAR_event_jump_c2o"].iloc[0])
+
+    missing_dates = add_event_return_targets(
+        pd.DataFrame(
+            {
+                "event_id": ["NO_DATES"],
+                "ticker": ["AAA"],
+                "announcement_timing": ["AMC"],
+                "entry_date": [None],
+                "exit_date": [None],
+            }
+        ),
+        pd.DataFrame(),
+    )
+    assert missing_dates["open_after_status"].iloc[0] == "unavailable"
+    assert pd.isna(missing_dates["rvar_event"].iloc[0])
+
+    features = build_model_feature_matrix(
+        out.assign(
+            ivar_event=[0.01, 0.02],
+            dte_1=[7, 8],
+            universe_rank=[1, 2],
+        )
+    )
+    assert features["rvar_event"].equals(features["RVAR_event_day_c2c"])
+    assert "edge_var_realized_jump_c2o" in features
+    assert "edge_var_realized_day_c2c" in features
+    assert "edge_var_realized_reaction_o2c" in features
+
+    targets = available_target_columns(out)
+    assert targets == {
+        "jump_c2o": "RVAR_event_jump_c2o",
+        "day_c2c": "RVAR_event_day_c2c",
+        "reaction_o2c": "RVAR_event_reaction_o2c",
+    }
+    assert target_label_column("day_c2c", out) == "RVAR_event_day_c2c"
+    assert target_label_column("day_c2c", pd.DataFrame({"rvar_event": [0.1]})) == "rvar_event"
+    with pytest.raises(ValueError, match="unsupported target_id"):
+        target_label_column("bad_target", out)
+
+
 def test_sequence_matrix_and_torch_sequence_models() -> None:
     rows = pd.DataFrame(
         {
@@ -4766,6 +4849,22 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         sequence_by_event=by_event,
         sequence_aggregates=aggregates,
     )
+    target_rows = pd.concat(
+        [
+            prepare_target_frame(
+                features.assign(
+                    RVAR_event_jump_c2o=features["rvar_event"] * 0.8,
+                    RVAR_event_day_c2c=features["rvar_event"],
+                    RVAR_event_reaction_o2c=features["rvar_event"] * 0.2,
+                ),
+                target_id=target_id,
+            )
+            for target_id in ["jump_c2o", "day_c2c", "reaction_o2c"]
+        ],
+        ignore_index=True,
+    )
+    assert target_rows.groupby("event_id")["split"].nunique().max() == 1
+    assert set(target_rows["target_id"]) == {"jump_c2o", "day_c2c", "reaction_o2c"}
     assert set(features["split"]) == {"train", "validation", "test"}
     assert features.groupby("event_id")["split"].nunique().max() == 1
     tensor_path = tmp_path / "sequence_tensor.npz"
@@ -4775,14 +4874,80 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert payload["time_mask"].shape == (40, 20)
     assert payload["feature_mask"].shape == (40, 20, len(SEQUENCE_FEATURE_NAMES))
 
+    hybrid_rows: list[dict[str, object]] = []
+    for event_idx, event_id in enumerate(events["event_id"]):
+        for seq_idx in range(HYBRID_STEPS):
+            is_intraday = seq_idx >= 19
+            row = {
+                "event_id": event_id,
+                "ticker": events.loc[event_idx, "ticker"],
+                "entry_date": events.loc[event_idx, "entry_date"].date(),
+                "exit_date": events.loc[event_idx, "exit_date"].date(),
+                "source_date": events.loc[event_idx, "entry_date"].date(),
+                "source_timestamp": (
+                    pd.Timestamp(events.loc[event_idx, "entry_date"])
+                    + pd.Timedelta(minutes=seq_idx)
+                ).isoformat(),
+                "event_entry_timestamp": (
+                    pd.Timestamp(events.loc[event_idx, "entry_date"]) + pd.Timedelta(hours=16)
+                ).isoformat(),
+                "seq_index": seq_idx,
+                "is_intraday_bin": float(is_intraday),
+                "step_type": "intraday" if is_intraday else "daily",
+                "step_type_intraday": float(is_intraday),
+                "hybrid_valid_step": True,
+            }
+            for feature in HYBRID_SEQUENCE_FEATURE_NAMES:
+                row.setdefault(feature, 0.01 * (event_idx + 1) + 0.001 * seq_idx)
+            hybrid_rows.append(row)
+    hybrid_long = pd.DataFrame(hybrid_rows)
+    hybrid_by_event = hybrid_sequence_coverage_by_event(hybrid_long)
+    assert hybrid_by_event["intraday_valid_bin_count"].min() == 12
+    features = features.merge(
+        hybrid_by_event[
+            [
+                "event_id",
+                "intraday_valid_bin_count",
+                "latest_5min_valid_surface",
+                "hybrid_feature_mask_density",
+                "hybrid_mamba_eligible_v1",
+            ]
+        ],
+        on="event_id",
+        how="left",
+        suffixes=("", "_hybrid"),
+    )
+    if "hybrid_mamba_eligible_v1_hybrid" in features:
+        features["hybrid_mamba_eligible_v1"] = features["hybrid_mamba_eligible_v1_hybrid"]
+    features["hybrid_sequence_too_sparse"] = False
+    hybrid_tensor_path = tmp_path / "hybrid_sequence_tensor.npz"
+    hybrid_tensor_report = build_sequence_tensor(
+        hybrid_long,
+        features,
+        out_path=hybrid_tensor_path,
+        feature_names=HYBRID_SEQUENCE_FEATURE_NAMES,
+        lookback_days=HYBRID_STEPS,
+        per_step_type_scaling=True,
+    )
+    hybrid_payload = np.load(hybrid_tensor_path, allow_pickle=True)
+    assert hybrid_tensor_report["shape"] == [40, 31, len(HYBRID_SEQUENCE_FEATURE_NAMES)]
+    assert hybrid_payload["time_mask"].shape == (40, 31)
+    assert hybrid_payload["feature_mask"].shape == (40, 31, len(HYBRID_SEQUENCE_FEATURE_NAMES))
+    assert set(hybrid_payload["step_type"][0].tolist()) == {"daily", "intraday"}
+    audit = proxy_surface_distribution_audit(hybrid_long.assign(iv_extraction_source="synthetic"))
+    assert {"iv_extraction_source", "metric", "missing_rate"}.issubset(audit.columns)
+
     predictions, diagnostics = run_proxy_model_suite(
         features,
         tensor_path=tensor_path,
+        hybrid_tensor_path=hybrid_tensor_path,
         model_ids=[
             "market_implied_event_variance",
             "linear_elastic_net",
-            "mamba_sequence_encoder",
-            "mask_only_mamba_sequence_encoder",
+            "daily_mamba_20step",
+            "hybrid_mamba_31step",
+            "intraday_only_mamba_12step",
+            "mask_only_hybrid_mamba",
         ],
     )
     assert (
@@ -4792,16 +4957,20 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         == "evaluated"
     )
     assert (
-        diagnostics.loc[diagnostics["model_id"].eq("mamba_sequence_encoder"), "status"].iloc[0]
+        diagnostics.loc[diagnostics["model_id"].eq("daily_mamba_20step"), "status"].iloc[0]
         == "trained"
     )
-    mamba_forecast = predictions["forecast_mamba_sequence_encoder"].dropna()
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("hybrid_mamba_31step"), "status"].iloc[0]
+        == "trained"
+    )
+    mamba_forecast = predictions["forecast_daily_mamba_20step"].dropna()
     assert mamba_forecast.gt(0).all()
     assert mamba_forecast.std() > 0
 
     qlike, extremes = qlike_sanity_table(
         predictions,
-        forecast_columns={"mamba_sequence_encoder": "forecast_mamba_sequence_encoder"},
+        forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
     )
     assert qlike["floored_qlike"].notna().all()
     assert set(
@@ -4821,7 +4990,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert pytest.approx(1e-6) == FORECAST_FLOOR
     inference = inference_table(
         predictions,
-        forecast_columns={"mamba_sequence_encoder": "forecast_mamba_sequence_encoder"},
+        forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
     )
     assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
 

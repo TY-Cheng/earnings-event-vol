@@ -65,7 +65,9 @@ Event variance construction:
 
 - AMC and BMO event windows use the documented pre-announcement close.
 - DMH and unknown timing are excluded from the first main sample.
-- `RVAR_event` uses the documented close-to-close event move.
+- Target construction writes C2O, C2C, and O2C realized-variance columns.
+- `rvar_event` remains the documented close-to-close alias for V1 proxy PnL.
+- C2O is not described as executable option PnL.
 - `IVAR_event` is extracted from total ATM implied variance across two expiries
   that cover the realized event window.
 - Negative and nonmonotone IVAR extractions are flagged and reported.

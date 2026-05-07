@@ -35,14 +35,15 @@ The current proxy route uses three required market-data inputs:
 
 - **Options day aggregates** for dynamic-universe liquidity ranking, contract
   discovery, local IV/IVAR proxy inputs, same-contract option exit closes, and
-  the 20-day close-trade-implied option-surface sequence.
-- **Underlying stock day aggregates** for underlying closes, event returns,
-  `RVAR_event`, and exit spot.
+  the daily close-trade-implied option-surface sequence.
+- **Underlying stock day aggregates** for underlying closes, vendor OHLC opens,
+  C2O/C2C/O2C event returns, and exit spot.
 - **Option one-second trade aggregates** for targeted pre-cutoff entry proxies.
   Massive REST is queried with `/range/1/second/<date>/<date>`. The bronze
   cache keeps only bars in the resolved pre-cutoff buffer, default 60 minutes
   before the event cutoff. Entry selection then uses the latest positive
-  `option_vwap` or `option_close` in the final 900 seconds before cutoff.
+  `option_vwap` or `option_close` in the final 900 seconds before cutoff. The
+  same cached bars can feed the 12-bin entry-day intraday proxy sequence.
 
 Candidate contracts are validated against Massive option reference metadata
 before entry proxy fetching. Non-100 or adjusted deliverables are marked
@@ -50,14 +51,16 @@ before entry proxy fetching. Non-100 or adjusted deliverables are marked
 create paper-grade execution claims.
 
 The one-second aggregates are trade OHLCV bars. They are not quote midpoints,
-bid/ask records, or NBBO.
+bid/ask records, or NBBO. Intraday sequence features are therefore
+trade-aggregate proxy surfaces, not observed NBBO-mid IV surfaces.
 
-Optional market-state controls can be added with `just data
+Market-state controls are availability-gated with `just data
 market-second-covariates`: SPY/QQQ option one-second aggregates and SPY/QQQ
-underlying one-second aggregates at the event entry cutoff. Those controls add
-entry-as-of ATM IV proxy, term slope, skew, butterfly, straddle premium over
-spot, option activity, and underlying pre-cutoff return. They follow the same
-`no_nbbo_trade_proxy` caveat.
+underlying one-second aggregates at the event entry cutoff. When present, those
+controls add entry-as-of ATM IV proxy, term slope, skew, butterfly, straddle
+premium over spot, option activity, and underlying pre-cutoff return. Missing
+coverage is reported and the no-market-control specification remains valid.
+They follow the same `no_nbbo_trade_proxy` caveat.
 
 The underlying universe is dynamic rather than a fixed ticker list:
 
@@ -92,7 +95,7 @@ Latest proxy data pipeline outputs:
 | Dynamic-calendar rows | 1,054 |
 | BMO/AMC main-sample candidates | 810 |
 | Trade-proxy event-panel rows | 810 |
-| Events with `RVAR_event` | 801 |
+| Events with C2C `rvar_event` alias | 801 |
 | Events with trade-proxy `IVAR_event` | 690 |
 | Proxy contract candidates | 12,038 |
 | Contracts with usable pre-cutoff proxy price | 10,165 |
@@ -241,6 +244,9 @@ Local raw outputs:
 | Dynamic calendar report | `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json` |
 | Trade-proxy panel report | `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` |
 | Feature matrix | `data/gold/modeling/feature_matrix.parquet` |
+| Daily sequence tensor | `data/gold/modeling/sequence_tensor.npz` |
+| Hybrid sequence tensor | `data/gold/modeling/hybrid_sequence_tensor.npz` |
+| Proxy surface distribution audit | `artifacts/modeling/proxy_surface_distribution_audit.csv` |
 | Forecast metrics | `artifacts/modeling/forecast_metrics.csv` |
 | Ranking metrics | `artifacts/modeling/ranking_metrics.csv` |
 | Strategy metrics | `artifacts/modeling/strategy_metrics.csv` |

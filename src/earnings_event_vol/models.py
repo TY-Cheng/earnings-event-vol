@@ -15,7 +15,13 @@ MARKET_BASELINE_COL = "ivar_event"
 PREDICTION_PREFIX = "forecast_"
 DEFAULT_FEATURE_EXCLUDE_PATTERNS = (
     "rvar_event",
+    "rvar_",
+    "r_event_",
     "s_after",
+    "close_after",
+    "open_after",
+    "return_decomposition",
+    "cross_term",
     "gross_proxy_pnl_usd",
     "haircut_pnl_usd",
     "net_proxy_pnl_usd",
@@ -122,6 +128,34 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         implemented=True,
         justification="Selective sequence encoder for 20-day pre-event option-surface paths.",
         risk="Requires sequence features; tabular proxy panels alone are not enough.",
+    ),
+    "daily_mamba_20step": ModelSpec(
+        model_id="daily_mamba_20step",
+        role="deep_model",
+        implemented=True,
+        justification="Daily 20-step proxy-surface sequence encoder.",
+        risk="Uses close-trade-implied daily proxy surfaces, not NBBO-mid surfaces.",
+    ),
+    "hybrid_mamba_31step": ModelSpec(
+        model_id="hybrid_mamba_31step",
+        role="deep_model",
+        implemented=True,
+        justification="Hybrid 19 daily plus 12 intraday proxy-surface sequence encoder.",
+        risk="Intraday trade-aggregate sparsity can make this diagnostic rather than headline.",
+    ),
+    "intraday_only_mamba_12step": ModelSpec(
+        model_id="intraday_only_mamba_12step",
+        role="deep_model",
+        implemented=True,
+        justification="Entry-day 12-bin intraday proxy-surface sequence ablation.",
+        risk="Short sequence; not a full long-horizon Mamba architecture test.",
+    ),
+    "mask_only_hybrid_mamba": ModelSpec(
+        model_id="mask_only_hybrid_mamba",
+        role="deep_model",
+        implemented=True,
+        justification="Hybrid sequence missingness-pattern ablation with values zeroed.",
+        risk="Diagnostic only; high performance would indicate selection/missingness signal.",
     ),
 }
 
@@ -565,6 +599,11 @@ def prediction_column_for_model(model_id: str) -> str:
         "xgboost": "forecast_xgboost",
         "ft_transformer": "forecast_ft_transformer",
         "mamba_sequence_encoder": "forecast_mamba_sequence_encoder",
+        "daily_mamba_20step": "forecast_daily_mamba_20step",
+        "hybrid_mamba_31step": "forecast_hybrid_mamba_31step",
+        "intraday_only_mamba_12step": "forecast_intraday_only_mamba_12step",
+        "mask_only_hybrid_mamba": "forecast_mask_only_hybrid_mamba",
+        "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
     }
     return mapping[model_id]
 

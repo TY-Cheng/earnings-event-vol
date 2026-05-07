@@ -17,6 +17,7 @@ from scipy.optimize import brentq
 
 from earnings_event_vol.backtest import black_scholes_price, build_proxy_strategy_frame
 from earnings_event_vol.config import ProjectConfig
+from earnings_event_vol.event_targets import available_target_columns, target_label_column
 from earnings_event_vol.features import build_model_feature_matrix
 from earnings_event_vol.market_covariates import (
     VIX_ALIGNMENT_PRIOR_CLOSE,
@@ -48,6 +49,9 @@ DEFAULT_HAIRCUT_BPS = 0.005
 DEFAULT_OPTION_MULTIPLIER = 100.0
 DEFAULT_CONTRACTS = 1.0
 LOOKBACK_DAYS = 20
+HYBRID_DAILY_STEPS = 19
+HYBRID_INTRADAY_STEPS = 12
+HYBRID_STEPS = HYBRID_DAILY_STEPS + HYBRID_INTRADAY_STEPS
 MAMBA_MIN_VALID_DAYS = 12
 MAMBA_LATEST_DAYS = 5
 BASE_OPTION_SURFACE_FEATURE_NAMES = [
@@ -80,6 +84,44 @@ SEQUENCE_FEATURE_NAMES = [
     "vix_percentile_252d",
     "vix_above_30",
 ]
+HYBRID_SEQUENCE_FEATURE_NAMES = [
+    "atm_iv_proxy",
+    "event_ivar_proxy",
+    "term_slope_proxy",
+    "skew_proxy",
+    "butterfly_proxy",
+    "straddle_premium_to_spot",
+    "valid_pair_count",
+    "surface_missing_rate",
+    "option_volume_sum",
+    "option_transactions_sum",
+    "underlying_return_in_bin",
+    "underlying_volume_sum",
+    "latest_option_trade_bar_age_seconds",
+    "underlying_bar_age_seconds",
+    "is_intraday_bin",
+    "step_type_intraday",
+    "log_delta_minutes_from_prev_step",
+    "normalized_time_to_entry",
+    "hours_until_announcement_proxy",
+    "iv_extraction_source_daily_close_trade",
+    "iv_extraction_source_intraday_5min_last_trade",
+]
+HYBRID_SURFACE_VALUE_FEATURE_NAMES = [
+    feature
+    for feature in HYBRID_SEQUENCE_FEATURE_NAMES
+    if feature
+    not in {
+        "is_intraday_bin",
+        "step_type_intraday",
+        "log_delta_minutes_from_prev_step",
+        "normalized_time_to_entry",
+        "hours_until_announcement_proxy",
+        "iv_extraction_source_daily_close_trade",
+        "iv_extraction_source_intraday_5min_last_trade",
+    }
+]
+TARGET_IDS = ["jump_c2o", "day_c2c", "reaction_o2c"]
 MODEL_IDS = [
     "market_implied_event_variance",
     "last_four_rvar",
@@ -89,8 +131,10 @@ MODEL_IDS = [
     "lightgbm",
     "xgboost",
     "ft_transformer",
-    "mamba_sequence_encoder",
-    "mask_only_mamba_sequence_encoder",
+    "daily_mamba_20step",
+    "hybrid_mamba_31step",
+    "intraday_only_mamba_12step",
+    "mask_only_hybrid_mamba",
 ]
 DETERMINISTIC_MODEL_IDS = {
     "market_implied_event_variance",
@@ -112,6 +156,8 @@ class ResearchPaths:
     feature_matrix_path: Path
     sequence_long_path: Path
     sequence_tensor_path: Path
+    hybrid_sequence_long_path: Path
+    hybrid_sequence_tensor_path: Path
     predictions_path: Path
 
 
@@ -143,6 +189,12 @@ def research_paths(config: ProjectConfig) -> ResearchPaths:
         / "modeling"
         / "option_surface_sequence_long.parquet",
         sequence_tensor_path=config.gold_data_dir / "modeling" / "sequence_tensor.npz",
+        hybrid_sequence_long_path=config.silver_data_dir
+        / "modeling"
+        / "option_proxy_surface_hybrid_sequence_long.parquet",
+        hybrid_sequence_tensor_path=config.gold_data_dir
+        / "modeling"
+        / "hybrid_sequence_tensor.npz",
         predictions_path=modeling_artifacts / "model_predictions.parquet",
     )
 
@@ -300,6 +352,31 @@ def list_bronze_dates(root: Path) -> list[date]:
         except ValueError:
             continue
     return sorted(set(out))
+
+
+def _safe_second_partition_value(value: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in value)
+
+
+def _option_second_agg_cache_path(
+    config: ProjectConfig,
+    *,
+    option_ticker: str,
+    entry_date: date,
+    cutoff_timestamp: pd.Timestamp,
+    buffer_minutes: int = 60,
+) -> Path:
+    cutoff = cutoff_timestamp.tz_convert("America/New_York").strftime("%H%M")
+    return (
+        config.bronze_data_dir
+        / "massive"
+        / "options_second_aggs"
+        / f"date={entry_date.isoformat()}"
+        / f"cutoff={cutoff}"
+        / f"buffer_minutes={buffer_minutes}"
+        / f"options_ticker={_safe_second_partition_value(option_ticker)}"
+        / "part.parquet"
+    )
 
 
 def _option_regex_for_tickers(tickers: Iterable[str]) -> str:
@@ -942,6 +1019,473 @@ def aggregate_sequence_features(
     return pd.DataFrame(rows)
 
 
+def _event_timestamp(value: object) -> pd.Timestamp | None:
+    if value is None or pd.isna(value):
+        return None
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("America/New_York")
+    return timestamp.tz_convert("America/New_York")
+
+
+def _announcement_proxy_timestamp(record: Mapping[str, object]) -> tuple[pd.Timestamp | None, str]:
+    value = record.get("announcement_proxy_timestamp") or record.get("source_timestamp")
+    timestamp = _event_timestamp(value)
+    if timestamp is None:
+        return None, "unavailable"
+    source = str(record.get("announcement_proxy_source") or "sec_acceptance_timestamp")
+    return timestamp, source
+
+
+def _calendar_minutes(later: pd.Timestamp, earlier: pd.Timestamp) -> float:
+    return float((later - earlier).total_seconds() / 60.0)
+
+
+def _compute_hybrid_time_features(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    out["source_timestamp"] = pd.to_datetime(out["source_timestamp"], errors="coerce", utc=True)
+    out["event_entry_timestamp"] = pd.to_datetime(
+        out["event_entry_timestamp"], errors="coerce", utc=True
+    )
+    rows: list[pd.DataFrame] = []
+    for _event_id, group in out.sort_values(["event_id", "seq_index"]).groupby("event_id"):
+        part = group.copy()
+        source_ts = part["source_timestamp"]
+        previous = source_ts.shift(1)
+        delta_minutes = (source_ts - previous).dt.total_seconds() / 60.0
+        delta_minutes = delta_minutes.fillna(1440.0).clip(lower=1.0)
+        part["log_delta_minutes_from_prev_step"] = np.log1p(delta_minutes)
+        entry_ts = part["event_entry_timestamp"]
+        minutes_to_entry = (source_ts - entry_ts).dt.total_seconds() / 60.0
+        part["normalized_time_to_entry"] = minutes_to_entry / float(20 * 24 * 60)
+        rows.append(part)
+    return pd.concat(rows, ignore_index=True)
+
+
+def _daily_hybrid_rows(daily_long: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    if daily_long.empty:
+        return pd.DataFrame()
+    event_meta = ensure_event_id(events).set_index("event_id").to_dict("index")
+    rows: list[dict[str, object]] = []
+    for event_id, group in daily_long.groupby("event_id", dropna=False):
+        meta = event_meta.get(str(event_id), {})
+        entry_date = pd.Timestamp(meta.get("entry_date") or group["entry_date"].iloc[0]).date()
+        eligible = group.loc[pd.to_datetime(group["source_date"]).dt.date < entry_date].copy()
+        eligible = eligible.sort_values("source_date").tail(HYBRID_DAILY_STEPS)
+        start = HYBRID_DAILY_STEPS - len(eligible)
+        proxy_ts, proxy_source = _announcement_proxy_timestamp(meta)
+        for offset, record in enumerate(eligible.to_dict("records")):
+            seq_index = start + offset
+            source_date = pd.Timestamp(record["source_date"]).date()
+            source_timestamp = pd.Timestamp(source_date, tz="America/New_York") + pd.Timedelta(
+                hours=16
+            )
+            hours_until = (
+                None
+                if proxy_ts is None
+                else float((proxy_ts - source_timestamp).total_seconds() / 3600.0)
+            )
+            rows.append(
+                {
+                    **record,
+                    "seq_index": int(seq_index),
+                    "source_timestamp": source_timestamp.isoformat(),
+                    "is_intraday_bin": 0.0,
+                    "step_type": "daily",
+                    "step_type_intraday": 0.0,
+                    "iv_extraction_source": "daily_close_trade",
+                    "iv_extraction_source_daily_close_trade": 1.0,
+                    "iv_extraction_source_intraday_5min_last_trade": 0.0,
+                    "skew_proxy": record.get("iv_skew_proxy"),
+                    "butterfly_proxy": record.get("iv_butterfly_proxy"),
+                    "underlying_return_in_bin": record.get("underlying_return_1d"),
+                    "underlying_volume_sum": np.nan,
+                    "latest_option_trade_bar_age_seconds": np.nan,
+                    "underlying_bar_age_seconds": np.nan,
+                    "hours_until_announcement_proxy": hours_until,
+                    "announcement_proxy_source": proxy_source,
+                    "hybrid_valid_step": bool(record.get("is_valid_sequence_day", False)),
+                    "intraday_window_spec": "daily_prior_19",
+                    "underlying_spot_source": "daily_close",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _load_second_bars_for_contracts(
+    config: ProjectConfig,
+    *,
+    contracts: pd.DataFrame,
+    event: Mapping[str, object],
+    buffer_minutes: int = 60,
+) -> pd.DataFrame:
+    if contracts.empty:
+        return pd.DataFrame()
+    entry_date = pd.Timestamp(event["entry_date"]).date()
+    cutoff = _event_timestamp(event.get("event_entry_timestamp"))
+    if cutoff is None:
+        return pd.DataFrame()
+    frames: list[pd.DataFrame] = []
+    for row in contracts.to_dict("records"):
+        path = _option_second_agg_cache_path(
+            config,
+            option_ticker=str(row["options_ticker"]),
+            entry_date=entry_date,
+            cutoff_timestamp=cutoff,
+            buffer_minutes=buffer_minutes,
+        )
+        if not path.exists() or path.stat().st_size <= 0:
+            continue
+        try:
+            bars = pd.read_parquet(path)
+        except Exception:
+            continue
+        for column, value in row.items():
+            if column not in bars.columns:
+                bars[column] = value
+        frames.append(bars)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _intraday_bin_surface(
+    bars: pd.DataFrame,
+    *,
+    spot: float,
+    source_date: date,
+    bin_start: pd.Timestamp,
+    bin_end: pd.Timestamp,
+) -> dict[str, object]:
+    base = {
+        "surface_source": "options_second_aggs",
+        "iv_source": "intraday_5min_last_trade",
+        "panel_grade": "no_nbbo_trade_proxy",
+        "underlying_spot_source": "s_before_fallback",
+        "underlying_bar_age_seconds": np.nan,
+        "underlying_return_in_bin": np.nan,
+        "underlying_volume_sum": np.nan,
+    }
+    if bars.empty or not np.isfinite(spot) or spot <= 0:
+        return {
+            **base,
+            **{feature: np.nan for feature in HYBRID_SURFACE_VALUE_FEATURE_NAMES},
+            "valid_pair_count": 0,
+            "surface_missing_rate": 1.0,
+            "hybrid_valid_step": False,
+        }
+    frame = bars.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame["timestamp_et"], errors="coerce")
+    if frame["timestamp_et"].dt.tz is None:
+        frame["timestamp_et"] = frame["timestamp_et"].dt.tz_localize("America/New_York")
+    frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
+    frame = frame.loc[frame["timestamp_et"].between(bin_start, bin_end, inclusive="both")].copy()
+    if frame.empty:
+        return {
+            **base,
+            **{feature: np.nan for feature in HYBRID_SURFACE_VALUE_FEATURE_NAMES},
+            "valid_pair_count": 0,
+            "surface_missing_rate": 1.0,
+            "hybrid_valid_step": False,
+        }
+    frame = (
+        frame.sort_values("timestamp_et").groupby("options_ticker", as_index=False).tail(1).copy()
+    )
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
+    frame["option_price"] = pd.to_numeric(
+        frame.get("option_vwap", frame.get("option_close")), errors="coerce"
+    )
+    frame["moneyness_abs"] = (frame["strike"] / spot - 1.0).abs()
+    frame = frame.loc[frame["moneyness_abs"].le(0.05) & frame["option_price"].gt(0)].copy()
+    if frame.empty:
+        return {
+            **base,
+            **{feature: np.nan for feature in HYBRID_SURFACE_VALUE_FEATURE_NAMES},
+            "valid_pair_count": 0,
+            "surface_missing_rate": 1.0,
+            "hybrid_valid_step": False,
+        }
+    frame["dte"] = (pd.to_datetime(frame["expiration"]).dt.date - source_date).map(
+        lambda delta: delta.days
+    )
+    ivs: list[float | None] = []
+    for record in frame.to_dict("records"):
+        ivs.append(
+            _implied_volatility(
+                spot=spot,
+                strike=float(record["strike"]),
+                time_to_expiry=max(float(record["dte"]) / 365.0, 1.0 / 365.0),
+                option_price=float(record["option_price"]),
+                right=str(record["right"]),
+            )
+        )
+    frame["iv_proxy"] = ivs
+    frame = frame.dropna(subset=["iv_proxy"])
+    pair_rows = frame.loc[
+        frame.groupby(["expiration", "strike"])["right"].transform("nunique").ge(2)
+    ].copy()
+    valid_pair_count = int(pair_rows.groupby(["expiration", "strike"]).ngroups)
+    if pair_rows.empty:
+        return {
+            **base,
+            **{feature: np.nan for feature in HYBRID_SURFACE_VALUE_FEATURE_NAMES},
+            "option_volume_sum": float(frame.get("volume", pd.Series(dtype=float)).sum()),
+            "option_transactions_sum": float(
+                frame.get("transactions", pd.Series(dtype=float)).sum()
+            ),
+            "valid_pair_count": 0,
+            "surface_missing_rate": 1.0,
+            "hybrid_valid_step": False,
+        }
+    atm_key = (
+        pair_rows.groupby(["expiration", "strike"], as_index=False)
+        .agg(moneyness_abs=("moneyness_abs", "mean"))
+        .sort_values("moneyness_abs")
+        .head(1)
+    )
+    expiration = atm_key.iloc[0]["expiration"]
+    strike = atm_key.iloc[0]["strike"]
+    atm = pair_rows.loc[pair_rows["expiration"].eq(expiration) & pair_rows["strike"].eq(strike)]
+    call = atm.loc[atm["right"].astype(str).eq("call")]
+    put = atm.loc[atm["right"].astype(str).eq("put")]
+    atm_iv_proxy = float(atm["iv_proxy"].mean())
+    skew_proxy = (
+        np.nan
+        if call.empty or put.empty
+        else float(put["iv_proxy"].mean() - call["iv_proxy"].mean())
+    )
+    straddle_premium_to_spot = (
+        np.nan
+        if call.empty or put.empty
+        else float((call["option_price"].mean() + put["option_price"].mean()) / spot)
+    )
+    near = pair_rows.loc[pair_rows["dte"].between(3, 14, inclusive="both")]
+    far = pair_rows.loc[pair_rows["dte"].between(15, 45, inclusive="both")]
+    term_slope_proxy = (
+        np.nan
+        if near.empty or far.empty
+        else float(far["iv_proxy"].mean() - near["iv_proxy"].mean())
+    )
+    by_strike = pair_rows.groupby("strike", as_index=False)["iv_proxy"].mean().sort_values("strike")
+    butterfly_proxy = np.nan
+    if len(by_strike) >= 3:
+        middle = int(np.argmin(np.abs(by_strike["strike"].to_numpy(dtype=float) - spot)))
+        low = max(0, middle - 1)
+        high = min(len(by_strike) - 1, middle + 1)
+        if low != middle and high != middle:
+            butterfly_proxy = float(
+                by_strike.iloc[low]["iv_proxy"]
+                + by_strike.iloc[high]["iv_proxy"]
+                - 2.0 * by_strike.iloc[middle]["iv_proxy"]
+            )
+    event_ivar_proxy = float(max(atm_iv_proxy, 0.0) ** 2 / 365.0)
+    age_seconds = float((bin_end - frame["timestamp_et"].max()).total_seconds())
+    return {
+        **base,
+        "atm_iv_proxy": atm_iv_proxy,
+        "event_ivar_proxy": event_ivar_proxy,
+        "term_slope_proxy": term_slope_proxy,
+        "skew_proxy": skew_proxy,
+        "butterfly_proxy": butterfly_proxy,
+        "straddle_premium_to_spot": straddle_premium_to_spot,
+        "valid_pair_count": valid_pair_count,
+        "surface_missing_rate": float(max(0.0, 1.0 - min(valid_pair_count, 10) / 10.0)),
+        "option_volume_sum": float(pd.to_numeric(frame["volume"], errors="coerce").sum()),
+        "option_transactions_sum": float(
+            pd.to_numeric(frame["transactions"], errors="coerce").sum()
+        ),
+        "latest_option_trade_bar_age_seconds": age_seconds,
+        "hybrid_valid_step": bool(valid_pair_count > 0 and np.isfinite(atm_iv_proxy)),
+    }
+
+
+def _intraday_hybrid_rows(
+    events: pd.DataFrame,
+    *,
+    config: ProjectConfig,
+    buffer_minutes: int = 60,
+) -> pd.DataFrame:
+    events = ensure_event_id(events)
+    candidates = _load_sequence_contract_candidates(config, events["event_id"].astype(str).tolist())
+    if candidates.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    candidates_by_event = {
+        str(event_id): group.copy() for event_id, group in candidates.groupby("event_id")
+    }
+    for event in events.to_dict("records"):
+        event_id = str(event["event_id"])
+        cutoff = _event_timestamp(event.get("event_entry_timestamp"))
+        entry_date = pd.Timestamp(event.get("entry_date")).date()
+        if cutoff is None:
+            continue
+        contracts = candidates_by_event.get(event_id, pd.DataFrame())
+        bars = _load_second_bars_for_contracts(
+            config,
+            contracts=contracts,
+            event=event,
+            buffer_minutes=buffer_minutes,
+        )
+        spot = float(event.get("s_before", np.nan))
+        proxy_ts, proxy_source = _announcement_proxy_timestamp(event)
+        for idx in range(HYBRID_INTRADAY_STEPS):
+            bin_start = cutoff - pd.Timedelta(minutes=60 - idx * 5)
+            bin_end = bin_start + pd.Timedelta(minutes=5)
+            if idx == HYBRID_INTRADAY_STEPS - 1:
+                bin_end = cutoff
+            surface = _intraday_bin_surface(
+                bars,
+                spot=spot,
+                source_date=entry_date,
+                bin_start=bin_start,
+                bin_end=bin_end,
+            )
+            hours_until = (
+                None if proxy_ts is None else float((proxy_ts - bin_end).total_seconds() / 3600.0)
+            )
+            rows.append(
+                {
+                    "event_id": event_id,
+                    "ticker": str(event.get("ticker", "")).upper(),
+                    "entry_date": entry_date,
+                    "exit_date": pd.Timestamp(event.get("exit_date")).date()
+                    if event.get("exit_date") is not None and not pd.isna(event.get("exit_date"))
+                    else None,
+                    "event_entry_timestamp": cutoff.isoformat(),
+                    "source_date": entry_date,
+                    "source_timestamp": bin_end.isoformat(),
+                    "seq_index": HYBRID_DAILY_STEPS + idx,
+                    "is_intraday_bin": 1.0,
+                    "step_type": "intraday",
+                    "step_type_intraday": 1.0,
+                    "iv_extraction_source": "intraday_5min_last_trade",
+                    "iv_extraction_source_daily_close_trade": 0.0,
+                    "iv_extraction_source_intraday_5min_last_trade": 1.0,
+                    "hours_until_announcement_proxy": hours_until,
+                    "announcement_proxy_source": proxy_source,
+                    "intraday_window_spec": "preclose_60_0",
+                    **surface,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_hybrid_proxy_sequence_long(
+    daily_long: pd.DataFrame,
+    events: pd.DataFrame,
+    *,
+    config: ProjectConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    daily = _daily_hybrid_rows(daily_long, events)
+    intraday = _intraday_hybrid_rows(events, config=config)
+    hybrid = pd.concat([daily, intraday], ignore_index=True, sort=False)
+    if hybrid.empty:
+        by_event = pd.DataFrame(columns=["event_id"])
+        return hybrid, by_event, hybrid_sequence_report(by_event, total_events=len(events))
+    hybrid = _compute_hybrid_time_features(hybrid)
+    hybrid = hybrid.sort_values(["event_id", "seq_index"]).reset_index(drop=True)
+    by_event = hybrid_sequence_coverage_by_event(hybrid)
+    report = hybrid_sequence_report(
+        by_event, total_events=ensure_event_id(events)["event_id"].nunique()
+    )
+    return hybrid, by_event, report
+
+
+def hybrid_sequence_coverage_by_event(hybrid: pd.DataFrame) -> pd.DataFrame:
+    if hybrid.empty:
+        return pd.DataFrame(columns=["event_id"])
+    numeric_features = [feature for feature in HYBRID_SEQUENCE_FEATURE_NAMES if feature in hybrid]
+    rows: list[dict[str, object]] = []
+    for event_id, group in hybrid.groupby("event_id", dropna=False):
+        intraday = group.loc[group["is_intraday_bin"].fillna(0).astype(float).gt(0)]
+        valid_intraday = int(intraday["hybrid_valid_step"].fillna(False).astype(bool).sum())
+        feature_values = group[numeric_features].apply(pd.to_numeric, errors="coerce")
+        density = (
+            float(np.isfinite(feature_values.to_numpy(dtype=float)).mean())
+            if not feature_values.empty
+            else 0.0
+        )
+        rows.append(
+            {
+                "event_id": event_id,
+                "hybrid_steps": int(len(group)),
+                "intraday_valid_bin_count": valid_intraday,
+                "latest_5min_valid_surface": bool(
+                    not intraday.empty
+                    and bool(intraday.sort_values("seq_index").tail(1)["hybrid_valid_step"].iloc[0])
+                ),
+                "hybrid_feature_mask_density": density,
+                "hybrid_mamba_eligible_v1": bool(valid_intraday >= 8 and density >= 0.50),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def hybrid_sequence_report(by_event: pd.DataFrame, *, total_events: int) -> dict[str, object]:
+    if by_event.empty:
+        return {
+            "total_events": int(total_events),
+            "events_with_8_valid_intraday_bins": 0,
+            "median_hybrid_feature_mask_density": 0.0,
+            "hybrid_sequence_too_sparse": True,
+            "intraday_window_spec": "preclose_60_0",
+            "surface_wording": "trade_aggregate_proxy",
+        }
+    events_with_8 = int(by_event["intraday_valid_bin_count"].ge(8).sum())
+    median_density = float(by_event["hybrid_feature_mask_density"].median())
+    sparse = events_with_8 < math.ceil(0.70 * max(1, total_events)) or median_density < 0.50
+    return {
+        "total_events": int(total_events),
+        "events_with_8_valid_intraday_bins": events_with_8,
+        "median_hybrid_feature_mask_density": median_density,
+        "hybrid_sequence_too_sparse": bool(sparse),
+        "intraday_window_spec": "preclose_60_0",
+        "closing_auction_caveat": (
+            "The final 30 minutes may contain MOC, benchmark, and closing-auction "
+            "microstructure unrelated to earnings positioning."
+        ),
+        "surface_wording": "trade_aggregate_proxy",
+    }
+
+
+def proxy_surface_distribution_audit(long_rows: pd.DataFrame) -> pd.DataFrame:
+    if long_rows.empty or "iv_extraction_source" not in long_rows:
+        return pd.DataFrame()
+    metrics = [
+        "atm_iv_proxy",
+        "event_ivar_proxy",
+        "term_slope_proxy",
+        "skew_proxy",
+        "butterfly_proxy",
+        "straddle_premium_to_spot",
+        "valid_pair_count",
+        "surface_missing_rate",
+        "option_volume_sum",
+        "option_transactions_sum",
+        "latest_option_trade_bar_age_seconds",
+    ]
+    rows: list[dict[str, object]] = []
+    for source, group in long_rows.groupby("iv_extraction_source", dropna=False):
+        for metric in metrics:
+            if metric not in group:
+                continue
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            rows.append(
+                {
+                    "iv_extraction_source": source,
+                    "metric": metric,
+                    "n": int(len(values)),
+                    "mean": float(values.mean()) if len(values) else np.nan,
+                    "std": float(values.std(ddof=0)) if len(values) else np.nan,
+                    "p01": float(values.quantile(0.01)) if len(values) else np.nan,
+                    "p50": float(values.quantile(0.50)) if len(values) else np.nan,
+                    "p99": float(values.quantile(0.99)) if len(values) else np.nan,
+                    "missing_rate": float(group[metric].isna().mean()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def build_sequence_tensor(
     long_rows: pd.DataFrame,
     feature_matrix: pd.DataFrame,
@@ -949,6 +1493,7 @@ def build_sequence_tensor(
     out_path: Path,
     feature_names: Sequence[str] = SEQUENCE_FEATURE_NAMES,
     lookback_days: int = LOOKBACK_DAYS,
+    per_step_type_scaling: bool = False,
 ) -> dict[str, object]:
     feature_matrix = ensure_event_id(feature_matrix)
     event_ids = feature_matrix["event_id"].astype(str).tolist()
@@ -956,6 +1501,7 @@ def build_sequence_tensor(
     features = list(feature_names)
     raw = np.full((len(event_ids), lookback_days, len(features)), np.nan, dtype=np.float32)
     source_dates = np.full((len(event_ids), lookback_days), "", dtype=object)
+    step_type = np.full((len(event_ids), lookback_days), "daily", dtype=object)
     for row in long_rows.to_dict("records"):
         event_id = str(row["event_id"])
         if event_id not in event_index:
@@ -964,6 +1510,7 @@ def build_sequence_tensor(
         if time_idx < 0 or time_idx >= lookback_days:
             continue
         source_dates[event_index[event_id], time_idx] = str(row["source_date"])
+        step_type[event_index[event_id], time_idx] = str(row.get("step_type") or "daily")
         for feature_idx, feature in enumerate(features):
             value = row.get(feature)
             raw[event_index[event_id], time_idx, feature_idx] = (
@@ -979,11 +1526,27 @@ def build_sequence_tensor(
     train_mask = split.eq("train").to_numpy()
     scaled = raw.copy()
     for feature_idx in range(len(features)):
-        observed = raw[train_mask, :, feature_idx]
-        observed = observed[np.isfinite(observed)]
-        mean = float(np.mean(observed)) if observed.size else 0.0
-        std = float(np.std(observed)) if observed.size and float(np.std(observed)) > 1e-12 else 1.0
-        scaled[:, :, feature_idx] = (scaled[:, :, feature_idx] - mean) / std
+        step_types = sorted(set(step_type.reshape(-1))) if per_step_type_scaling else ["all"]
+        for current_step_type in step_types:
+            type_mask = (
+                np.ones(step_type.shape, dtype=bool)
+                if current_step_type == "all"
+                else step_type == current_step_type
+            )
+            observed = raw[:, :, feature_idx][train_mask, :]
+            observed_mask = type_mask[train_mask, :]
+            observed = observed[observed_mask & np.isfinite(observed)]
+            mean = float(np.mean(observed)) if observed.size else 0.0
+            std = (
+                float(np.std(observed))
+                if observed.size and float(np.std(observed)) > 1e-12
+                else 1.0
+            )
+            scaled[:, :, feature_idx] = np.where(
+                type_mask,
+                (scaled[:, :, feature_idx] - mean) / std,
+                scaled[:, :, feature_idx],
+            )
     scaled = np.where(np.isfinite(scaled), scaled, 0.0).astype(np.float32)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -995,6 +1558,7 @@ def build_sequence_tensor(
         feature_names=np.asarray(features, dtype=object),
         time_index=np.arange(lookback_days, dtype=np.int64),
         source_dates=source_dates,
+        step_type=step_type,
     )
     return {
         "path": str(out_path),
@@ -1017,6 +1581,7 @@ def enrich_feature_matrix_for_research(
     base_features: pd.DataFrame,
     *,
     sequence_by_event: pd.DataFrame | None = None,
+    hybrid_by_event: pd.DataFrame | None = None,
     sequence_aggregates: pd.DataFrame | None = None,
     split_design: str = "chronological_proxy_70_15_15",
     split_date: str | pd.Timestamp | None = None,
@@ -1037,7 +1602,25 @@ def enrich_feature_matrix_for_research(
         )
     if sequence_aggregates is not None and not sequence_aggregates.empty:
         out = out.merge(sequence_aggregates, on="event_id", how="left")
-    out["mamba_eligible_v1"] = out.get("mamba_eligible_v1", False).fillna(False).astype(bool)
+    if "mamba_eligible_v1" not in out.columns:
+        out["mamba_eligible_v1"] = False
+    out["mamba_eligible_v1"] = out["mamba_eligible_v1"].fillna(False).astype(bool)
+    if hybrid_by_event is not None and not hybrid_by_event.empty:
+        keep = [
+            "event_id",
+            "intraday_valid_bin_count",
+            "latest_5min_valid_surface",
+            "hybrid_feature_mask_density",
+            "hybrid_mamba_eligible_v1",
+        ]
+        out = out.merge(
+            hybrid_by_event[[column for column in keep if column in hybrid_by_event]],
+            on="event_id",
+            how="left",
+        )
+    if "hybrid_mamba_eligible_v1" not in out.columns:
+        out["hybrid_mamba_eligible_v1"] = False
+    out["hybrid_mamba_eligible_v1"] = out["hybrid_mamba_eligible_v1"].fillna(False).astype(bool)
     if "entry_premium_usd" in out.columns:
         out["proxy_cost_usd"] = proxy_transaction_cost(
             pd.to_numeric(out["entry_premium_usd"], errors="coerce").fillna(0.0)
@@ -1063,6 +1646,37 @@ def gbdt_feature_columns(frame: pd.DataFrame) -> list[str]:
         if column.startswith("seqagg_") and pd.api.types.is_numeric_dtype(frame[column])
     ]
     return base + seqagg
+
+
+def prepare_target_frame(base: pd.DataFrame, *, target_id: str) -> pd.DataFrame:
+    out = base.copy()
+    label_col = target_label_column(target_id, out)
+    if label_col not in out.columns:
+        raise ValueError(f"target {target_id} requires missing column {label_col}")
+    out["target_id"] = target_id
+    out["target_label_column"] = label_col
+    out["rvar_event"] = pd.to_numeric(out[label_col], errors="coerce")
+    out["edge_var_realized"] = out["rvar_event"] - pd.to_numeric(out["ivar_event"], errors="coerce")
+    out["target_has_strategy_pnl"] = target_id == "day_c2c"
+    if target_id == "reaction_o2c":
+        out["ivar_baseline_interpretation"] = "weak_comparator_only"
+    elif target_id == "jump_c2o":
+        out["ivar_baseline_interpretation"] = "conservative_full_event_ivar_benchmark"
+    else:
+        out["ivar_baseline_interpretation"] = "c2c_literature_compatible"
+    return out
+
+
+def research_prediction_column(model_id: str) -> str:
+    mapping = {
+        "mask_only_mamba_sequence_encoder": "forecast_mask_only_mamba_sequence_encoder",
+        "daily_mamba_20step": "forecast_daily_mamba_20step",
+        "hybrid_mamba_31step": "forecast_hybrid_mamba_31step",
+        "intraday_only_mamba_12step": "forecast_intraday_only_mamba_12step",
+        "mask_only_hybrid_mamba": "forecast_mask_only_hybrid_mamba",
+        "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
+    }
+    return mapping.get(model_id, prediction_column_for_model(model_id))
 
 
 def _numeric_matrix(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
@@ -1361,6 +1975,8 @@ def _train_proxy_mamba(
     *,
     tensor_path: Path,
     mask_only: bool = False,
+    eligibility_col: str = "mamba_eligible_v1",
+    time_mode: str = "all",
     seed: int = 17,
     hidden_sizes: Sequence[int] = (32, 64),
     lr: float = 1e-3,
@@ -1375,8 +1991,8 @@ def _train_proxy_mamba(
     tensor_index = {event_id: idx for idx, event_id in enumerate(tensor_events)}
     frame = ensure_event_id(frame)
     eligible = (
-        frame["mamba_eligible_v1"].astype(bool)
-        if "mamba_eligible_v1" in frame
+        frame[eligibility_col].astype(bool)
+        if eligibility_col in frame
         else pd.Series(False, index=frame.index)
     )
     row_tensor_idx = frame["event_id"].astype(str).map(tensor_index)
@@ -1397,15 +2013,27 @@ def _train_proxy_mamba(
     skip = _safe_training_frames(frame, train=train_rows, validation=val_rows, test=test_rows)
     if skip:
         return pd.Series(np.nan, index=frame.index), {"status": skip}, None
+    x_values = tensor["x"].copy()
+    feature_mask = tensor["feature_mask"].copy()
+    time_mask = tensor["time_mask"].copy()
+    if time_mode != "all" and "step_type" in tensor:
+        step_type = tensor["step_type"].astype(str)
+        if time_mode == "intraday_only":
+            allowed = step_type == "intraday"
+        elif time_mode == "daily_only":
+            allowed = step_type == "daily"
+        else:
+            raise ValueError(f"unsupported time_mode: {time_mode}")
+        x_values = np.where(allowed[:, :, None], x_values, 0.0)
+        feature_mask = feature_mask & allowed[:, :, None]
+        time_mask = time_mask & allowed
     x_all = _mamba_input(
-        tensor["x"],
-        tensor["feature_mask"],
-        tensor["time_mask"],
+        x_values,
+        feature_mask,
+        time_mask,
         mask_only=mask_only,
     )
-    target = np.log(
-        pd.to_numeric(frame["rvar_event"], errors="coerce").to_numpy(dtype=float) + FORECAST_FLOOR
-    )
+    target = np.log(pd.to_numeric(frame["rvar_event"], errors="coerce") + FORECAST_FLOOR)
     best_model: MambaSequenceEncoder | None = None
     best_loss = float("inf")
     best_epochs = 0
@@ -1417,9 +2045,11 @@ def _train_proxy_mamba(
         train_idx = row_tensor_idx.loc[train_rows.index].astype(int).to_numpy()
         val_idx = row_tensor_idx.loc[val_rows.index].astype(int).to_numpy()
         x_train = torch.tensor(x_all[train_idx], dtype=torch.float32)
-        y_train = torch.tensor(target[train_rows.index], dtype=torch.float32)
+        y_train = torch.tensor(
+            target.loc[train_rows.index].to_numpy(dtype=float), dtype=torch.float32
+        )
         x_val = torch.tensor(x_all[val_idx], dtype=torch.float32)
-        y_val = torch.tensor(target[val_rows.index], dtype=torch.float32)
+        y_val = torch.tensor(target.loc[val_rows.index].to_numpy(dtype=float), dtype=torch.float32)
         local_best_state: dict[str, torch.Tensor] | None = None
         local_best = float("inf")
         stale = 0
@@ -1480,6 +2110,7 @@ def run_proxy_model_suite(
     frame: pd.DataFrame,
     *,
     tensor_path: Path,
+    hybrid_tensor_path: Path | None = None,
     model_ids: Sequence[str] = MODEL_IDS,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     predictions = add_benchmark_predictions(frame)
@@ -1512,25 +2143,55 @@ def run_proxy_model_suite(
             pred, diag, _ = _train_xgboost(predictions, features=tree_features)
         elif model_id == "ft_transformer":
             pred, diag, _ = _train_ft_transformer(predictions, features=event_features)
-        elif model_id == "mamba_sequence_encoder":
+        elif model_id in {"mamba_sequence_encoder", "daily_mamba_20step"}:
             pred, diag, _ = _train_proxy_mamba(
                 predictions, tensor_path=tensor_path, mask_only=False
             )
         elif model_id == "mask_only_mamba_sequence_encoder":
             pred, diag, _ = _train_proxy_mamba(predictions, tensor_path=tensor_path, mask_only=True)
+        elif model_id == "hybrid_mamba_31step":
+            pred, diag, _ = _train_proxy_mamba(
+                predictions,
+                tensor_path=hybrid_tensor_path or tensor_path,
+                mask_only=False,
+                eligibility_col="hybrid_mamba_eligible_v1",
+                time_mode="all",
+            )
+            if bool(predictions.get("hybrid_sequence_too_sparse", False).any()):
+                diag = {**diag, "status_label": "high_missingness_diagnostic"}
+        elif model_id == "intraday_only_mamba_12step":
+            pred, diag, _ = _train_proxy_mamba(
+                predictions,
+                tensor_path=hybrid_tensor_path or tensor_path,
+                mask_only=False,
+                eligibility_col="hybrid_mamba_eligible_v1",
+                time_mode="intraday_only",
+            )
+            if bool(predictions.get("hybrid_sequence_too_sparse", False).any()):
+                diag = {**diag, "status_label": "high_missingness_diagnostic"}
+        elif model_id == "mask_only_hybrid_mamba":
+            pred, diag, _ = _train_proxy_mamba(
+                predictions,
+                tensor_path=hybrid_tensor_path or tensor_path,
+                mask_only=True,
+                eligibility_col="hybrid_mamba_eligible_v1",
+                time_mode="all",
+            )
+            if bool(predictions.get("hybrid_sequence_too_sparse", False).any()):
+                diag = {**diag, "status_label": "high_missingness_diagnostic"}
+        elif model_id == "lightgbm_with_hybrid_aggregates":
+            pred, diag, _ = _train_lightgbm(predictions, features=tree_features)
         else:
             raise ValueError(f"unknown model_id: {model_id}")
-        column = (
-            "forecast_mask_only_mamba_sequence_encoder"
-            if model_id == "mask_only_mamba_sequence_encoder"
-            else prediction_column_for_model(model_id)
-        )
+        column = research_prediction_column(model_id)
         predictions[column] = pred
         diagnostics.append(
             {
                 "model_id": model_id,
                 "feature_count": len(
-                    tree_features if model_id in GBDT_MODEL_IDS else event_features
+                    tree_features
+                    if model_id in GBDT_MODEL_IDS or model_id == "lightgbm_with_hybrid_aggregates"
+                    else event_features
                 ),
                 **diag,
             }
@@ -1541,11 +2202,7 @@ def run_proxy_model_suite(
 def model_forecast_columns(frame: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for model_id in MODEL_IDS:
-        column = (
-            "forecast_mask_only_mamba_sequence_encoder"
-            if model_id == "mask_only_mamba_sequence_encoder"
-            else prediction_column_for_model(model_id)
-        )
+        column = research_prediction_column(model_id)
         if column in frame.columns:
             mapping[model_id] = column
     return mapping
@@ -1681,6 +2338,39 @@ def inference_table(
     return pd.DataFrame(rows)
 
 
+def append_day_c2c_additive_naive_diagnostics(predictions: pd.DataFrame) -> pd.DataFrame:
+    if "target_id" not in predictions.columns:
+        return predictions
+    out = predictions.copy()
+    forecast_columns = model_forecast_columns(out)
+    keys = ["event_id"]
+    if "target_id" not in out or "event_id" not in out:
+        return out
+    for model_id, column in forecast_columns.items():
+        if column not in out.columns:
+            continue
+        jump = out.loc[out["target_id"].eq("jump_c2o"), keys + [column]].rename(
+            columns={column: "_jump_forecast"}
+        )
+        reaction = out.loc[out["target_id"].eq("reaction_o2c"), keys + [column]].rename(
+            columns={column: "_reaction_forecast"}
+        )
+        additive = jump.merge(reaction, on=keys, how="inner")
+        additive[f"forecast_day_c2c_additive_naive_{model_id}"] = pd.to_numeric(
+            additive["_jump_forecast"], errors="coerce"
+        ) + pd.to_numeric(additive["_reaction_forecast"], errors="coerce")
+        out = out.merge(
+            additive[keys + [f"forecast_day_c2c_additive_naive_{model_id}"]],
+            on=keys,
+            how="left",
+        )
+        out.loc[
+            ~out["target_id"].eq("day_c2c"),
+            f"forecast_day_c2c_additive_naive_{model_id}",
+        ] = np.nan
+    return out
+
+
 def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     forecast_columns = model_forecast_columns(predictions)
@@ -1689,56 +2379,77 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
     strategy_rows: list[dict[str, object]] = []
     cost_rows: list[pd.DataFrame] = []
     breakdown_frames: list[pd.DataFrame] = []
-    test = predictions.loc[predictions["split"].eq("test")].copy()
-    for model_id, column in forecast_columns.items():
-        scored = test.copy()
-        if column not in scored:
-            continue
-        scored[f"score_{model_id}"] = pd.to_numeric(
-            scored[column], errors="coerce"
-        ) - pd.to_numeric(scored["ivar_event"], errors="coerce")
-        forecast_rows.append(
-            {"model_id": model_id, **forecast_metrics(scored, forecast_col=column)}
-        )
-        if "edge_var_realized" in scored:
-            ranking_rows.append(
-                {"model_id": model_id, **ranking_metrics(scored, score_col=f"score_{model_id}")}
+    test_all = predictions.loc[predictions["split"].eq("test")].copy()
+    groups = (
+        list(test_all.groupby("target_id", dropna=False))
+        if "target_id" in test_all.columns
+        else [("day_c2c", test_all)]
+    )
+    for target_id, test in groups:
+        target_id = str(target_id)
+        for model_id, column in forecast_columns.items():
+            scored = test.copy()
+            if column not in scored:
+                continue
+            scored[f"score_{model_id}"] = pd.to_numeric(
+                scored[column], errors="coerce"
+            ) - pd.to_numeric(scored["ivar_event"], errors="coerce")
+            forecast_rows.append(
+                {
+                    "target_id": target_id,
+                    "model_id": model_id,
+                    **forecast_metrics(scored, forecast_col=column),
+                }
             )
-            edge_decile_table(scored, score_col=f"score_{model_id}").to_csv(
-                out_dir / f"edge_deciles_{model_id}.csv", index=False
-            )
-        if {"gross_proxy_pnl_usd", "entry_premium_usd"}.issubset(scored.columns):
-            strategy = build_proxy_strategy_frame(
-                scored,
-                forecast_col=column,
-                cost_col="proxy_cost_usd",
-                min_edge_var=0.0,
-            )
-            trades = strategy.loc[strategy["should_trade"].astype(bool)].copy()
-            trades.to_csv(out_dir / f"strategy_trades_{model_id}.csv", index=False)
-            strategy_rows.append({"model_id": model_id, **strategy_metrics(trades)})
-            sensitivity = cost_sensitivity(
-                trades,
-                gross_pnl_col="gross_strategy_pnl_usd",
-                cost_col="estimated_transaction_cost_usd",
-                multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
-            )
-            sensitivity.insert(0, "model_id", model_id)
-            cost_rows.append(sensitivity)
-            for breakdown in (
-                "dte_bucket",
-                "is_main_dte_5_14",
-                "announcement_timing",
-                "ticker",
-                "event_year",
-                "regime",
-                "liquidity_bucket",
-            ):
-                if breakdown in trades.columns and not trades.empty:
-                    table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
-                    table.insert(0, "model_id", model_id)
-                    table.insert(1, "breakdown", breakdown)
-                    breakdown_frames.append(table)
+            if "edge_var_realized" in scored:
+                ranking_rows.append(
+                    {
+                        "target_id": target_id,
+                        "model_id": model_id,
+                        **ranking_metrics(scored, score_col=f"score_{model_id}"),
+                    }
+                )
+                edge_decile_table(scored, score_col=f"score_{model_id}").to_csv(
+                    out_dir / f"edge_deciles_{target_id}_{model_id}.csv", index=False
+                )
+            if target_id != "day_c2c":
+                continue
+            if {"gross_proxy_pnl_usd", "entry_premium_usd"}.issubset(scored.columns):
+                strategy = build_proxy_strategy_frame(
+                    scored,
+                    forecast_col=column,
+                    cost_col="proxy_cost_usd",
+                    min_edge_var=0.0,
+                )
+                trades = strategy.loc[strategy["should_trade"].astype(bool)].copy()
+                trades.to_csv(out_dir / f"strategy_trades_{model_id}.csv", index=False)
+                strategy_rows.append(
+                    {"target_id": target_id, "model_id": model_id, **strategy_metrics(trades)}
+                )
+                sensitivity = cost_sensitivity(
+                    trades,
+                    gross_pnl_col="gross_strategy_pnl_usd",
+                    cost_col="estimated_transaction_cost_usd",
+                    multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
+                )
+                sensitivity.insert(0, "target_id", target_id)
+                sensitivity.insert(1, "model_id", model_id)
+                cost_rows.append(sensitivity)
+                for breakdown in (
+                    "dte_bucket",
+                    "is_main_dte_5_14",
+                    "announcement_timing",
+                    "ticker",
+                    "event_year",
+                    "regime",
+                    "liquidity_bucket",
+                ):
+                    if breakdown in trades.columns and not trades.empty:
+                        table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
+                        table.insert(0, "target_id", target_id)
+                        table.insert(1, "model_id", model_id)
+                        table.insert(2, "breakdown", breakdown)
+                        breakdown_frames.append(table)
     forecast_path = out_dir / "forecast_metrics.csv"
     ranking_path = out_dir / "ranking_metrics.csv"
     strategy_path = out_dir / "strategy_metrics.csv"
@@ -1753,13 +2464,31 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
     (pd.concat(breakdown_frames, ignore_index=True) if breakdown_frames else pd.DataFrame()).to_csv(
         breakdown_path, index=False
     )
-    qlike, extremes = qlike_sanity_table(predictions, forecast_columns=forecast_columns)
+    qlike_frames: list[pd.DataFrame] = []
+    extreme_frames: list[pd.DataFrame] = []
+    inference_frames: list[pd.DataFrame] = []
+    for target_id, group in (
+        list(predictions.groupby("target_id", dropna=False))
+        if "target_id" in predictions
+        else [("day_c2c", predictions)]
+    ):
+        qlike_one, extremes_one = qlike_sanity_table(group, forecast_columns=forecast_columns)
+        qlike_one.insert(0, "target_id", str(target_id))
+        if not extremes_one.empty:
+            extremes_one.insert(0, "target_id", str(target_id))
+        inference_one = inference_table(group, forecast_columns=forecast_columns)
+        inference_one.insert(0, "target_id", str(target_id))
+        qlike_frames.append(qlike_one)
+        extreme_frames.append(extremes_one)
+        inference_frames.append(inference_one)
+    qlike = pd.concat(qlike_frames, ignore_index=True) if qlike_frames else pd.DataFrame()
+    extremes = pd.concat(extreme_frames, ignore_index=True) if extreme_frames else pd.DataFrame()
     qlike_path = out_dir / "qlike_sanity.csv"
     extreme_path = out_dir / "extreme_predictions.csv"
     qlike.to_csv(qlike_path, index=False)
     extremes.to_csv(extreme_path, index=False)
     inference_path = out_dir / "inference.csv"
-    inference_table(predictions, forecast_columns=forecast_columns).to_csv(
+    (pd.concat(inference_frames, ignore_index=True) if inference_frames else pd.DataFrame()).to_csv(
         inference_path, index=False
     )
     return {
@@ -1818,6 +2547,11 @@ def write_research_figures(
     ]
     for csv_name, value_col, fig_name, title in specs:
         data = read_csv(csv_name)
+        if "target_id" in data.columns:
+            if csv_name in {"forecast_metrics.csv", "ranking_metrics.csv", "qlike_sanity.csv"}:
+                data = data.loc[data["target_id"].astype(str).eq("jump_c2o")].copy()
+            elif csv_name in {"strategy_metrics.csv", "cost_sensitivity.csv"}:
+                data = data.loc[data["target_id"].astype(str).eq("day_c2c")].copy()
         fig, ax = plt.subplots(figsize=(8, 4))
         if not data.empty and value_col in data.columns and "model_id" in data.columns:
             if csv_name == "cost_sensitivity.csv" and "cost_multiplier" in data.columns:
@@ -1839,6 +2573,8 @@ def write_research_figures(
     fig, ax = plt.subplots(figsize=(5, 5))
     if predictions_path.exists():
         predictions = pd.read_parquet(predictions_path)
+        if "target_id" in predictions.columns:
+            predictions = predictions.loc[predictions["target_id"].astype(str).eq("jump_c2o")]
         if {"forecast_market_implied_event_variance", "rvar_event"}.issubset(predictions.columns):
             test = predictions.loc[predictions["split"].eq("test")]
             ax.scatter(
@@ -1913,12 +2649,34 @@ def write_proxy_research_report(
         "lightgbm",
         "xgboost",
         "ft_transformer",
-        "mamba_sequence_encoder",
-        "mask_only_mamba_sequence_encoder",
+        "daily_mamba_20step",
+        "hybrid_mamba_31step",
+        "intraday_only_mamba_12step",
+        "mask_only_hybrid_mamba",
+        "lightgbm_with_hybrid_aggregates",
     ]
-    if not forecast.empty:
-        summary = forecast.merge(ranking, on="model_id", how="left", suffixes=("", "_ranking"))
-        summary = summary.merge(strategy, on="model_id", how="left", suffixes=("", "_strategy"))
+    forecast_main = (
+        forecast.loc[forecast["target_id"].astype(str).eq("jump_c2o")].copy()
+        if "target_id" in forecast
+        else forecast.copy()
+    )
+    ranking_main = (
+        ranking.loc[ranking["target_id"].astype(str).eq("jump_c2o")].copy()
+        if "target_id" in ranking
+        else ranking.copy()
+    )
+    strategy_main = (
+        strategy.loc[strategy["target_id"].astype(str).eq("day_c2c")].copy()
+        if "target_id" in strategy
+        else strategy.copy()
+    )
+    if not forecast_main.empty:
+        summary = forecast_main.merge(
+            ranking_main, on="model_id", how="left", suffixes=("", "_ranking")
+        )
+        summary = summary.merge(
+            strategy_main, on="model_id", how="left", suffixes=("", "_strategy")
+        )
         summary = summary.loc[summary["model_id"].isin(selected_models)].copy()
         summary["model_id"] = pd.Categorical(
             summary["model_id"], categories=selected_models, ordered=True
@@ -2014,63 +2772,69 @@ def write_proxy_research_report(
         _append_bullets(lines, bullets)
 
     mamba_note = "Mamba diagnostics were unavailable."
-    if not predictions.empty and {
-        "forecast_mamba_sequence_encoder",
-        "forecast_mask_only_mamba_sequence_encoder",
+    mamba_target = (
+        predictions.loc[predictions["target_id"].astype(str).eq("jump_c2o")].copy()
+        if "target_id" in predictions
+        else predictions.copy()
+    )
+    if not mamba_target.empty and {
+        "forecast_hybrid_mamba_31step",
+        "forecast_mask_only_hybrid_mamba",
         "rvar_event",
         "split",
-    }.issubset(predictions.columns):
-        mamba_frame = predictions.loc[
-            predictions["split"].eq("test"),
+    }.issubset(mamba_target.columns):
+        mamba_frame = mamba_target.loc[
+            mamba_target["split"].eq("test"),
             [
-                "forecast_mamba_sequence_encoder",
-                "forecast_mask_only_mamba_sequence_encoder",
+                "forecast_hybrid_mamba_31step",
+                "forecast_mask_only_hybrid_mamba",
                 "rvar_event",
             ],
         ].dropna()
         if not mamba_frame.empty:
-            corr = mamba_frame["forecast_mamba_sequence_encoder"].corr(
-                mamba_frame["forecast_mask_only_mamba_sequence_encoder"]
+            corr = mamba_frame["forecast_hybrid_mamba_31step"].corr(
+                mamba_frame["forecast_mask_only_hybrid_mamba"]
             )
             mean_abs_diff = (
                 (
-                    mamba_frame["forecast_mamba_sequence_encoder"]
-                    - mamba_frame["forecast_mask_only_mamba_sequence_encoder"]
+                    mamba_frame["forecast_hybrid_mamba_31step"]
+                    - mamba_frame["forecast_mask_only_hybrid_mamba"]
                 )
                 .abs()
                 .mean()
             )
-            mamba_target_corr = mamba_frame["forecast_mamba_sequence_encoder"].corr(
+            mamba_target_corr = mamba_frame["forecast_hybrid_mamba_31step"].corr(
                 mamba_frame["rvar_event"]
             )
-            mask_target_corr = mamba_frame["forecast_mask_only_mamba_sequence_encoder"].corr(
+            mask_target_corr = mamba_frame["forecast_mask_only_hybrid_mamba"].corr(
                 mamba_frame["rvar_event"]
             )
             mamba_note = (
-                f"On the common test rows, proxy-Mamba and mask-only Mamba have forecast "
-                f"correlation {corr:.3f}; their mean absolute forecast difference is "
-                f"{mean_abs_diff:.4f}. The proxy-Mamba forecast has correlation "
+                "On the common C2O test rows, hybrid proxy-Mamba and mask-only "
+                f"Mamba have forecast correlation {corr:.3f}; their mean absolute "
+                f"forecast difference is {mean_abs_diff:.4f}. The hybrid proxy-Mamba "
+                "forecast has correlation "
                 f"{mamba_target_corr:.3f} with realized event variance, versus "
                 f"{mask_target_corr:.3f} for the mask-only ablation."
             )
 
-    best_mae = _best(forecast, "mae", higher_is_better=False)
-    best_oos = _best(forecast, "oos_r2_vs_ivar", higher_is_better=True)
-    best_auc = _best(ranking, "auc", higher_is_better=True)
-    best_top_decile = _best(ranking, "top_decile_precision", higher_is_better=True)
-    best_edge_monotone = _best(ranking, "edge_decile_spearman", higher_is_better=True)
-    best_net = _best(strategy, "net_pnl_usd", higher_is_better=True)
-    best_return = _best(strategy, "return_on_premium", higher_is_better=True)
+    best_mae = _best(forecast_main, "mae", higher_is_better=False)
+    best_oos = _best(forecast_main, "oos_r2_vs_ivar", higher_is_better=True)
+    best_auc = _best(ranking_main, "auc", higher_is_better=True)
+    best_top_decile = _best(ranking_main, "top_decile_precision", higher_is_better=True)
+    best_edge_monotone = _best(ranking_main, "edge_decile_spearman", higher_is_better=True)
+    best_net = _best(strategy_main, "net_pnl_usd", higher_is_better=True)
+    best_return = _best(strategy_main, "return_on_premium", higher_is_better=True)
     qlike_worst = _best(qlike, "raw_qlike", higher_is_better=True)
     qlike_share_worst = _best(
         qlike,
         "top_1pct_qlike_contribution_share",
         higher_is_better=True,
     )
-    mamba_auc = _value(ranking, "mamba_sequence_encoder", "auc")
-    mask_auc = _value(ranking, "mask_only_mamba_sequence_encoder", "auc")
-    mamba_net = _value(strategy, "mamba_sequence_encoder", "net_pnl_usd")
-    mask_net = _value(strategy, "mask_only_mamba_sequence_encoder", "net_pnl_usd")
+    mamba_auc = _value(ranking_main, "hybrid_mamba_31step", "auc")
+    mask_auc = _value(ranking_main, "mask_only_hybrid_mamba", "auc")
+    mamba_net = _value(strategy_main, "hybrid_mamba_31step", "net_pnl_usd")
+    mask_net = _value(strategy_main, "mask_only_hybrid_mamba", "net_pnl_usd")
     sequence_drop_rate = float(sequence_report.get("drop_rate", 0.0))
     if best_auc and best_top_decile:
         ranking_winner_text = (
@@ -2084,12 +2848,19 @@ def write_proxy_research_report(
     else:
         ranking_winner_text = "Ranking comparison was unavailable."
 
-    if not cost.empty and {"cost_multiplier", "net_pnl_usd", "model_id"}.issubset(cost.columns):
-        cost_snapshot = cost.loc[
-            pd.to_numeric(cost["cost_multiplier"], errors="coerce").isin([0.0, 1.0, 3.0, 5.0])
-            & cost["model_id"]
+    cost_main = (
+        cost.loc[cost["target_id"].astype(str).eq("day_c2c")].copy()
+        if "target_id" in cost
+        else cost.copy()
+    )
+    if not cost_main.empty and {"cost_multiplier", "net_pnl_usd", "model_id"}.issubset(
+        cost_main.columns
+    ):
+        cost_snapshot = cost_main.loc[
+            pd.to_numeric(cost_main["cost_multiplier"], errors="coerce").isin([0.0, 1.0, 3.0, 5.0])
+            & cost_main["model_id"]
             .astype(str)
-            .isin(["lightgbm", "xgboost", "linear_elastic_net", "mamba_sequence_encoder"])
+            .isin(["lightgbm", "xgboost", "linear_elastic_net", "hybrid_mamba_31step"])
         ].copy()
         cost_snapshot = cost_snapshot[
             ["model_id", "cost_multiplier", "n", "net_pnl_usd", "hit_rate", "max_drawdown_usd"]
@@ -2496,19 +3267,32 @@ def run_research_sequence_audit(config: ProjectConfig) -> ProxyResearchResult:
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
     base = build_base_feature_matrix(config)
     long_rows, by_event, report = build_option_surface_sequence_long(base, config=config)
-    _ = long_rows
+    hybrid_long, hybrid_by_event, hybrid_report = build_hybrid_proxy_sequence_long(
+        long_rows,
+        base,
+        config=config,
+    )
     by_event_path = paths.modeling_artifacts_dir / "sequence_coverage_by_event.csv"
     report_path = paths.modeling_artifacts_dir / "sequence_coverage_report.json"
+    hybrid_by_event_path = paths.modeling_artifacts_dir / "hybrid_sequence_coverage_by_event.csv"
+    hybrid_report_path = paths.modeling_artifacts_dir / "hybrid_sequence_coverage_report.json"
+    distribution_audit_path = paths.modeling_artifacts_dir / "proxy_surface_distribution_audit.csv"
     by_event.to_csv(by_event_path, index=False)
+    hybrid_by_event.to_csv(hybrid_by_event_path, index=False)
+    proxy_surface_distribution_audit(hybrid_long).to_csv(distribution_audit_path, index=False)
     write_json(report_path, report)
+    write_json(hybrid_report_path, hybrid_report)
     return ProxyResearchResult(
         ok=True,
         stage="sequence-audit",
         outputs={
             "sequence_coverage_by_event": str(by_event_path),
             "sequence_coverage_report": str(report_path),
+            "hybrid_sequence_coverage_by_event": str(hybrid_by_event_path),
+            "hybrid_sequence_coverage_report": str(hybrid_report_path),
+            "proxy_surface_distribution_audit": str(distribution_audit_path),
         },
-        diagnostics=report,
+        diagnostics={**report, "hybrid": hybrid_report},
     )
 
 
@@ -2521,14 +3305,21 @@ def run_research_features(
     paths = research_paths(config)
     base = build_base_feature_matrix(config)
     long_rows, by_event, report = build_option_surface_sequence_long(base, config=config)
+    hybrid_long, hybrid_by_event, hybrid_report = build_hybrid_proxy_sequence_long(
+        long_rows,
+        base,
+        config=config,
+    )
     aggregates = aggregate_sequence_features(long_rows)
     features = enrich_feature_matrix_for_research(
         base,
         sequence_by_event=by_event,
+        hybrid_by_event=hybrid_by_event,
         sequence_aggregates=aggregates,
         split_design=split_design,
         split_date=split_date,
     )
+    features["hybrid_sequence_too_sparse"] = bool(hybrid_report.get("hybrid_sequence_too_sparse"))
     market_covariates = _read_market_covariates(config)
     if not market_covariates.empty and "entry_date" in features.columns:
         vix_input_columns = ["event_id", "entry_date"]
@@ -2570,16 +3361,34 @@ def run_research_features(
     paths.sequence_long_path.parent.mkdir(parents=True, exist_ok=True)
     paths.feature_matrix_path.parent.mkdir(parents=True, exist_ok=True)
     long_rows.to_parquet(paths.sequence_long_path, index=False)
+    hybrid_long.to_parquet(paths.hybrid_sequence_long_path, index=False)
     features.to_parquet(paths.feature_matrix_path, index=False)
     tensor_report = build_sequence_tensor(long_rows, features, out_path=paths.sequence_tensor_path)
+    hybrid_tensor_report = build_sequence_tensor(
+        hybrid_long,
+        features,
+        out_path=paths.hybrid_sequence_tensor_path,
+        feature_names=HYBRID_SEQUENCE_FEATURE_NAMES,
+        lookback_days=HYBRID_STEPS,
+        per_step_type_scaling=True,
+    )
     by_event.to_csv(paths.modeling_artifacts_dir / "sequence_coverage_by_event.csv", index=False)
+    hybrid_by_event.to_csv(
+        paths.modeling_artifacts_dir / "hybrid_sequence_coverage_by_event.csv", index=False
+    )
+    proxy_surface_distribution_audit(hybrid_long).to_csv(
+        paths.modeling_artifacts_dir / "proxy_surface_distribution_audit.csv", index=False
+    )
     write_json(paths.modeling_artifacts_dir / "sequence_coverage_report.json", report)
+    write_json(paths.modeling_artifacts_dir / "hybrid_sequence_coverage_report.json", hybrid_report)
     return ProxyResearchResult(
         ok=True,
         stage="features",
         outputs={
             "sequence_long": str(paths.sequence_long_path),
             "sequence_tensor": str(paths.sequence_tensor_path),
+            "hybrid_sequence_long": str(paths.hybrid_sequence_long_path),
+            "hybrid_sequence_tensor": str(paths.hybrid_sequence_tensor_path),
             "feature_matrix": str(paths.feature_matrix_path),
             "sequence_coverage_by_event": str(
                 paths.modeling_artifacts_dir / "sequence_coverage_by_event.csv"
@@ -2587,10 +3396,21 @@ def run_research_features(
             "sequence_coverage_report": str(
                 paths.modeling_artifacts_dir / "sequence_coverage_report.json"
             ),
+            "hybrid_sequence_coverage_by_event": str(
+                paths.modeling_artifacts_dir / "hybrid_sequence_coverage_by_event.csv"
+            ),
+            "hybrid_sequence_coverage_report": str(
+                paths.modeling_artifacts_dir / "hybrid_sequence_coverage_report.json"
+            ),
+            "proxy_surface_distribution_audit": str(
+                paths.modeling_artifacts_dir / "proxy_surface_distribution_audit.csv"
+            ),
         },
         diagnostics={
             **report,
+            "hybrid": hybrid_report,
             "tensor": tensor_report,
+            "hybrid_tensor": hybrid_tensor_report,
             "feature_rows": int(len(features)),
             "market_second_covariate_columns": int(market_second_columns),
         },
@@ -2601,9 +3421,29 @@ def run_research_models(config: ProjectConfig) -> ProxyResearchResult:
     paths = research_paths(config)
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
     features = read_table(paths.feature_matrix_path)
-    predictions, diagnostics = run_proxy_model_suite(
-        features, tensor_path=paths.sequence_tensor_path
-    )
+    prediction_frames: list[pd.DataFrame] = []
+    diagnostic_frames: list[pd.DataFrame] = []
+    available_targets = available_target_columns(features)
+    if "day_c2c" not in available_targets and "rvar_event" in features:
+        available_targets["day_c2c"] = "rvar_event"
+    for target_id in TARGET_IDS:
+        if target_id not in available_targets:
+            continue
+        target_frame = prepare_target_frame(features, target_id=target_id)
+        predictions_one, diagnostics_one = run_proxy_model_suite(
+            target_frame,
+            tensor_path=paths.sequence_tensor_path,
+            hybrid_tensor_path=paths.hybrid_sequence_tensor_path,
+        )
+        predictions_one["target_id"] = target_id
+        diagnostics_one["target_id"] = target_id
+        prediction_frames.append(predictions_one)
+        diagnostic_frames.append(diagnostics_one)
+    if not prediction_frames:
+        raise ValueError("no available target columns for research modeling")
+    predictions = pd.concat(prediction_frames, ignore_index=True)
+    diagnostics = pd.concat(diagnostic_frames, ignore_index=True)
+    predictions = append_day_c2c_additive_naive_diagnostics(predictions)
     predictions.to_parquet(paths.predictions_path, index=False)
     diagnostics_path = paths.modeling_artifacts_dir / "model_fit_diagnostics.csv"
     diagnostics.to_csv(diagnostics_path, index=False)

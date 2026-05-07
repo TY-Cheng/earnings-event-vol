@@ -28,10 +28,23 @@ The paper asks:
 > option-implied earnings event variance mispricing, and does that improvement
 > survive realistic proxy transaction costs?
 
-The forecast target is realized event variance:
+The primary scientific forecast target is close-to-open realized jump variance:
 
 ```text
-RVAR_event = log(S_after / S_before)^2
+RVAR_event_jump_c2o = log(open_after / close_before)^2
+```
+
+The literature-compatible and V1 proxy-PnL target remains close-to-close:
+
+```text
+RVAR_event_day_c2c = log(close_after / close_before)^2
+rvar_event = RVAR_event_day_c2c
+```
+
+The post-open digestion diagnostic is:
+
+```text
+RVAR_event_reaction_o2c = log(close_after / open_after)^2
 ```
 
 The market baseline is option-implied event variance:
@@ -40,10 +53,10 @@ The market baseline is option-implied event variance:
 IVAR_event
 ```
 
-The ex post mispricing label is:
+The ex post C2C mispricing label is:
 
 ```text
-RVAR_event - IVAR_event
+RVAR_event_day_c2c - IVAR_event
 ```
 
 The strategy layer is evaluated in premium space:
@@ -140,7 +153,7 @@ flowchart TB
     stock_day["Massive underlying day aggregates\ndaily OHLCV by stock"]
     opt_ref["Massive option reference\n/v3/reference/options/contracts\nshares_per_contract\nadditional_underlyings\nexercise_style\ncorrection"]
     opt_sec["Massive option second aggregates\nrange/1/second\ntrade OHLCV bars\nnot quote, not bid/ask, not NBBO"]
-    index_sec["Optional SPY / QQQ second aggregates\noptions and underlying\nentry-as-of market controls"]
+    index_sec["SPY / QQQ second aggregates when available\noptions and underlying\nentry-as-of market controls"]
     fred["FRED VIXCLS\ndaily VIX close\nprior-close aligned"]
   end
 
@@ -163,10 +176,10 @@ flowchart TB
 
   %% Event alignment
   subgraph alignment["Event timing and target construction"]
-    bmo["BMO event on date d\nentry uses close d-1\nS_before = close d-1\nS_after = close d"]
-    amc["AMC event on date d\nentry uses close d\nS_before = close d\nS_after = close d+1"]
+    bmo["BMO event on date d\nentry uses close d-1\nclose_before = close d-1\nopen_after = open d\nclose_after = close d"]
+    amc["AMC event on date d\nentry uses close d\nclose_before = close d\nopen_after = open d+1\nclose_after = close d+1"]
     entry_cutoff["event_entry_timestamp\nresolved market close\nhandles early close days"]
-    rvar["Forecast target\nRVAR_event = log(S_after / S_before)^2"]
+    rvar["Target decomposition\njump C2O primary\nC2C proxy PnL target\nO2C diagnostic"]
     leak_gate["Leakage gate\nfeature_asof_timestamp <= event_entry_timestamp\nno exit date or post-event bars"]
   end
 
@@ -210,7 +223,8 @@ flowchart TB
   subgraph features["Feature engineering"]
     event_features["Event-level feature matrix\nIVAR_event\nATM IV / term spread / skew / butterfly\noption activity\nRV5 / RV20 / RV60\nlast-four earnings history\nBMO/AMC flag\nuniverse rank and liquidity bucket"]
     daily_sequence["20-day daily sequence\nseq_t00 oldest allowed day\nseq_t19 latest allowed day\nsingle-name daily option-surface summaries\nunderlying return and RV5\nVIX daily state\nSPY / QQQ daily controls if available"]
-    market_second["Optional entry-as-of market controls\nSPY / QQQ ATM IV proxy\nterm slope\nskew / butterfly\nstraddle premium / spot\noption volume / transactions\nunderlying pre-cutoff return"]
+    hybrid_sequence["31-step hybrid proxy sequence\n19 prior daily steps\n12 entry-day 5-min bins\ntrade aggregate proxy surface\nmixed-clock time features"]
+    market_second["Availability-gated entry-as-of market controls\nSPY / QQQ ATM IV proxy\nterm slope\nskew / butterfly\nstraddle premium / spot\noption volume / transactions\nunderlying pre-cutoff return"]
     vix_features["VIX features\nresolved_vix_date before feature_asof_date\nvix_level, 1d change, 5d change\n252d percentile, tercile regime, above 30 flag"]
   end
 
@@ -220,6 +234,9 @@ flowchart TB
   ref_validation --> event_features
   opt_day --> daily_sequence
   stock_day --> daily_sequence
+  daily_sequence --> hybrid_sequence
+  opt_sec --> hybrid_sequence
+  entry_cutoff --> hybrid_sequence
   fred --> vix_features
   vix_features --> event_features
   vix_features --> daily_sequence
@@ -233,11 +250,12 @@ flowchart TB
     split_later["Final paper robustness when longer data exists\nrolling walk-forward\ntrain 5y, validate 1y, test 1y\npurge same-ticker adjacent leakage"]
     baseline_models["Deterministic baselines\nIVAR market baseline\nlast-four RVAR\nlast-four IVAR\nGoyal-Saretto RV-IV spread\nPatell-Wolfson diagnostics"]
     tabular_models["Tabular models\nElastic Net\nLightGBM\nXGBoost optional\nFT-Transformer V1"]
-    mamba_models["Sequence models\nproxy-Mamba on ordered 20-day tensor\nmask-only Mamba ablation\nuses close-trade-implied proxy surface, not NBBO-mid surface"]
+    mamba_models["Sequence models\ndaily proxy-Mamba\nhybrid proxy-Mamba\nintraday-only ablation\nmask-only hybrid ablation\nnot NBBO-mid surface"]
   end
 
   event_features --> split_now
   daily_sequence --> split_now
+  hybrid_sequence --> split_now
   split_now --> baseline_models
   split_now --> tabular_models
   split_now --> mamba_models
@@ -245,8 +263,8 @@ flowchart TB
 
   %% Forecast to trade decision
   subgraph backtest["Backtest logic and strategy assumptions"]
-    forecasts["Model output\nforecast_RVAR_event\npositive floor = 1e-6"]
-    var_edge["Variance edge\nforecast_RVAR_event - IVAR_event\nused for ranking and diagnostics"]
+    forecasts["Model output by target_id\nforecast jump C2O\nforecast day C2C\nforecast reaction O2C\npositive floor = 1e-6"]
+    var_edge["C2C variance edge\nforecast day C2C - IVAR_event\nused for tradable ranking and diagnostics\nC2O ranking is scientific not PnL"]
     premium_edge["Premium-space edge\nexpected_strategy_value_usd - market_entry_cost_usd\nthis drives trade selection"]
     long_straddle["Long ATM straddle\nused when event vol is predicted cheap"]
     short_iron_fly["Short iron fly\nused when event vol is predicted rich\nrisk-defined short-vol proxy"]
@@ -307,10 +325,11 @@ market data for prices:
   `shares_per_contract`, `additional_underlyings`, `exercise_style`, and
   `correction` from `/v3/reference/options/contracts`; non-100 or adjusted
   deliverables are excluded from proxy trading rows.
-- **Massive underlying day aggregates** support underlying closes, event returns,
-  `RVAR_event`, exit spot, and daily market-return controls.
+- **Massive underlying day aggregates** support underlying closes, vendor OHLC
+  opens, C2O/C2C/O2C event returns, exit spot, and daily market-return controls.
 - **Massive option one-second aggregates** support targeted pre-cutoff entry
-  proxy prices and optional SPY/QQQ market-state controls.
+  proxy prices, availability-gated SPY/QQQ market-state controls, and the entry-day
+  intraday trade-aggregate proxy sequence.
 - **FRED VIXCLS** supplies daily VIX state and regime controls.
 
 All trade-proxy market outputs are labeled `no_nbbo_trade_proxy`. They are trade
@@ -348,7 +367,8 @@ option_premium_dollar_volume = option_price * contract_volume * 100
 filter first removes ETF, index, volatility, commodity trust, ETN, fund, and
 other non-single-name-like symbols using SEC company ticker metadata. SPY, QQQ,
 IWM, VIX, GLD, SPX, and SPXW cannot consume single-name universe slots, though
-SPY/QQQ may be used later as market controls.
+SPY/QQQ are excluded from single-name universe slots but are used as
+availability-gated market controls when present in the current data lake.
 
 Appendix C will report universe membership, turnover, excluded tickers, and
 monthly liquidity distributions.
@@ -364,19 +384,25 @@ feature_asof_timestamp <= event_entry_timestamp
 AMC events:
 
 - Entry is before regular-session close on announcement date `d`.
-- `S_before = close_d`.
-- `S_after = close_{d+1}`.
-- Event move is `log(close_{d+1} / close_d)`.
+- `close_before = close_d`.
+- `open_after = open_{d+1}`.
+- `close_after = close_{d+1}`.
+- Primary jump move is `log(open_{d+1} / close_d)`.
+- C2C robustness/PnL move is `log(close_{d+1} / close_d)`.
 
 BMO events:
 
 - Entry is before regular-session close on `d-1`.
-- `S_before = close_{d-1}`.
-- `S_after = close_d`.
-- Event move is `log(close_d / close_{d-1})`.
+- `close_before = close_{d-1}`.
+- `open_after = open_d`.
+- `close_after = close_d`.
+- Primary jump move is `log(open_d / close_{d-1})`.
+- C2C robustness/PnL move is `log(close_d / close_{d-1})`.
 
 SEC acceptance time is regulatory metadata, not necessarily the company's first
-public release timestamp. Ambiguous events stay outside the main sample.
+public release timestamp. The feature is named
+`hours_until_announcement_proxy`, not verified announcement lead time.
+Ambiguous events stay outside the main sample.
 
 Mechanical filters:
 
@@ -403,11 +429,29 @@ BMO/AMC timing.
 
 ### 2.4 Target and Market Baseline Construction
 
-The forecast target is:
+The target system is:
 
 ```text
-RVAR_event = log(S_after / S_before)^2
+RVAR_event_jump_c2o     = log(open_after / close_before)^2
+RVAR_event_day_c2c      = log(close_after / close_before)^2
+RVAR_event_reaction_o2c = log(close_after / open_after)^2
 ```
+
+The exact return identity is:
+
+```text
+r_event_day_c2c = r_event_jump_c2o + r_event_reaction_o2c
+```
+
+Variance reconstruction must include:
+
+```text
+RVAR_cross_term = 2 * r_event_jump_c2o * r_event_reaction_o2c
+```
+
+`RVAR_event_jump_c2o` is the primary scientific target. `RVAR_event_day_c2c`
+is the literature-compatible robustness target and the only V1 proxy-PnL target.
+`RVAR_event_reaction_o2c` is diagnostic.
 
 The implied event variance baseline uses total ATM implied variance:
 
@@ -454,7 +498,7 @@ Event-level features:
 - BMO/AMC timing.
 - Liquidity bucket and universe rank.
 - Daily VIX state and VIX regime.
-- Optional SPY/QQQ second-level entry controls.
+- SPY/QQQ second-level entry controls when available in the data lake.
 
 VIX features:
 
@@ -479,22 +523,31 @@ VIX level directly.
 
 Sequence features:
 
-- The Mamba path is daily-frequency, not second-frequency.
+- The daily Mamba path is daily-frequency.
 - Each event has up to 20 pre-entry trading-day timesteps.
 - `seq_t00` is the oldest allowed day.
 - `seq_t19` is the latest allowed day.
 - Daily states include single-name close-trade-implied option-surface summaries,
   underlying RV/return, SPY/QQQ daily returns, SPY/QQQ daily surface summaries
   when available, and daily VIX features.
+- The hybrid Mamba path adds a 31-step mixed-frequency tensor: 19 prior daily
+  steps plus 12 entry-day five-minute bins from cutoff minus 60 minutes through
+  cutoff.
+- Hybrid rows include `step_type`, `is_intraday_bin`,
+  `log_delta_minutes_from_prev_step`, `normalized_time_to_entry`,
+  `hours_until_announcement_proxy`, and `iv_extraction_source`.
+- The final 30 minutes may contain MOC, benchmark, and closing-auction
+  microstructure; this is a report caveat and robustness target.
 
 Second-level market controls:
 
-- `market-second-covariates` optionally fetches SPY/QQQ option one-second
-  aggregates and SPY/QQQ underlying one-second aggregates at event entry.
+- `market-second-covariates` fetches SPY/QQQ option one-second aggregates when
+  available in the current data lake.
 - Features include SPY/QQQ ATM IV proxy, term slope, skew, butterfly, straddle
   premium over spot, option volume/transaction count, and underlying pre-cutoff
   return.
-- These are event-entry covariates, not a second-level Mamba sequence.
+- These are event-entry market controls; single-name option second aggregates
+  feed the hybrid proxy sequence.
 
 Appendix F will define the feature schema and source/as-of timestamp for every
 column family.
@@ -503,7 +556,8 @@ column family.
 
 Financial and deterministic baselines:
 
-1. Market-implied baseline: `forecast_RVAR_event = IVAR_event`.
+1. Market-implied baseline: `forecast_RVAR_event_<target> = IVAR_event`, with
+   target-specific interpretation.
 2. Last-four RVAR baseline.
 3. Last-four IVAR baseline.
 4. Goyal-Saretto-style RV-IV spread baseline.
@@ -516,10 +570,19 @@ Trainable tabular models:
 3. XGBoost when dependency is available.
 4. FT-Transformer.
 
-Sequence model:
+Sequence models:
 
-1. proxy-Mamba sequence encoder.
-2. mask-only Mamba ablation.
+1. Daily proxy-Mamba on the 20-step daily sequence.
+2. Hybrid proxy-Mamba on 19 daily steps plus 12 entry-day five-minute bins.
+3. Intraday-only 12-bin Mamba ablation.
+4. Mask-only hybrid Mamba ablation.
+
+The hybrid sequence is a mixed-clock tensor. It includes `step_type`,
+`is_intraday_bin`, `log_delta_minutes_from_prev_step`, `normalized_time_to_entry`,
+`hours_until_announcement_proxy`, and `iv_extraction_source` so the model can
+distinguish daily close-trade observations from intraday five-minute
+trade-aggregate observations. The intraday leg is a proxy surface, not an
+NBBO-mid IV surface.
 
 Model input policy:
 
@@ -530,15 +593,18 @@ Model input policy:
 | Elastic Net | Yes | No | No | No |
 | LightGBM/XGBoost | Yes | Mean/last/slope/std aggregates | No | No |
 | FT-Transformer | Yes | No | No | No |
-| proxy-Mamba | Optional late fusion | No | Yes | Yes |
-| mask-only Mamba | No values | No | Zeroed tensor | Yes |
+| daily proxy-Mamba | Optional late fusion | No | 20 daily steps | Yes |
+| hybrid proxy-Mamba | Optional late fusion | No | 19 daily + 12 intraday bins | Yes |
+| intraday-only Mamba | Optional late fusion | No | 12 intraday bins | Yes |
+| mask-only hybrid Mamba | No values | No | Zeroed hybrid tensor | Yes |
 
 ### 2.7 Loss Functions and Forecast Postprocessing
 
-Mamba uses q=0.5 quantile loss on log-transformed realized event variance:
+Mamba uses q=0.5 quantile loss on log-transformed realized event variance for
+each target:
 
 ```text
-log_target = log(RVAR_event + forecast_floor)
+log_target = log(RVAR_target + forecast_floor)
 forecast_floor = 1e-6
 ```
 
@@ -562,8 +628,9 @@ validation: next 15%
 test:       last 15%
 ```
 
-The split unit is `event_id`; all rows for the same event remain in the same
-split. The final paper design should move to rolling walk-forward:
+The split unit is `event_id`; all target rows for the same event remain in the
+same split, so an event cannot have C2O in train and C2C/O2C in validation/test.
+The final paper design should move to rolling walk-forward:
 
 - Train five years.
 - Validate one year.
@@ -596,7 +663,7 @@ front/back gamma mismatch, skew, dividends, borrow, and assignment risk.
 Premium-space valuation:
 
 - Use deterministic quadrature under a zero-mean Gaussian event-return
-  distribution with variance `forecast_RVAR_event`.
+  distribution with variance `forecast_RVAR_event_day_c2c`.
 - Proxy route entry prices use pre-cutoff option second aggregates.
 - Proxy route exit marks use same-contract option day-aggregate close when
   available; intrinsic payoff is only a flagged fallback for missing exit close

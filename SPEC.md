@@ -2,8 +2,9 @@
 
 This repository implements a reproducible research skeleton for earnings event
 variance forecasting and risk-defined options backtests. Models forecast
-`RVAR_event`; ex post mispricing evaluates correctness; trading decisions use
-premium-space expected edge, not raw variance edge.
+realized earnings-event variance targets; ex post mispricing evaluates
+correctness; trading decisions use premium-space expected edge, not raw
+variance edge.
 
 ## Protocol Defaults
 
@@ -27,9 +28,24 @@ premium-space expected edge, not raw variance edge.
     invalidation diagnostics.
   - `calendar-pilot` is a static ticker smoke/debug stage and is not part of the
     default final proxy DAG.
-- Main event move is close-to-close:
-  - AMC: `S_before = close_d`, `S_after = close_{d+1}`.
-  - BMO: `S_before = close_{d-1}`, `S_after = close_d`.
+- Event targets are decomposed:
+  - Primary scientific target: `RVAR_event_jump_c2o`.
+    - AMC: `close_d -> open_{d+1}`.
+    - BMO: `close_{d-1} -> open_d`.
+  - Literature-compatible and V1 proxy-PnL target: `RVAR_event_day_c2c`.
+    - AMC: `close_d -> close_{d+1}`.
+    - BMO: `close_{d-1} -> close_d`.
+  - Diagnostic post-open digestion target: `RVAR_event_reaction_o2c`.
+    - AMC: `open_{d+1} -> close_{d+1}`.
+    - BMO: `open_d -> close_d`.
+  - `rvar_event` remains a backward-compatible alias for
+    `RVAR_event_day_c2c`.
+  - The return identity is exact:
+    `r_event_day_c2c = r_event_jump_c2o + r_event_reaction_o2c`.
+    Variance reconstruction must include
+    `RVAR_cross_term = 2 * r_event_jump_c2o * r_event_reaction_o2c`.
+  - Open prices from Massive daily OHLC may be used as
+    `vendor_regular_ohlc_assumed`; they are not verified auction-open prints.
 - `IVAR_event` uses two adjacent expiries covering the event:
   - `T_j` follows the IV source year-fraction convention.
   - V1 default is ACT/365 unless vendor documentation says otherwise.
@@ -77,7 +93,9 @@ premium-space expected edge, not raw variance edge.
   - Report gross proxy PnL and haircut PnL only as screening diagnostics.
   - Do not use this route for full-spread crossing or paper-grade execution
     claims.
-- Optional SPY/QQQ market-state controls use the same proxy discipline:
+- SPY/QQQ market-state controls are required when available in the existing
+  data lake; when unavailable, coverage must be reported and the no-market-control
+  specification remains valid. They use the same proxy discipline:
   - `market-second-covariates` fetches SPY and QQQ option one-second aggregates
     plus SPY/QQQ underlying one-second aggregates at the event entry cutoff.
   - It produces event-level ATM IV, term slope, skew, butterfly,
@@ -85,17 +103,33 @@ premium-space expected edge, not raw variance edge.
     proxies.
   - These features are trade OHLCV aggregates, not bid/ask, quote, or NBBO
     surfaces.
-- The 20-day Mamba path is daily-frequency. Each timestep is one allowed
+- The daily Mamba path is daily-frequency. Each timestep is one allowed
   pre-entry trading day with close-trade-implied single-name option-surface
   summaries, SPY/QQQ daily surface summaries when available, market ETF returns,
-  and daily VIX state. One-second data enter the current research package as
-  event-entry covariates and entry proxy prices, not as a full intraday sequence
-  model.
+  and daily VIX state.
+- The hybrid proxy sequence path uses 31 timesteps:
+  - steps 00-18 are the prior 19 trading days before the entry date;
+  - steps 19-30 are twelve entry-day five-minute bins from cutoff minus
+    60 minutes through cutoff;
+  - entry-date daily close is excluded from the daily segment;
+  - `step_type`, `is_intraday_bin`, `log_delta_minutes_from_prev_step`,
+    `normalized_time_to_entry`, `hours_until_announcement_proxy`, and
+    `iv_extraction_source` distinguish mixed-frequency observations;
+  - SEC acceptance time is an announcement proxy, not verified first-release
+    time;
+  - the intraday sequence is a trade-aggregate proxy surface from second
+    aggregate OHLCV bars, not a quote/NBBO surface;
+  - if fewer than 70% of events have at least eight valid intraday bins, or
+    median hybrid mask density is below 0.50, hybrid Mamba results are labeled
+    `high_missingness_diagnostic` and cannot be headline evidence.
 - ATMF forward selection can use put-call parity only as a short-DTE,
   no-dividend, near-ATM approximation for American single-name options. Weak or
   dividend-contaminated pairs fall back to nearest-spot ATM and record
   `forward_source = spot_fallback`.
-- Raw research edge is `edge_var = forecast_RVAR_event - IVAR_event`.
+- Raw V1 strategy edge is C2C-only:
+  `edge_var_day_c2c = forecast_RVAR_event_day_c2c - IVAR_event`. C2O is
+  reported as forecast/ranking of realized jump variance, not as a V1 tradable
+  mispricing or option-PnL headline.
 - Trading threshold is premium-space:
   - Convert forecast variance into expected strategy value using deterministic
     quadrature under a zero-mean Gaussian event-return distribution.

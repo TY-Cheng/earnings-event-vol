@@ -31,8 +31,9 @@ Research object:
 
 - Earnings announcements are scheduled jump-risk events.
 - Options embed an ex ante market-implied event variance.
-- Models forecast `RVAR_event`.
-- Ex post mispricing is `RVAR_event - IVAR_event`.
+- Models forecast C2O, C2C, and O2C realized-variance targets.
+- The primary scientific target is `RVAR_event_jump_c2o`.
+- V1 tradable proxy mispricing uses C2C: `RVAR_event_day_c2c - IVAR_event`.
 - Trading entry is evaluated in USD premium space, not raw variance space.
 
 Data:
@@ -60,7 +61,9 @@ Data:
 
 Variables:
 
-- `RVAR_event = log(S_after / S_before)^2`.
+- `RVAR_event_jump_c2o = log(open_after / close_before)^2`.
+- `RVAR_event_day_c2c = log(close_after / close_before)^2`.
+- `rvar_event` is the C2C backward-compatible alias.
 - `IVAR_event` is extracted from two-expiry total implied variance.
 - IVAR extraction failures are reported by reason, including missing event-
   covering expiries, nonmonotone total variance, and negative extracted IVAR.

@@ -12,6 +12,7 @@ from scipy.optimize import brentq
 
 from earnings_event_vol.backtest import black_scholes_price
 from earnings_event_vol.config import ProjectConfig, load_project_config
+from earnings_event_vol.event_targets import add_event_return_targets
 from earnings_event_vol.events import regular_close_timestamp
 from earnings_event_vol.massive import (
     _run_head_object_command,
@@ -25,7 +26,6 @@ from earnings_event_vol.schemas import AnnouncementTiming, OptionRight
 from earnings_event_vol.variance import (
     TotalVariancePoint,
     extract_implied_event_variance,
-    realized_event_variance,
 )
 
 PARQUET_COMPRESSION = "zstd"
@@ -567,21 +567,7 @@ def build_pilot_panel(
             bar_rows.extend(_load_underlying_bars(_underlying_path(config, day), tickers, day))
     bars = pd.DataFrame(bar_rows)
     _write_parquet(silver_windows_dir / "underlying_event_bars.parquet", bars)
-    close_by_key = {(row["ticker"], row["date"]): row["close"] for row in bars.to_dict("records")}
-    s_before: list[float | None] = []
-    s_after: list[float | None] = []
-    rvar: list[float | None] = []
-    for row in windows.to_dict("records"):
-        before = close_by_key.get((row["ticker"], row["entry_date"]))
-        after = close_by_key.get((row["ticker"], row["exit_date"]))
-        s_before.append(before)
-        s_after.append(after)
-        rvar.append(
-            realized_event_variance(float(before), float(after)) if before and after else None
-        )
-    windows["s_before"] = s_before
-    windows["s_after"] = s_after
-    windows["rvar_event"] = rvar
+    windows = add_event_return_targets(windows, bars)
     _write_parquet(silver_windows_dir / "event_windows.parquet", windows)
 
     contract_rows: list[dict[str, object]] = []
