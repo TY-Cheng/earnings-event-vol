@@ -123,6 +123,30 @@ The legacy in-repo proxy-Mamba rows are retired because they used a gated
 recurrent encoder rather than official `mamba-ssm`. They are retained only in
 the machine-readable retirement manifest and cleanup tests.
 
+## Headline Result Summary
+
+This compact table mirrors the paper-plan result table, but it belongs here
+because `results_snapshot.md` is the detailed reader-facing result ledger.
+Forecast and ranking columns use `jump_c2o`, the overnight jump ranking target.
+The strategy column uses `day_c2c`, the only current V1 proxy-PnL headline.
+
+| Model | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Day-C2C net proxy PnL |
+|:---|---:|---:|---:|---:|---:|---:|
+| Market IVAR | 0.0097 | 0.0145 | 0.000 | 0.000 | 0.500 | n/a |
+| Goyal-Saretto spread | 0.0076 | 0.0134 | 0.141 | 0.300 | 0.602 | -461 |
+| Elastic Net | 0.0095 | 0.0213 | 0.323 | 0.500 | 0.629 | 47,938 |
+| LightGBM | 0.0077 | 0.0192 | 0.355 | 0.500 | 0.745 | 69,908 |
+| XGBoost | 0.0074 | 0.0191 | 0.380 | 0.500 | 0.781 | 68,344 |
+| LightGBM/XGBoost ensemble | 0.0074 | 0.0191 | 0.397 | 0.500 | 0.788 | 72,155 |
+| FT-Transformer | 0.0374 | 0.0396 | -5.487 | 0.200 | 0.525 | -4,793 |
+| Official `mamba-ssm` sequence | 0.0087 | 0.0237 | 0.042 | 0.200 | 0.495 | -4,178 |
+
+**Summary interpretation.** The central result is not that lower RMSE alone
+proves tradability. The LightGBM/XGBoost ensemble has the strongest current
+combination of `jump_c2o` ranking and `day_c2c` premium-space proxy economics.
+The official Mamba sequence challenger is validly implemented, but it is not a
+headline model in the current proxy sample.
+
 ## C2C Results
 
 The C2C target is the current proxy-PnL headline because it has the cleanest
@@ -168,6 +192,18 @@ ranking and proxy economics.
 | Mask-only sequence | 93 | 532 | 0.003 | 0.042 | -11,497 |
 | Time-shuffle sequence | 93 | -20 | -0.000 | -0.002 | -11,928 |
 
+#### C2C Premium-Space Figure
+
+![Strategy PnL by edge decile](assets/images/modeling/strategy_pnl_by_edge_decile.png)
+
+**Figure interpretation.** The strategy plot is the main visual companion to
+the C2C table. It shows whether predicted premium-space edge maps into realized
+proxy economics by decile. The strongest proxy economics come from the tabular
+tree models and their rank-average ensemble, which supports a conservative
+tabular-model contribution rather than a sequence headline. The figure remains
+a proxy-stage screen because all prices are trade-aggregate proxies, not
+executable bid/ask or NBBO marks.
+
 **C2C interpretation.** The sellable result is the tabular nonlinear ranking
 story. The LightGBM/XGBoost ensemble has the strongest C2C AUC and the highest
 net proxy PnL. Sequence models do not improve the C2C headline; the official
@@ -198,6 +234,44 @@ quote path.
 | Official `mamba-ssm` sequence | 100 | 0.0237 | 0.0087 | 0.042 | 0.495 | 0.200 | 0.527 |
 | Mask-only sequence | 100 | 0.0242 | 0.0088 | -0.034 | 0.500 | 0.100 | 0.685 |
 | Time-shuffle sequence | 100 | 0.0248 | 0.0092 | -0.202 | 0.475 | 0.100 | 0.915 |
+
+#### C2O Forecast Figure
+
+![Forecast performance](assets/images/modeling/forecast_performance.png)
+
+**Figure interpretation.** Forecast error is useful but not decisive. The
+current `jump_c2o` table shows the tree ensemble and XGBoost as the strongest
+forecast/ranking candidates, while several models can improve squared forecast
+loss without producing equally strong economic evidence. This is why the paper
+does not claim that lower RMSE alone proves tradability.
+
+#### C2O Ranking Figure
+
+![AUC and top-decile precision](assets/images/modeling/auc_top_decile_precision.png)
+
+**Figure interpretation.** Ranking quality is closer to the paper's question
+than level forecast accuracy. XGBoost and the LightGBM/XGBoost ensemble lead
+`jump_c2o` AUC in the current proxy test rows. The market IVAR baseline is
+neutral in ranking because it generates no positive premium edge against
+itself.
+
+#### C2O Mispricing Monotonicity Figure
+
+![Edge decile realized mispricing](assets/images/modeling/edge_decile_realized_mispricing.png)
+
+**Figure interpretation.** A useful mispricing model should sort realized
+mispricing monotonically across predicted-edge buckets. The displayed
+edge-decile relationship is strongest for the tabular tree models, consistent
+with the C2O AUC and top-decile evidence.
+
+#### C2O Calibration Figure
+
+![Calibration plot](assets/images/modeling/calibration_plot.png)
+
+**Figure interpretation.** Calibration checks whether forecast variance is on
+the right scale, not only correctly ranked. The current evidence is stronger
+for ranking and premium-space economics than for perfectly calibrated variance
+levels, so calibration remains a supporting diagnostic.
 
 ### C2O Diagnostic Strategy Proxies
 
@@ -244,6 +318,24 @@ diagnostics, not calibrated O2C mispricing or a headline trading claim.
 | FT-Transformer | 122 | 0.039 | 0.039 | -6.569 | 0.200 | 0.688 | 0.988 |
 | Official `mamba-ssm` sequence | 100 | 0.002 | 0.004 | 0.933 | 0.100 | 0.600 | 0.988 |
 
+#### O2C Forecast Figure
+
+![O2C forecast performance](assets/images/modeling/o2c_forecast_performance.png)
+
+**Figure interpretation.** This is the O2C counterpart to the C2O forecast
+figure. It is useful for comparing model fit on the post-open digestion target,
+but it should not be sold as calibrated O2C mispricing because the benchmark
+`IVAR_event` is a full-event implied-variance measure.
+
+#### O2C Ranking Figure
+
+![O2C ranking quality](assets/images/modeling/o2c_auc_top_decile_precision.png)
+
+**Figure interpretation.** The O2C ranking figure is the third-window
+diagnostic companion to the C2O ranking figure. It supports a directional
+ranking readout for post-open realized variance; it does not promote O2C to a
+headline strategy surface.
+
 ### O2C Premium-Space Diagnostic Strategy
 
 | Model | 5-15m trades | 5-15m net proxy PnL | 5-15m return on premium | 5-15m Sharpe | 0-5m trades | 0-5m net proxy PnL | 0-5m return on premium |
@@ -257,6 +349,15 @@ diagnostics, not calibrated O2C mispricing or a headline trading claim.
 | FT-Transformer | 93 | 753 | 0.004 | 0.127 | 95 | -1,206 | -0.007 |
 | Official `mamba-ssm` sequence | 88 | -5,421 | -0.034 | -0.933 | 90 | -2,191 | -0.014 |
 
+#### O2C Diagnostic Strategy Figure
+
+![O2C diagnostic proxy PnL](assets/images/modeling/o2c_strategy_proxy_pnl.png)
+
+**Figure interpretation.** The O2C strategy figure uses the 5-15 minute
+post-open option VWAP anchor as entry and the primary C2C exit mark as exit.
+The tree-model O2C proxy PnL rows are negative in the current run, so this
+figure reinforces the diagnostic-only wording.
+
 ### O2C Scale Diagnostic
 
 | Diagnostic | Value |
@@ -266,6 +367,15 @@ diagnostics, not calibrated O2C mispricing or a headline trading claim.
 | SD(`IVAR_event`) | 0.0269 |
 | SD ratio O2C / IVAR | 0.240 |
 | Mean ratio O2C / IVAR | 0.167 |
+
+#### O2C Scale Figure
+
+![O2C scale diagnostic](assets/images/modeling/o2c_scale_diagnostic.png)
+
+**Figure interpretation.** The scale figure makes the O2C caveat visible:
+post-open realized variance is much smaller than full-event `IVAR_event` in the
+paired sample. This is why O2C is interpreted as ranking/direction evidence
+rather than a calibrated mispricing or headline trading test.
 
 **O2C interpretation.** LightGBM/XGBoost rank O2C realized variance best, but
 the premium-space O2C proxy strategy does not support a headline claim: 5-15m
@@ -319,6 +429,14 @@ does not beat the gate, the controls, or the tabular ensemble.
 
 ### Cost Stress
 
+![Cost sensitivity](assets/images/modeling/cost_sensitivity.png)
+
+**Figure interpretation.** The default proxy cost model is a haircut on entry
+premium. Cost multiplier 0 is an anchor, not an execution assumption.
+Persistence across higher multipliers matters because the current route lacks
+bid/ask data. LightGBM, XGBoost, and their rank-average ensemble remain the
+main proxy-stage contenders in the displayed cost stress.
+
 Selected `day_c2c` net proxy PnL under entry-premium haircut multipliers:
 
 | Model | 1x cost | 3x cost | 5x cost |
@@ -355,43 +473,17 @@ lower RMSE alone is not sufficient for the paper claim.
 
 ### QLIKE and Calibration Caveat
 
+![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
+
 QLIKE diagnostics are retained as sanity checks but are not used as the primary
 claim surface because very small realized variance values can dominate the
 raw QLIKE contribution. The paper-facing argument should emphasize ranking,
 edge-decile monotonicity, cost sensitivity, and premium-space proxy economics.
 
-## Figures
-
-All generated paper-facing figures from `reports/modeling/figures/*.png` are
-synced into `docs/assets/images/modeling/` and included below.
-
-### Forecast Error
-
-![Forecast performance](assets/images/modeling/forecast_performance.png)
-
-### Ranking Quality
-
-![AUC and top-decile precision](assets/images/modeling/auc_top_decile_precision.png)
-
-### Premium-Space Proxy Economics
-
-![Strategy PnL by edge decile](assets/images/modeling/strategy_pnl_by_edge_decile.png)
-
-### Cost Sensitivity
-
-![Cost sensitivity](assets/images/modeling/cost_sensitivity.png)
-
-### Calibration
-
-![Calibration plot](assets/images/modeling/calibration_plot.png)
-
-### Realized Mispricing by Predicted Edge Decile
-
-![Edge decile realized mispricing](assets/images/modeling/edge_decile_realized_mispricing.png)
-
-### QLIKE Contribution Diagnostic
-
-![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
+**Figure interpretation.** Raw QLIKE is unstable when forecasts are clipped
+near zero. The QLIKE figure is a diagnostic guardrail, not a headline metric.
+It prevents the paper from over-weighting a loss function dominated by a small
+number of near-zero forecast cases.
 
 ## Discussion
 
@@ -494,3 +586,7 @@ liquidity robustness, and clustered or bootstrap inference.
 | Calibration figure | `docs/assets/images/modeling/calibration_plot.png` |
 | Edge-decile realized mispricing figure | `docs/assets/images/modeling/edge_decile_realized_mispricing.png` |
 | QLIKE contribution diagnostic figure | `docs/assets/images/modeling/qlike_contribution_diagnostic.png` |
+| O2C forecast figure | `docs/assets/images/modeling/o2c_forecast_performance.png` |
+| O2C ranking figure | `docs/assets/images/modeling/o2c_auc_top_decile_precision.png` |
+| O2C strategy figure | `docs/assets/images/modeling/o2c_strategy_proxy_pnl.png` |
+| O2C scale diagnostic figure | `docs/assets/images/modeling/o2c_scale_diagnostic.png` |

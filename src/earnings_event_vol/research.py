@@ -3492,6 +3492,87 @@ def write_research_figures(
         fig.savefig(path, dpi=160)
         plt.close(fig)
         outputs[fig_name.removesuffix(".png")] = str(path)
+
+    def write_bar_figure(
+        data: pd.DataFrame,
+        *,
+        value_cols: str | list[str],
+        fig_name: str,
+        title: str,
+        x_col: str = "model_id",
+    ) -> None:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        cols = [value_cols] if isinstance(value_cols, str) else value_cols
+        if not data.empty and x_col in data.columns and all(col in data.columns for col in cols):
+            plot_cols: str | list[str] = cols[0] if len(cols) == 1 else cols
+            data.plot.bar(x=x_col, y=plot_cols, ax=ax, legend=len(cols) > 1)
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        path = figures_dir / fig_name
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        outputs[fig_name.removesuffix(".png")] = str(path)
+
+    o2c_forecast = read_csv("forecast_metrics.csv")
+    if "target_id" in o2c_forecast.columns:
+        o2c_forecast = o2c_forecast.loc[
+            o2c_forecast["target_id"].astype(str).eq("reaction_o2c")
+        ].copy()
+    write_bar_figure(
+        o2c_forecast,
+        value_cols="mae",
+        fig_name="o2c_forecast_performance.png",
+        title="O2C Forecast MAE",
+    )
+
+    o2c_ranking = read_csv("ranking_metrics.csv")
+    if "target_id" in o2c_ranking.columns:
+        o2c_ranking = o2c_ranking.loc[
+            o2c_ranking["target_id"].astype(str).eq("reaction_o2c")
+        ].copy()
+    write_bar_figure(
+        o2c_ranking,
+        value_cols=["auc", "top_decile_precision"],
+        fig_name="o2c_auc_top_decile_precision.png",
+        title="O2C Ranking Quality",
+    )
+
+    o2c_strategy = read_csv("strategy_metrics.csv")
+    if {"target_id", "strategy_proxy_kind"}.issubset(o2c_strategy.columns):
+        o2c_strategy = o2c_strategy.loc[
+            o2c_strategy["target_id"].astype(str).eq("reaction_o2c")
+            & o2c_strategy["strategy_proxy_kind"]
+            .astype(str)
+            .eq("reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy")
+        ].copy()
+    write_bar_figure(
+        o2c_strategy,
+        value_cols="net_pnl_usd",
+        fig_name="o2c_strategy_proxy_pnl.png",
+        title="O2C 5-15m Diagnostic Proxy Net PnL",
+    )
+
+    o2c_scale = read_csv("o2c_scale_diagnostic.csv")
+    if {"sd_rvar_reaction_o2c", "sd_ivar_event"}.issubset(o2c_scale.columns):
+        scale_plot = pd.DataFrame(
+            {
+                "series": ["SD RVAR reaction_o2c", "SD IVAR event"],
+                "value": [
+                    float(o2c_scale["sd_rvar_reaction_o2c"].iloc[0]),
+                    float(o2c_scale["sd_ivar_event"].iloc[0]),
+                ],
+            }
+        )
+    else:
+        scale_plot = pd.DataFrame(columns=["series", "value"])
+    write_bar_figure(
+        scale_plot,
+        value_cols="value",
+        fig_name="o2c_scale_diagnostic.png",
+        title="O2C Scale Mismatch",
+        x_col="series",
+    )
     predictions_path = artifacts_dir / "model_predictions.parquet"
     fig, ax = plt.subplots(figsize=(5, 5))
     if predictions_path.exists():
@@ -4234,6 +4315,68 @@ def write_proxy_research_report(
             "",
             _markdown_table(o2c_scale_table, "O2C scale diagnostics were unavailable."),
             "",
+        ]
+    )
+    _figure_block(
+        lines,
+        name="o2c_forecast_performance",
+        title="O2C Forecast Performance",
+        bullets=[
+            (
+                "This figure repeats the forecast comparison for `reaction_o2c`, the "
+                "post-open digestion target."
+            ),
+            (
+                "O2C level-fit metrics are diagnostic because full-event `IVAR_event` is "
+                "only a weak comparator for post-open realized variance."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="o2c_auc_top_decile_precision",
+        title="O2C Ranking and Top-Decile Precision",
+        bullets=[
+            (
+                f"For `reaction_o2c`, best ranking AUC is {_label(best_o2c_auc[0])} at "
+                f"{_fmt(best_o2c_auc[1])}."
+                if best_o2c_auc
+                else "O2C ranking metrics were unavailable."
+            ),
+            "Treat O2C ranking as a third-window diagnostic, not as a headline claim.",
+        ],
+    )
+    _figure_block(
+        lines,
+        name="o2c_strategy_proxy_pnl",
+        title="O2C Diagnostic Proxy PnL",
+        bullets=[
+            (
+                f"Best O2C 5-15 minute diagnostic net PnL is "
+                f"{_label(best_o2c_diag_net[0])} at {_fmt(best_o2c_diag_net[1], money=True)}."
+                if best_o2c_diag_net
+                else "O2C 5-15 minute diagnostic proxy metrics were unavailable."
+            ),
+            (
+                "All O2C strategy rows use post-open option VWAP anchors and remain "
+                "`pnl_headline_eligible=false`."
+            ),
+        ],
+    )
+    _figure_block(
+        lines,
+        name="o2c_scale_diagnostic",
+        title="O2C Scale Diagnostic",
+        bullets=[
+            (
+                "The scale figure compares post-open realized variance against full-event "
+                "`IVAR_event` and visualizes why IVAR is a weak O2C comparator."
+            ),
+            "Use O2C evidence for ranking/direction diagnostics, not calibrated mispricing.",
+        ],
+    )
+    lines.extend(
+        [
             (
                 f"Best O2C 5-15 minute diagnostic net PnL is "
                 f"{_label(best_o2c_diag_net[0])} at {_fmt(best_o2c_diag_net[1], money=True)}."
