@@ -3444,6 +3444,38 @@ def write_research_figures(
         path = artifacts_dir / name
         return pd.read_csv(path) if path.exists() else pd.DataFrame()
 
+    figure_labels = {
+        "market_implied_event_variance": "Market IVAR",
+        "last_four_rvar": "Last-four RVAR",
+        "last_four_ivar": "Last-four IVAR",
+        "goyal_saretto_rv_iv_spread": "Goyal-Saretto spread",
+        "linear_elastic_net": "Elastic Net",
+        "lightgbm": "LightGBM",
+        "xgboost": "XGBoost",
+        "lightgbm_xgboost_mean_ensemble": "LightGBM/XGBoost ensemble",
+        "ft_transformer": "FT-Transformer",
+        "ridge_flat_aggregates_sequence": "Ridge-flat sequence",
+        "bigru_sequence": "BiGRU sequence",
+        "mamba_ssm_sequence": "Official mamba-ssm",
+        "mask_only_sequence": "Mask-only sequence",
+        "time_shuffle_sequence": "Time-shuffle sequence",
+        "SD RVAR reaction_o2c": "SD RVAR reaction_o2c",
+        "SD IVAR event": "SD IVAR_event",
+    }
+
+    def figure_label(value: object) -> str:
+        raw = str(value)
+        return figure_labels.get(raw, raw.replace("_", " "))
+
+    def figure_height(row_count: int, *, series_count: int = 1) -> float:
+        grouped_extra = max(series_count - 1, 0) * 0.12
+        return min(9.0, max(3.6, 1.4 + row_count * (0.34 + grouped_extra)))
+
+    def with_figure_labels(data: pd.DataFrame, x_col: str) -> pd.DataFrame:
+        plot_data = data.copy()
+        plot_data["_figure_label"] = plot_data[x_col].map(figure_label)
+        return plot_data
+
     outputs: dict[str, str] = {}
     specs = [
         ("forecast_metrics.csv", "mae", "forecast_performance.png", "Forecast MAE"),
@@ -3475,18 +3507,29 @@ def write_research_figures(
                 data = data.loc[data["target_id"].astype(str).eq("jump_c2o")].copy()
             elif csv_name in {"strategy_metrics.csv", "cost_sensitivity.csv"}:
                 data = data.loc[data["target_id"].astype(str).eq("day_c2c")].copy()
-        fig, ax = plt.subplots(figsize=(8, 4))
         if not data.empty and value_col in data.columns and "model_id" in data.columns:
             if csv_name == "cost_sensitivity.csv" and "cost_multiplier" in data.columns:
+                fig, ax = plt.subplots(figsize=(8.5, 4.8))
                 for model_id, group in data.groupby("model_id"):
                     ax.plot(
-                        group["cost_multiplier"], group[value_col], marker="o", label=str(model_id)
+                        group["cost_multiplier"],
+                        group[value_col],
+                        marker="o",
+                        label=figure_label(model_id),
                     )
-                ax.legend(fontsize=7)
+                ax.legend(fontsize=7, frameon=False)
             else:
-                data.plot.bar(x="model_id", y=value_col, ax=ax, legend=False)
+                plot_data = with_figure_labels(data, "model_id").sort_values(
+                    value_col, ascending=True
+                )
+                fig, ax = plt.subplots(figsize=(8.8, figure_height(len(plot_data))))
+                plot_data.plot.barh(x="_figure_label", y=value_col, ax=ax, legend=False)
+        else:
+            fig, ax = plt.subplots(figsize=(8.8, 3.8))
         ax.set_title(title)
-        ax.tick_params(axis="x", rotation=45)
+        ax.set_ylabel("")
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_axisbelow(True)
         fig.tight_layout()
         path = figures_dir / fig_name
         fig.savefig(path, dpi=160)
@@ -3501,13 +3544,24 @@ def write_research_figures(
         title: str,
         x_col: str = "model_id",
     ) -> None:
-        fig, ax = plt.subplots(figsize=(8, 4))
         cols = [value_cols] if isinstance(value_cols, str) else value_cols
         if not data.empty and x_col in data.columns and all(col in data.columns for col in cols):
             plot_cols: str | list[str] = cols[0] if len(cols) == 1 else cols
-            data.plot.bar(x=x_col, y=plot_cols, ax=ax, legend=len(cols) > 1)
+            plot_data = with_figure_labels(data, x_col)
+            if cols[0] in plot_data.columns and x_col != "series":
+                plot_data = plot_data.sort_values(cols[0], ascending=True)
+            fig, ax = plt.subplots(
+                figsize=(8.8, figure_height(len(plot_data), series_count=len(cols)))
+            )
+            plot_data.plot.barh(x="_figure_label", y=plot_cols, ax=ax, legend=len(cols) > 1)
+            if len(cols) > 1:
+                ax.legend(fontsize=8, frameon=False)
+        else:
+            fig, ax = plt.subplots(figsize=(8.8, 3.8))
         ax.set_title(title)
-        ax.tick_params(axis="x", rotation=45)
+        ax.set_ylabel("")
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_axisbelow(True)
         fig.tight_layout()
         path = figures_dir / fig_name
         fig.savefig(path, dpi=160)
