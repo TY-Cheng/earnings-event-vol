@@ -554,9 +554,25 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
         split_design=args.split_design,
         split_date=args.split_date,
         allow_high_sequence_risk=args.allow_high_sequence_risk,
+        sequence_suite=args.sequence_suite,
+        mamba_backend=args.mamba_backend,
+        mamba_seeds=_parse_comma_ints(args.mamba_seeds),
+        bootstrap_iter=args.bootstrap_iter,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
+
+
+def _parse_comma_ints(raw: str) -> list[int]:
+    values: list[int] = []
+    for piece in str(raw).split(","):
+        value = piece.strip()
+        if not value:
+            continue
+        values.append(int(value))
+    if not values:
+        raise ValueError("expected at least one integer seed")
+    return values
 
 
 def _leakage_audit(args: argparse.Namespace) -> int:
@@ -834,6 +850,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     research.add_argument("--split-date", default=None)
     research.add_argument("--allow-high-sequence-risk", action="store_true")
+    research.add_argument(
+        "--sequence-suite",
+        choices=["none", "phase1", "phase2"],
+        default="phase1",
+        help="Sequence model suite to run; phase1 is the diagnostic default.",
+    )
+    research.add_argument("--mamba-backend", choices=["mamba_ssm"], default="mamba_ssm")
+    research.add_argument("--mamba-seeds", default="17")
+    research.add_argument("--bootstrap-iter", type=int, default=200)
 
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")
     leakage_audit.add_argument("--features", type=Path, required=True)

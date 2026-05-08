@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -134,33 +134,66 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Deep tabular architecture for mixed event features.",
         risk="May not beat GBDT on small tabular panels.",
     ),
-    "daily_mamba_20step": ModelSpec(
-        model_id="daily_mamba_20step",
-        role="deep_model",
+    "lightgbm_xgboost_mean_ensemble": ModelSpec(
+        model_id="lightgbm_xgboost_mean_ensemble",
+        role="ensemble",
         implemented=True,
-        justification="Daily 20-step proxy-surface sequence encoder.",
-        risk="Uses close-trade-implied daily proxy surfaces, not NBBO-mid surfaces.",
+        justification="Equal-weight LightGBM/XGBoost ensemble sanity check.",
+        risk="Should not be tuned on the locked test sample.",
     ),
-    "hybrid_mamba_31step": ModelSpec(
-        model_id="hybrid_mamba_31step",
-        role="deep_model",
+    "ridge_flat_aggregates_sequence": ModelSpec(
+        model_id="ridge_flat_aggregates_sequence",
+        role="sequence_baseline",
         implemented=True,
-        justification="Hybrid 19 daily plus 12 intraday proxy-surface sequence encoder.",
-        risk="Intraday trade-aggregate sparsity can make this diagnostic rather than headline.",
+        justification=(
+            "Flattens daily and intraday sequence channels into simple aggregates before "
+            "a ridge-style linear fit."
+        ),
+        risk="Tests whether ordering adds value beyond coarse path summaries.",
     ),
-    "intraday_only_mamba_12step": ModelSpec(
-        model_id="intraday_only_mamba_12step",
-        role="deep_model",
+    "attention_pooling_sequence": ModelSpec(
+        model_id="attention_pooling_sequence",
+        role="sequence_baseline",
         implemented=True,
-        justification="Entry-day 12-bin intraday proxy-surface sequence ablation.",
-        risk="Short sequence; not a full long-horizon Mamba architecture test.",
+        justification="Learned-query attention pooling over pre-entry sequence tokens.",
+        risk="Diagnostic; may overfit on small sequence samples.",
     ),
-    "mask_only_hybrid_mamba": ModelSpec(
-        model_id="mask_only_hybrid_mamba",
-        role="deep_model",
+    "bigru_sequence": ModelSpec(
+        model_id="bigru_sequence",
+        role="sequence_baseline",
         implemented=True,
-        justification="Hybrid sequence missingness-pattern ablation with values zeroed.",
-        risk="Diagnostic only; high performance would indicate selection/missingness signal.",
+        justification="LayerNorm BiGRU baseline for ordered pre-entry proxy-surface paths.",
+        risk="Diagnostic; sequence sample has selection risk.",
+    ),
+    "dilated_cnn_sequence": ModelSpec(
+        model_id="dilated_cnn_sequence",
+        role="sequence_baseline",
+        implemented=True,
+        justification="Non-causal dilated 1D CNN baseline for short pre-entry paths.",
+        risk="Diagnostic; non-causal only because all tokens are pre-entry.",
+    ),
+    "mamba_ssm_sequence": ModelSpec(
+        model_id="mamba_ssm_sequence",
+        role="sequence_challenger",
+        implemented=True,
+        justification=(
+            "Official mamba-ssm selective state-space block used as a diagnostic challenger."
+        ),
+        risk="Requires Linux/NVIDIA/CUDA; skipped when mamba-ssm is unavailable.",
+    ),
+    "mask_only_sequence": ModelSpec(
+        model_id="mask_only_sequence",
+        role="sequence_control",
+        implemented=True,
+        justification="Sequence control with values zeroed and masks retained.",
+        risk="High performance indicates missingness/selection signal rather than path values.",
+    ),
+    "time_shuffle_sequence": ModelSpec(
+        model_id="time_shuffle_sequence",
+        role="sequence_control",
+        implemented=True,
+        justification="Deterministic within-event time-order ablation for sequence models.",
+        risk="Tests ordering, not sample selection.",
     ),
 }
 
@@ -494,38 +527,190 @@ class FTTransformerRegressor(nn.Module):
         return cast(torch.Tensor, self.head(encoded[:, 0]).squeeze(-1))
 
 
-class MambaSequenceEncoder(nn.Module):
-    """Small selective state-space encoder for pre-event option-surface sequences.
+def _validate_sequence(sequence: torch.Tensor) -> None:
+    if sequence.ndim != 3:
+        raise ValueError("sequence must have shape [batch, time, features]")
 
-    This is an in-repo implementation of the sequence interface, not a dependency on the
-    external `mamba-ssm` package. It provides the protocol we need for 20-day option-surface
-    path experiments while keeping the environment portable.
+
+def _masked_mean(sequence: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return sequence.mean(dim=1)
+    weights = mask.to(dtype=sequence.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=1).clamp_min(1.0)
+    return (sequence * weights).sum(dim=1) / denom
+
+
+def _masked_max(sequence: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return torch.max(sequence, dim=1).values
+    masked = sequence.masked_fill(~mask.unsqueeze(-1), -1e9)
+    values = torch.max(masked, dim=1).values
+    return torch.where(torch.isfinite(values), values, torch.zeros_like(values))
+
+
+class AttentionPoolingSequenceEncoder(nn.Module):
+    """Small learned-query attention pooler for event-level sequence forecasts."""
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        hidden_size: int = 32,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        if hidden_size % n_heads != 0:
+            raise ValueError("hidden_size must be divisible by n_heads")
+        self.input_projection = nn.Linear(n_features, hidden_size)
+        self.query = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.attention = nn.MultiheadAttention(hidden_size, n_heads, batch_first=True)
+        self.head = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, 1))
+        self.last_attention_weights: torch.Tensor | None = None
+
+    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        _validate_sequence(sequence)
+        tokens = self.input_projection(sequence)
+        query = self.query.expand(sequence.shape[0], -1, -1)
+        key_padding_mask = None if mask is None else ~mask.bool()
+        pooled, weights = self.attention(
+            query,
+            tokens,
+            tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=True,
+        )
+        self.last_attention_weights = weights.detach()
+        return cast(torch.Tensor, self.head(pooled[:, 0, :]).squeeze(-1))
+
+
+class BiGRUSequenceEncoder(nn.Module):
+    """LayerNorm bidirectional GRU for short pre-entry option-surface paths."""
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        hidden_size: int = 32,
+        n_layers: int = 1,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(n_features)
+        self.gru = nn.GRU(
+            input_size=n_features,
+            hidden_size=hidden_size,
+            num_layers=n_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size * 4),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, 1),
+        )
+
+    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        _validate_sequence(sequence)
+        encoded, _ = self.gru(self.input_norm(sequence))
+        pooled = torch.cat([_masked_mean(encoded, mask), _masked_max(encoded, mask)], dim=1)
+        return cast(torch.Tensor, self.head(pooled).squeeze(-1))
+
+
+class DilatedCNNSequenceEncoder(nn.Module):
+    """Non-causal dilated CNN for offline pre-entry sequence encoding."""
+
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        channels: Sequence[int] = (32, 64, 64),
+        dilations: Sequence[int] = (1, 2, 4),
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        if len(channels) != len(dilations):
+            raise ValueError("channels and dilations must have equal length")
+        layers: list[nn.Module] = []
+        in_channels = n_features
+        for out_channels, dilation in zip(channels, dilations, strict=True):
+            padding = dilation
+            layers.extend(
+                [
+                    nn.Conv1d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        dilation=dilation,
+                        padding=padding,
+                    ),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
+            in_channels = out_channels
+        self.encoder = nn.Sequential(*layers)
+        self.head = nn.Sequential(nn.LayerNorm(in_channels), nn.Linear(in_channels, 1))
+
+    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        _validate_sequence(sequence)
+        encoded = self.encoder(sequence.transpose(1, 2)).transpose(1, 2)
+        return cast(torch.Tensor, self.head(_masked_mean(encoded, mask)).squeeze(-1))
+
+
+class MambaSSMSequenceEncoder(nn.Module):
+    """Bidirectional wrapper around official `mamba_ssm.Mamba`.
+
+    This is a non-causal encoder over a completed pre-entry path. It is not a causal
+    event-after-entry predictor and therefore does not use post-entry information.
     """
 
-    def __init__(self, *, n_features: int, hidden_size: int = 32):
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        hidden_size: int = 32,
+        n_layers: int = 1,
+        dropout: float = 0.15,
+    ):
         super().__init__()
+        if not torch.cuda.is_available():
+            raise RuntimeError("mamba_ssm_sequence requires CUDA-enabled torch")
+        try:
+            module = importlib.import_module("mamba_ssm")
+            mamba_cls = cast(Any, module.Mamba)
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError("mamba_ssm package with Mamba class is required") from exc
         self.input_projection = nn.Linear(n_features, hidden_size)
-        self.gate_projection = nn.Linear(n_features, hidden_size)
-        self.state_projection = nn.Linear(hidden_size, hidden_size)
+        self.forward_layers = nn.ModuleList(
+            [mamba_cls(d_model=hidden_size) for _ in range(n_layers)]
+        )
+        self.reverse_layers = nn.ModuleList(
+            [mamba_cls(d_model=hidden_size) for _ in range(n_layers)]
+        )
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size), nn.Linear(hidden_size, 1), nn.Softplus()
+            nn.LayerNorm(hidden_size * 4),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 4, 1),
         )
 
-    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
-        if sequence.ndim != 3:
-            raise ValueError("sequence must have shape [batch, time, features]")
-        state = torch.zeros(
-            sequence.shape[0],
-            self.state_projection.out_features,
-            dtype=sequence.dtype,
-            device=sequence.device,
+    def _encode(self, tokens: torch.Tensor, layers: nn.ModuleList) -> torch.Tensor:
+        out = tokens
+        for layer in layers:
+            out = cast(torch.Tensor, layer(out))
+        return out
+
+    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        _validate_sequence(sequence)
+        tokens = self.input_projection(sequence)
+        forward = self._encode(tokens, self.forward_layers)
+        reverse = torch.flip(
+            self._encode(torch.flip(tokens, dims=[1]), self.reverse_layers), dims=[1]
         )
-        for step in range(sequence.shape[1]):
-            x_t = sequence[:, step, :]
-            gate = torch.sigmoid(self.gate_projection(x_t))
-            candidate = torch.tanh(self.input_projection(x_t) + self.state_projection(state))
-            state = gate * candidate + (1.0 - gate) * state
-        return cast(torch.Tensor, self.head(state).squeeze(-1))
+        encoded = torch.cat([forward, reverse], dim=2)
+        pooled = torch.cat([_masked_mean(encoded, mask), _masked_max(encoded, mask)], dim=1)
+        return cast(torch.Tensor, self.head(pooled).squeeze(-1))
 
 
 def _torch_matrix(frame: pd.DataFrame, features: Sequence[str]) -> torch.Tensor:
@@ -603,10 +788,14 @@ def prediction_column_for_model(model_id: str) -> str:
         "lightgbm": "forecast_lightgbm",
         "xgboost": "forecast_xgboost",
         "ft_transformer": "forecast_ft_transformer",
-        "daily_mamba_20step": "forecast_daily_mamba_20step",
-        "hybrid_mamba_31step": "forecast_hybrid_mamba_31step",
-        "intraday_only_mamba_12step": "forecast_intraday_only_mamba_12step",
-        "mask_only_hybrid_mamba": "forecast_mask_only_hybrid_mamba",
+        "lightgbm_xgboost_mean_ensemble": "forecast_lightgbm_xgboost_mean_ensemble",
+        "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence",
+        "attention_pooling_sequence": "forecast_attention_pooling_sequence",
+        "bigru_sequence": "forecast_bigru_sequence",
+        "dilated_cnn_sequence": "forecast_dilated_cnn_sequence",
+        "mamba_ssm_sequence": "forecast_mamba_ssm_sequence",
+        "mask_only_sequence": "forecast_mask_only_sequence",
+        "time_shuffle_sequence": "forecast_time_shuffle_sequence",
         "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
     }
     return mapping[model_id]

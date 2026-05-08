@@ -32,7 +32,7 @@ from earnings_event_vol.backtest import (
     market_entry_cost_usd,
     premium_space_signal,
 )
-from earnings_event_vol.cli import main
+from earnings_event_vol.cli import _parse_comma_ints, main
 from earnings_event_vol.config import load_project_config
 from earnings_event_vol.contract_reference import apply_contract_reference_validation
 from earnings_event_vol.data_audit import audit_data_fields, vendor_local_iv_comparison
@@ -144,9 +144,12 @@ from earnings_event_vol.metrics import (
 )
 from earnings_event_vol.models import (
     MODEL_REGISTRY,
+    AttentionPoolingSequenceEncoder,
+    BiGRUSequenceEncoder,
+    DilatedCNNSequenceEncoder,
     FTTransformerRegressor,
     LinearElasticNetRegressor,
-    MambaSequenceEncoder,
+    MambaSSMSequenceEncoder,
     add_benchmark_predictions,
     fit_ft_transformer,
     fit_linear_elastic_net,
@@ -167,8 +170,10 @@ from earnings_event_vol.research import (
     SEQUENCE_FEATURE_NAMES,
     aggregate_sequence_features,
     assign_event_splits,
+    build_common_row_diagnostics,
     build_metric_tables,
     build_sequence_tensor,
+    build_sequence_v2_quality,
     enrich_feature_matrix_for_research,
     hybrid_sequence_coverage_by_event,
     inference_table,
@@ -179,6 +184,7 @@ from earnings_event_vol.research import (
     run_proxy_model_suite,
     sequence_coverage_by_event,
     sequence_coverage_report,
+    write_retired_model_manifest,
 )
 from earnings_event_vol.schemas import (
     AnnouncementTiming,
@@ -4595,7 +4601,22 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     assert "implemented as a deterministic baseline" in unimplemented_model_message(
         "market_implied_event_variance"
     ) or "implemented and available" in unimplemented_model_message("market_implied_event_variance")
-    assert "mamba_sequence_encoder" not in MODEL_REGISTRY
+    for retired_id in [
+        "daily_mamba_20step",
+        "hybrid_mamba_31step",
+        "intraday_only_mamba_12step",
+        "mask_only_hybrid_mamba",
+        "mamba_sequence_encoder",
+    ]:
+        assert retired_id not in MODEL_REGISTRY
+    for sequence_id in [
+        "ridge_flat_aggregates_sequence",
+        "bigru_sequence",
+        "mamba_ssm_sequence",
+        "mask_only_sequence",
+        "time_shuffle_sequence",
+    ]:
+        assert MODEL_REGISTRY[sequence_id].role.startswith("sequence")
     with pytest.raises(KeyError):
         get_model_spec("mamba_sequence_encoder")
 
@@ -4754,7 +4775,7 @@ def test_event_target_decomposition_amc_bmo_and_open_audit() -> None:
         target_label_column("bad_target", out)
 
 
-def test_sequence_matrix_and_torch_sequence_models() -> None:
+def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPatch) -> None:
     rows = pd.DataFrame(
         {
             "event_id": ["E1", "E1", "E2", "E2"],
@@ -4769,10 +4790,53 @@ def test_sequence_matrix_and_torch_sequence_models() -> None:
     tensor = sequence_tensor_from_frame(sequence, columns)
 
     assert tensor.shape == (2, 2, 3)
+    mask = torch.tensor([[True, False], [True, True]])
     ft = FTTransformerRegressor(n_features=3)
-    mamba = MambaSequenceEncoder(n_features=3)
+    attention = AttentionPoolingSequenceEncoder(n_features=3, hidden_size=4, n_heads=2)
+    bigru = BiGRUSequenceEncoder(n_features=3, hidden_size=4, n_layers=2, dropout=0.0)
+    cnn = DilatedCNNSequenceEncoder(
+        n_features=3,
+        channels=(4, 4),
+        dilations=(1, 2),
+        dropout=0.0,
+    )
     assert ft(tensor[:, 0, :]).shape == (2,)
-    assert mamba(tensor).shape == (2,)
+    assert attention(tensor, mask).shape == (2,)
+    assert attention.last_attention_weights is not None
+    assert attention.last_attention_weights.shape == (2, 1, 2)
+    assert bigru(tensor, mask).shape == (2,)
+    assert cnn(tensor, mask).shape == (2,)
+    with pytest.raises(ValueError, match="hidden_size must be divisible"):
+        AttentionPoolingSequenceEncoder(n_features=3, hidden_size=5, n_heads=2)
+    with pytest.raises(ValueError, match="channels and dilations"):
+        DilatedCNNSequenceEncoder(n_features=3, channels=(4,), dilations=(1, 2))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA-enabled"):
+        MambaSSMSequenceEncoder(n_features=3)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    class FakeMamba(torch.nn.Module):
+        def __init__(self, *, d_model: int):
+            super().__init__()
+            self.projection = torch.nn.Linear(d_model, d_model)
+
+        def forward(self, values: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.projection(values))
+
+    class FakeMambaModule:
+        Mamba = FakeMamba
+
+    monkeypatch.setattr(
+        "earnings_event_vol.models.importlib.import_module",
+        lambda _name: FakeMambaModule,
+    )
+    official_wrapper = MambaSSMSequenceEncoder(
+        n_features=3,
+        hidden_size=4,
+        n_layers=1,
+        dropout=0.0,
+    )
+    assert official_wrapper(tensor, mask).shape == (2,)
 
 
 def test_research_metrics_cover_empty_and_breakdown_paths() -> None:
@@ -4971,15 +5035,15 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
                 "intraday_valid_bin_count",
                 "latest_5min_valid_surface",
                 "hybrid_feature_mask_density",
-                "hybrid_mamba_eligible_v1",
+                "hybrid_sequence_eligible_v2",
             ]
         ],
         on="event_id",
         how="left",
         suffixes=("", "_hybrid"),
     )
-    if "hybrid_mamba_eligible_v1_hybrid" in features:
-        features["hybrid_mamba_eligible_v1"] = features["hybrid_mamba_eligible_v1_hybrid"]
+    if "hybrid_sequence_eligible_v2_hybrid" in features:
+        features["hybrid_sequence_eligible_v2"] = features["hybrid_sequence_eligible_v2_hybrid"]
     features["hybrid_sequence_too_sparse"] = False
     hybrid_tensor_path = tmp_path / "hybrid_sequence_tensor.npz"
     hybrid_tensor_report = build_sequence_tensor(
@@ -4995,20 +5059,21 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert hybrid_payload["time_mask"].shape == (40, 31)
     assert hybrid_payload["feature_mask"].shape == (40, 31, len(HYBRID_SEQUENCE_FEATURE_NAMES))
     assert set(hybrid_payload["step_type"][0].tolist()) == {"daily", "intraday"}
+    sequence_quality = build_sequence_v2_quality(features, tensor_path=hybrid_tensor_path)
+    assert {"valid_len", "missing_rate", "common_row_eligible"}.issubset(sequence_quality.columns)
     audit = proxy_surface_distribution_audit(hybrid_long.assign(iv_extraction_source="synthetic"))
     assert {"iv_extraction_source", "metric", "missing_rate"}.issubset(audit.columns)
 
+    model_frame = prepare_target_frame(features, target_id="day_c2c")
     predictions, diagnostics = run_proxy_model_suite(
-        features,
+        model_frame,
         tensor_path=tensor_path,
         hybrid_tensor_path=hybrid_tensor_path,
         model_ids=[
             "market_implied_event_variance",
             "linear_elastic_net",
-            "daily_mamba_20step",
-            "hybrid_mamba_31step",
-            "intraday_only_mamba_12step",
-            "mask_only_hybrid_mamba",
+            "ridge_flat_aggregates_sequence",
+            "mamba_ssm_sequence",
         ],
     )
     assert (
@@ -5018,20 +5083,31 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         == "evaluated"
     )
     assert (
-        diagnostics.loc[diagnostics["model_id"].eq("daily_mamba_20step"), "status"].iloc[0]
+        diagnostics.loc[
+            diagnostics["model_id"].eq("ridge_flat_aggregates_sequence"), "status"
+        ].iloc[0]
         == "trained"
     )
-    assert (
-        diagnostics.loc[diagnostics["model_id"].eq("hybrid_mamba_31step"), "status"].iloc[0]
-        == "trained"
-    )
-    mamba_forecast = predictions["forecast_daily_mamba_20step"].dropna()
-    assert mamba_forecast.gt(0).all()
-    assert mamba_forecast.std() > 0
+    assert diagnostics.loc[diagnostics["model_id"].eq("mamba_ssm_sequence"), "status"].iloc[0] in {
+        "trained",
+        "skipped_dependency_unavailable",
+    }
+    ridge_forecast = predictions["forecast_ridge_flat_aggregates_sequence"].dropna()
+    assert ridge_forecast.gt(0).all()
+    assert ridge_forecast.std() > 0
+    for retired_column in [
+        "forecast_daily_mamba_20step",
+        "forecast_hybrid_mamba_31step",
+        "forecast_intraday_only_mamba_12step",
+        "forecast_mask_only_hybrid_mamba",
+    ]:
+        assert retired_column not in predictions.columns
 
     qlike, extremes = qlike_sanity_table(
         predictions,
-        forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
+        forecast_columns={
+            "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence"
+        },
     )
     assert qlike["floored_qlike"].notna().all()
     assert set(
@@ -5051,9 +5127,21 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert pytest.approx(1e-6) == FORECAST_FLOOR
     inference = inference_table(
         predictions,
-        forecast_columns={"daily_mamba_20step": "forecast_daily_mamba_20step"},
+        forecast_columns={
+            "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence"
+        },
     )
     assert inference["status"].iloc[0] in {"ok", "insufficient_rows", "insufficient_clusters"}
+    diagnostics_paths = build_common_row_diagnostics(
+        predictions,
+        out_dir=tmp_path / "common",
+        bootstrap_iter=10,
+    )
+    assert Path(diagnostics_paths["common_row_universe"]).exists()
+    retired_manifest = write_retired_model_manifest(tmp_path / "manifest")
+    retired_payload = json.loads(retired_manifest.read_text())
+    assert "daily_mamba_20step" in retired_payload["retired_model_ids"]
+    assert retired_payload["reason"] == "in-repo gated-RNN, not official Mamba"
     metrics_dir = tmp_path / "metrics"
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").parent.mkdir()
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").write_text("stale\n")
@@ -5508,7 +5596,7 @@ def test_research_model_suite_and_error_paths() -> None:
     with pytest.raises(ValueError, match="invalid sequence"):
         sequence_tensor_from_frame(seq_frame, ["bad_name"])
     with pytest.raises(ValueError, match="sequence must have shape"):
-        MambaSequenceEncoder(n_features=2)(torch.zeros(2, 2))
+        BiGRUSequenceEncoder(n_features=2)(torch.zeros(2, 2))
 
 
 def test_feature_matrix_edge_cases_and_sequence_eligibility() -> None:
@@ -5995,6 +6083,12 @@ def test_cli_smoke_commands(tmp_path: Path) -> None:
     )
     assert (models_out / "forecast_metrics.csv").exists()
     assert (models_out / "strategy_metrics.csv").exists()
+
+
+def test_cli_comma_int_parser_validates_mamba_seed_lists() -> None:
+    assert _parse_comma_ints("17, 31,,47") == [17, 31, 47]
+    with pytest.raises(ValueError, match="expected at least one integer seed"):
+        _parse_comma_ints(" , ")
 
 
 def test_compute_variance_uses_event_exit_date_and_rejects_duplicates(tmp_path: Path) -> None:

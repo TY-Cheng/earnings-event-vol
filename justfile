@@ -1,5 +1,6 @@
 set dotenv-load := true
 set shell := ["bash", "-cu"]
+export PATH := "/home/tycheng/.local/bin:" + env_var_or_default("PATH", "")
 
 cli := "PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli"
 active_src := "src/earnings_event_vol"
@@ -13,7 +14,15 @@ _require-external-uv-env:
     @python3 -c 'import os, sys; from pathlib import Path; raw = os.environ.get("UV_PROJECT_ENVIRONMENT", ""); repo = Path("{{ justfile_directory() }}").resolve(); expanded = Path(os.path.expanduser(os.path.expandvars(raw))) if raw else Path(); missing = not raw; relative = bool(raw) and not expanded.is_absolute(); inside = False if missing or relative else expanded.resolve().is_relative_to(repo); reason = "is required" if missing else "must be an absolute path" if relative else "must be outside the repo" if inside else "ok"; print("UV_PROJECT_ENVIRONMENT=" + (raw or "<unset>")); sys.exit(0 if reason == "ok" else (print("error: UV_PROJECT_ENVIRONMENT " + reason, file=sys.stderr) or 1))'
 
 _sync: _require-external-uv-env
-    uv sync --all-extras --dev
+    uv sync --all-extras --dev --inexact
+
+mamba-install: _sync
+    @uv run python -c 'import shutil; nvcc = shutil.which("nvcc"); print("nvcc=" + str(nvcc or "unavailable")); print("mamba-install uses prebuilt wheels; nvcc is optional for this recipe")'
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --torch-backend cu130 "torch==2.11.0"
+    uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --only-binary :all: "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" "https://github.com/state-spaces/mamba/releases/download/v2.3.1/mamba_ssm-2.3.1%2Bcu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl"
+
+mamba-doctor: _require-external-uv-env
+    @uv run python -c 'import importlib.util, platform, shutil, torch; probe=lambda name: "available version=" + str(getattr(__import__(name), "__version__", "unknown")) if importlib.util.find_spec(name) else "unavailable"; print(f"os={platform.system()} {platform.release()} machine={platform.machine()}"); print(f"torch={torch.__version__}"); print(f"torch_cuda_available={torch.cuda.is_available()}"); print(f"torch_cuda_version={torch.version.cuda}"); print(f"cuda_device_count={torch.cuda.device_count()}"); print("nvcc=" + str(shutil.which("nvcc") or "unavailable")); print("mamba_ssm=" + probe("mamba_ssm")); print("causal_conv1d=" + probe("causal_conv1d"))'
 
 _format: _sync
     uv run ruff format {{ format_paths }}
@@ -28,7 +37,7 @@ _check-doc-figures:
 
 check: _format
     uv run mypy {{ active_src }} {{ active_tests }}
-    uv run pytest
+    TMPDIR=/tmp uv run pytest
     uv run mkdocs build --strict --clean
     just _check-doc-figures
     {{ cli }} status

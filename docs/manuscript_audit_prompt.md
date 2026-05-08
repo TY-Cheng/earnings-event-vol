@@ -21,8 +21,8 @@ It must not claim:
 - generic IV forecasting superiority;
 - paper-grade executable backtest results from second-aggregate trade bars;
 - that lower RMSE alone implies economic value;
-- that Mamba is the contribution independent of baselines, ablations, and
-  costs;
+- that official `mamba-ssm` or any sequence model is the contribution
+  independent of baselines, ablations, and costs;
 - that calendar spreads isolate pure event variance.
 
 ## Required Manuscript Elements
@@ -83,11 +83,12 @@ Models:
 - Market-implied IVAR is the primary benchmark.
 - Historical event baselines and Goyal-Saretto-style RV-IV spread are included.
 - Elastic Net and LightGBM/XGBoost are included before deep-model claims.
-- FT-Transformer and Mamba are positioned after strong tabular baselines.
-- Mamba results include sequence coverage, drop-rate diagnostics, and a
-  mask-only ablation.
-- If LightGBM/XGBoost beat Mamba, the conclusion is that tabular nonlinear
-  interactions currently dominate the proxy sequence route.
+- FT-Transformer and sequence diagnostics are positioned after strong tabular
+  baselines.
+- Sequence results include coverage, drop-rate diagnostics, mask-only controls,
+  and deterministic time-shuffle controls.
+- If LightGBM/XGBoost beat the sequence suite, the conclusion is that tabular
+  nonlinear interactions currently dominate the proxy sequence route.
 
 Evaluation:
 

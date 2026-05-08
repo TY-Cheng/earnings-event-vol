@@ -105,7 +105,7 @@ variance edge.
     proxies.
   - These features are trade OHLCV aggregates, not bid/ask, quote, or NBBO
     surfaces.
-- The daily Mamba path is daily-frequency. Each timestep is one allowed
+- The daily sequence path is daily-frequency. Each timestep is one allowed
   pre-entry trading day with close-trade-implied single-name option-surface
   summaries, SPY/QQQ daily surface summaries when available, market ETF returns,
   and daily VIX state.
@@ -122,7 +122,7 @@ variance edge.
   - the intraday sequence is a trade-aggregate proxy surface from second
     aggregate OHLCV bars, not a quote/NBBO surface;
   - if fewer than 70% of events have at least eight valid intraday bins, or
-    median hybrid mask density is below 0.50, hybrid Mamba results are labeled
+    median hybrid mask density is below 0.50, hybrid sequence results are labeled
     `high_missingness_diagnostic` and cannot be headline evidence.
 - ATMF forward selection can use put-call parity only as a short-DTE,
   no-dividend, near-ATM approximation for American single-name options. Weak or

@@ -42,11 +42,12 @@ Robustness and inference:
 
 Sequence route:
 
-- Reduce sequence-selection risk before using Mamba as a paper claim.
+- Reduce sequence-selection risk before using any sequence model as a paper
+  claim.
 - Report sequence coverage, drop rate, and missingness by year and ticker.
-- Keep the mask-only Mamba ablation.
-- Compare Mamba only after LightGBM/XGBoost and FT-Transformer are tuned and
-  reported.
+- Keep mask-only and deterministic time-shuffle controls.
+- Compare official `mamba-ssm` only after LightGBM/XGBoost, FT-Transformer, and
+  simple sequence baselines are tuned and reported.
 
 ## Near-Term Engineering
 

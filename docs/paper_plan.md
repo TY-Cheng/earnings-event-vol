@@ -34,13 +34,14 @@ is diagnostic.
 In the current proxy run, XGBoost has the strongest `jump_c2o` ranking result
 with AUC 0.781 and edge-decile Spearman 0.927. LightGBM produces the strongest
 `day_c2c` net proxy PnL, about 69,908 USD, followed by XGBoost at about
-68,344 USD. Daily and hybrid proxy-Mamba variants are implemented but are not
-headline results because sequence coverage has selection risk and current
-economic performance is weak. The defensible conclusion is that nonlinear
-tabular models show preliminary cross-sectional ranking signal for earnings
-event-variance mispricing in a no-NBBO proxy sample. Paper-grade claims require
-historical quote/NBBO or equivalent data, quote-based IVAR, and leg-level
-execution with realistic bid/ask crossing.
+68,344 USD. The legacy in-repo proxy-Mamba rows are retired because they used a
+gated recurrent encoder rather than official `mamba-ssm`. The new sequence
+suite is a diagnostic-grade test of whether ordered pre-event proxy-surface
+paths add incremental information beyond tabular aggregates. The defensible
+conclusion is that nonlinear tabular models show preliminary cross-sectional
+ranking signal for earnings event-variance mispricing in a no-NBBO proxy
+sample. Paper-grade claims require historical quote/NBBO or equivalent data,
+quote-based IVAR, and leg-level execution with realistic bid/ask crossing.
 
 ## 1. Introduction
 
@@ -87,15 +88,16 @@ the tradable tail.
 
 ### Contribution
 
-The contribution is not "Mamba predicts IV better." The intended contribution is
+The contribution is not a model-family claim. The intended contribution is
 narrower:
 
 > State and event-history features contain preliminary cross-sectional signal
 > for earnings event-variance mispricing beyond market-implied IVAR and simple
 > historical baselines.
 
-The model comparison is outcome-dependent. If Mamba wins, pre-event sequence
-dynamics matter. If LightGBM/XGBoost win, event-level nonlinear tabular
+The model comparison is outcome-dependent. If the sequence suite passes the
+diagnostic gate, ordered pre-event proxy-surface paths may contain incremental
+information. If LightGBM/XGBoost win, event-level nonlinear tabular
 interactions are sufficient for the current proxy data. If IVAR wins after
 costs, the evidence supports a hard-to-beat earnings option market. The current
 proxy result favors the tabular nonlinear interpretation, not a deep-sequence
@@ -109,7 +111,7 @@ headline.
 | Earnings straddle-return studies | Motivates testing whether predicted event variance mispricing maps into option strategy returns. |
 | RV-IV spread and option-return predictability | Provides required classical benchmarks, including Goyal-Saretto-style spread signals. |
 | Empirical asset pricing with ML | Sets the discipline: out-of-sample ranking and economic value matter more than in-sample fit. |
-| Surface and sequence models | Motivates FT-Transformer and proxy-Mamba comparisons, but only after strong tabular baselines. |
+| Surface and sequence models | Motivates FT-Transformer and official `mamba-ssm` diagnostics, but only after strong tabular baselines. |
 
 The paper differs from average-return earnings straddle studies by asking
 whether models sort events by expected event variance mispricing and whether
@@ -210,7 +212,7 @@ flowchart TB
   ivar --> features["Feature matrix and sequences"]
   targets --> features
   entry --> features
-  features --> models["Benchmarks, tabular models,\nFT-Transformer, proxy-Mamba"]
+  features --> models["Benchmarks, tabular models,\nFT-Transformer, sequence diagnostics"]
   models --> metrics["Forecast, ranking,\nproxy strategy metrics"]
   exit --> metrics
   metrics --> docs["Tables, figures,\nproxy report, docs"]
@@ -274,11 +276,14 @@ Sequence coverage is 678 eligible events out of 810. The default drop rate is
 | Linear tabular | Elastic Net | Sparse linear event-level benchmark. |
 | Nonlinear tabular | LightGBM, XGBoost | Main current contenders. |
 | Neural tabular | FT-Transformer | Deep tabular comparator. |
-| Sequence models | Daily proxy-Mamba, hybrid proxy-Mamba, intraday-only Mamba, mask-only hybrid Mamba | Tests whether ordered pre-event paths add value. |
+| Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU, official bidirectional `mamba-ssm`, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
 
-Mamba variants use a q=0.5 quantile loss on log-transformed realized variance
-with `forecast_floor=1e-6`. Forecasts are transformed back to variance space
-before all ranking and economic metrics.
+The sequence suite is diagnostic-grade in the current sample. Phase 1 runs only
+`jump_c2o` and `day_c2c`; Phase 2 expands to attention pooling, non-causal
+dilated CNN, and `reaction_o2c` only if a real sequence model passes the common-
+row bootstrap gate. The official Mamba wrapper is bidirectional over completed
+pre-entry tokens and is therefore a non-causal encoder of the pre-event path,
+not a post-entry leakage channel.
 
 ### 3.6 Splits, Strategy, and Metrics
 
@@ -315,23 +320,20 @@ only V1 proxy-PnL headline.
 | LightGBM | 0.0077 | 0.0192 | 0.355 | 0.500 | 0.745 | 69,908 |
 | XGBoost | 0.0074 | 0.0191 | 0.380 | 0.500 | 0.781 | 68,344 |
 | FT-Transformer | 0.0374 | 0.0396 | -5.487 | 0.200 | 0.525 | -4,793 |
-| Daily Mamba 20-step | 0.0067 | 0.0136 | 0.106 | 0.111 | 0.495 | -9,370 |
-| Hybrid Mamba 31-step | 0.0082 | 0.0228 | 0.194 | 0.100 | 0.498 | -35 |
-| Intraday-only Mamba 12-step | 0.0083 | 0.0228 | 0.192 | 0.100 | 0.498 | -35 |
-| Mask-only hybrid Mamba | 0.0088 | 0.0242 | -0.036 | 0.100 | 0.500 | 101 |
 
-The central result is not that the lowest MAE model wins economically. Daily
-Mamba has the lowest `jump_c2o` MAE, but XGBoost and LightGBM produce the best
-ranking and proxy economic results.
+The central result is not that the lowest MAE model wins economically. XGBoost
+and LightGBM produce the best ranking and proxy economic results in the current
+reader-facing snapshot. Retired in-repo fake-Mamba rows are excluded from the
+paper table.
 
 ### 4.2 Forecast Accuracy
 
 ![Forecast performance](assets/images/modeling/forecast_performance.png)
 
 **Interpretation.** Forecast error is useful but not decisive. XGBoost leads the
-reported `jump_c2o` OOS R2 versus IVAR, while daily Mamba has the lowest MAE.
-The split between forecast accuracy and economic value is why the paper does not
-claim that lower RMSE alone proves tradability.
+reported `jump_c2o` OOS R2 versus IVAR. The split between forecast accuracy and
+economic value is why the paper does not claim that lower RMSE alone proves
+tradability.
 
 ### 4.3 Ranking Quality
 
@@ -367,12 +369,9 @@ Selected `day_c2c` proxy strategy metrics:
 | LightGBM | 100 | 69,908 | 0.413 | 6.476 | -1,416 |
 | XGBoost | 100 | 68,344 | 0.403 | 6.271 | -1,695 |
 | FT-Transformer | 100 | -4,793 | -0.028 | -0.370 | -15,366 |
-| Daily Mamba 20-step | 87 | -9,370 | -0.066 | -0.765 | -14,012 |
-| Hybrid Mamba 31-step | 93 | -35 | -0.000 | -0.003 | -11,928 |
-| Mask-only hybrid Mamba | 93 | 101 | 0.001 | 0.008 | -11,928 |
 
 **Interpretation.** The strongest proxy economics come from LightGBM and
-XGBoost. This supports the conservative tabular-model claim, not a Mamba
+XGBoost. This supports the conservative tabular-model claim, not a sequence
 headline. The strategy table remains a screening result because prices are
 trade-aggregate proxies rather than executable bid/ask marks.
 
@@ -423,7 +422,7 @@ clusters, and 72 ticker clusters.
 story rather than a deep-sequence headline. LightGBM has the strongest clustered
 forecast-loss diagnostic in the current proxy run, while XGBoost has the
 strongest `jump_c2o` ranking metrics. The missing paper-grade step is not
-another Mamba variant; it is quote/NBBO execution evidence and broader
+another sequence variant; it is quote/NBBO execution evidence and broader
 robustness by DTE, liquidity, timing, ticker concentration, and calendar time.
 
 ### 4.8 Calibration
@@ -455,8 +454,6 @@ Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 | LightGBM | 93 | 28,911 | 0.171 | 2.782 | -3,910 |
 | XGBoost | 93 | 41,456 | 0.245 | 4.190 | -1,698 |
 | FT-Transformer | 93 | 4,113 | 0.024 | 0.380 | -9,347 |
-| Hybrid Mamba 31-step | 88 | -7,438 | -0.047 | -0.689 | -10,293 |
-| Mask-only hybrid Mamba | 88 | -8,021 | -0.050 | -0.743 | -10,148 |
 
 **Interpretation.** The C2O diagnostic is consistent with the tabular ranking
 story: XGBoost and LightGBM perform best under the post-open option-VWAP proxy.
@@ -474,7 +471,7 @@ limitations are:
 | Option second aggregates are trade OHLCV bars | IV surfaces and strategy marks are trade-price proxies. |
 | Current sample starts in 2022 | Does not yet cover the target 2013-2025 paper window. |
 | 117 of 810 events lack usable trade-proxy IVAR | IVAR coverage is a material sample screen. |
-| Sequence eligibility is 678 of 810 events | Mamba results carry selection risk and are diagnostic. |
+| Sequence eligibility is 678 of 810 events | Sequence results carry selection risk and are diagnostic. |
 | C2O/O2C option PnL is diagnostic | V1 tradable mispricing headline remains `day_c2c`. |
 | Proxy haircut cost model | Full bid/ask crossing remains future paper-grade work. |
 

@@ -106,11 +106,11 @@ channel is missing two event-covering expiries.
 ## Model Results
 
 The feature matrix has 810 rows. The chronological proxy split trains on 567
-rows, validates on 121 rows, and tests on 122 rows for tabular models. Daily
-Mamba uses a 20 x 37 tensor; hybrid Mamba uses a 31 x 21 mixed-clock tensor with
-19 prior daily proxy-surface states plus 12 entry-day five-minute trade-aggregate
-proxy bins. Sequence coverage is 678 eligible events out of 810, so Mamba
-results are diagnostic rather than headline evidence.
+rows, validates on 121 rows, and tests on 122 rows for tabular models. The
+legacy in-repo proxy-Mamba rows are retired because they used a gated recurrent
+encoder rather than official `mamba-ssm`. The new sequence suite is a
+diagnostic-grade test of whether ordered pre-event proxy-surface paths add
+incremental information beyond tabular aggregates.
 
 Selected `jump_c2o` forecast metrics:
 
@@ -122,10 +122,6 @@ Selected `jump_c2o` forecast metrics:
 | LightGBM | 122 | 0.0077 | 0.0192 | 0.355 |
 | XGBoost | 122 | 0.0074 | 0.0191 | 0.380 |
 | FT-Transformer | 122 | 0.0374 | 0.0396 | -5.487 |
-| Daily Mamba 20-step | 100 | 0.0067 | 0.0136 | 0.106 |
-| Hybrid Mamba 31-step | 100 | 0.0082 | 0.0228 | 0.194 |
-| Intraday-only Mamba 12-step | 100 | 0.0083 | 0.0228 | 0.192 |
-| Mask-only hybrid Mamba | 100 | 0.0088 | 0.0242 | -0.036 |
 
 Selected `jump_c2o` ranking metrics:
 
@@ -137,10 +133,6 @@ Selected `jump_c2o` ranking metrics:
 | LightGBM | 100 | 0.500 | 0.745 | 0.903 |
 | XGBoost | 100 | 0.500 | 0.781 | 0.927 |
 | FT-Transformer | 100 | 0.200 | 0.525 | 0.758 |
-| Daily Mamba 20-step | 87 | 0.111 | 0.495 | 0.406 |
-| Hybrid Mamba 31-step | 93 | 0.100 | 0.498 | 0.600 |
-| Intraday-only Mamba 12-step | 93 | 0.100 | 0.498 | 0.673 |
-| Mask-only hybrid Mamba | 93 | 0.100 | 0.500 | 0.685 |
 
 Selected `day_c2c` proxy strategy metrics:
 
@@ -153,10 +145,6 @@ Selected `day_c2c` proxy strategy metrics:
 | LightGBM | 100 | 69,908.11 | 0.413 | 6.476 | -1,416.38 |
 | XGBoost | 100 | 68,343.93 | 0.403 | 6.271 | -1,694.94 |
 | FT-Transformer | 100 | -4,792.98 | -0.028 | -0.370 | -15,366.08 |
-| Daily Mamba 20-step | 87 | -9,370.00 | -0.066 | -0.765 | -14,011.80 |
-| Hybrid Mamba 31-step | 93 | -34.55 | -0.000 | -0.003 | -11,928.45 |
-| Intraday-only Mamba 12-step | 93 | -34.55 | -0.000 | -0.003 | -11,928.45 |
-| Mask-only hybrid Mamba | 93 | 101.21 | 0.001 | 0.008 | -11,928.45 |
 
 Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 
@@ -168,11 +156,32 @@ Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 | LightGBM | 93 | 28,911.28 | 0.171 | 2.782 | -3,909.83 |
 | XGBoost | 93 | 41,455.71 | 0.245 | 4.190 | -1,697.70 |
 | FT-Transformer | 93 | 4,112.63 | 0.024 | 0.380 | -9,347.18 |
-| Hybrid Mamba 31-step | 88 | -7,438.48 | -0.047 | -0.689 | -10,292.62 |
-| Mask-only hybrid Mamba | 88 | -8,020.68 | -0.050 | -0.743 | -10,147.87 |
 
 The C2O proxy rows are diagnostic and have
 `pnl_headline_eligible=false`. The V1 proxy-PnL headline remains `day_c2c`.
+
+### Phase 1 Sequence Gate
+
+The Phase 1 sequence suite is a diagnostic-grade signal test, not a headline
+model run. The gate requires AUC lift of at least 0.05 and a bootstrap lift
+95% CI with lower bound above zero on the same common-row universe. No sequence
+model passes this gate in the current sample, and sequence stacking reduces the
+locked-test AUC versus the LightGBM/XGBoost rank-average ensemble.
+
+Selected common-row Phase 1 gate results:
+
+| Target | Model | Test N | AUC | AUC lift vs control | 95% CI low | 95% CI high | Gate |
+|:---|:---|---:|---:|---:|---:|---:|:---|
+| `jump_c2o` | BiGRU | 93 | 0.496 | -0.004 vs mask-only | -0.028 | 0.026 | fail |
+| `jump_c2o` | official `mamba-ssm` | 93 | 0.495 | -0.005 vs mask-only | -0.063 | 0.050 | fail |
+| `jump_c2o` | ridge-flat aggregates | 100 | 0.434 | -0.066 vs mask-only | -0.206 | 0.017 | fail |
+| `day_c2c` | ridge-flat aggregates | 100 | 0.636 | 0.104 vs time-shuffle | -0.044 | 0.282 | fail |
+| `day_c2c` | BiGRU | 93 | 0.541 | 0.009 vs time-shuffle | -0.009 | 0.029 | fail |
+| `day_c2c` | official `mamba-ssm` | 93 | 0.504 | -0.027 vs time-shuffle | -0.099 | 0.037 | fail |
+
+Interpretation: ordered proxy-surface paths do not provide reliable
+incremental signal in the current sample. Official `mamba-ssm` is implemented
+and runs on CUDA, but it is not a paper headline model.
 
 ## Robustness and Inference
 
@@ -224,10 +233,9 @@ The current proxy evidence supports three narrow statements:
   simple historical baselines.
 - The strongest tabular models also improve the premium-space `day_c2c` proxy
   strategy screen after the current proxy haircut cost model.
-- The sequence-model route is implemented, including daily, hybrid,
-  intraday-only, and mask-only variants, but it is not the current headline
-  result because coverage selection risk remains high and economic results are
-  weak.
+- The new sequence-model route is diagnostic-grade. It compares ridge-flat
+  sequence aggregates, BiGRU, official `mamba-ssm`, mask-only, and time-shuffle
+  controls before any sequence claim can enter the paper headline.
 
 The defensible near-term claim is:
 
@@ -247,8 +255,8 @@ The current route has the following limits:
 - The sample begins in 2022 because the observed options day-aggregate
   entitlement does not cover the 2013-2025 target paper window.
 - IVAR coverage is incomplete: 117 of 810 events lack a usable trade-proxy IVAR.
-- Mamba sequence coverage is incomplete: 678 of 810 events pass the default
-  sequence rule, a 16.3% drop rate.
+- Sequence coverage is incomplete: 678 of 810 events pass the default sequence
+  rule, a 16.3% drop rate.
 - C2O and O2C option-PnL rows are diagnostic decompositions, not V1 tradable
   mispricing headlines.
 - Cost sensitivity uses a proxy haircut, not full bid/ask crossing.

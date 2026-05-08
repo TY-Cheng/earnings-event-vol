@@ -40,11 +40,13 @@ market entry cost and transaction cost estimates.
 
 ## Current State
 
-Verified local state on 2026-05-07:
+Verified local state on 2026-05-08:
 
 - `just data` builds the active no-NBBO proxy data pipeline.
 - `just research` builds the proxy feature/model/report package from the
   current trade-proxy event panel.
+- `just mamba-install` installs the local CUDA Mamba wheels and `just
+  mamba-doctor` verifies the official `mamba-ssm` runtime.
 - Current data range is `2022-12-01` through `2025-12-31`, because the observed
   Massive options day-aggregate entitlement in this workspace starts in 2022.
 - The target paper range remains 2013-2025, but that needs upgraded historical
@@ -68,16 +70,19 @@ Latest proxy modeling artifacts:
 - Feature matrix: 810 rows.
 - Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost,
-  FT-Transformer, daily proxy-Mamba, hybrid proxy-Mamba, intraday-only Mamba,
-  and mask-only Mamba ablations.
+  LightGBM/XGBoost rank-average ensemble, FT-Transformer, and the V5 sequence
+  diagnostic suite.
+- Sequence diagnostics: ridge-flat sequence aggregates, BiGRU, official
+  bidirectional `mamba-ssm`, mask-only, and deterministic time-shuffle controls.
 - Sequence audit: 678 eligible events out of 810 under the default path
   coverage rule; flagged as high sequence-selection risk.
 - In the current no-NBBO proxy run, XGBoost leads `jump_c2o` ranking AUC
   (0.781), while LightGBM leads `day_c2c` net proxy PnL (about 69,908 USD).
   This is signal-screening evidence, not a paper-grade executable trading
   result.
-- Proxy-Mamba is implemented for both the 20-step daily tensor and the 31-step
-  hybrid tensor, but it is not a headline model in the current run.
+- Phase 1 sequence diagnostics did not pass the common-row bootstrap gate:
+  official `mamba-ssm` has `jump_c2o` AUC 0.495 and `day_c2c` AUC 0.504, and it
+  does not add value to the tabular ensemble in locked-test stacking.
 
 ## Command Surface
 
@@ -86,9 +91,11 @@ Use `just` as the public command surface:
 ```bash
 just status
 just check
+just mamba-doctor
+just mamba-install
 just data args="--dry-run"
 just data
-just research args="--allow-high-sequence-risk --split-design chronological_proxy_70_15_15"
+just research args="--stage all --sequence-suite phase1 --allow-high-sequence-risk --bootstrap-iter 200"
 just docs
 ```
 
@@ -150,6 +157,10 @@ Research package:
 - `artifacts/modeling/strategy_metrics.csv`
 - `artifacts/modeling/model_fit_diagnostics.csv`
 - `artifacts/modeling/model_predictions.parquet`
+- `artifacts/modeling/sequence_v2_quality.csv`
+- `artifacts/modeling/common_row_pairwise_metrics.csv`
+- `artifacts/modeling/incremental_value_diagnostics.csv`
+- `artifacts/modeling/sequence_model_fit_diagnostics.csv`
 - `reports/modeling/proxy_research_report.md`
 - `reports/modeling/figures/`
 

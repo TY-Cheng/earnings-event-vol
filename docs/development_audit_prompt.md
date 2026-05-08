@@ -93,8 +93,8 @@ Model and research package:
 
 - Market-implied IVAR is always the primary benchmark.
 - Last-four RVAR, last-four IVAR, Goyal-Saretto-style RV-IV spread, Elastic Net,
-  LightGBM/XGBoost, FT-Transformer, and Mamba are compared only when their
-  callable implementations and diagnostics exist.
+  LightGBM/XGBoost, FT-Transformer, and sequence diagnostics are compared only
+  when their callable implementations and diagnostics exist.
 - Model registry `implemented` flags must match callable behavior.
 - Sequence-model results report coverage, drop rate, and mask-only ablation.
 - High sequence-selection risk is surfaced and not hidden in headline claims.

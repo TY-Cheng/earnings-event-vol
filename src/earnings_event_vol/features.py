@@ -213,7 +213,7 @@ def build_option_surface_sequence_matrix(
     value_columns: Sequence[str] = ("atm_iv", "option_volume", "spread_over_mid"),
     lookback_days: int = 20,
 ) -> pd.DataFrame:
-    """Pivot long pre-event surface rows into `seq_tXX_feature` columns for Mamba."""
+    """Pivot long pre-event surface rows into `seq_tXX_feature` columns."""
     required = {event_id_col, day_index_col, *value_columns}
     missing = sorted(required - set(rows.columns))
     if missing:
