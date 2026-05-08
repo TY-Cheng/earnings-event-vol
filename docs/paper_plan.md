@@ -13,6 +13,9 @@ U.S. Equity Options**
 This page is organized like a paper draft rather than a project plan. It keeps
 the current evidence conservative: the results are based on a
 `no_nbbo_trade_proxy` route and are not paper-grade executable trading results.
+It is the manuscript skeleton with selected headline tables; the full
+paper-facing result ledger is `docs/results_snapshot.md`, whose numeric tables
+are verified against the generated artifacts under `artifacts/modeling/`.
 
 ## Abstract
 

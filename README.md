@@ -43,8 +43,8 @@ market entry cost and transaction cost estimates.
 Verified local state on 2026-05-08:
 
 - `just data` builds the active no-NBBO proxy data pipeline.
-- `just research` builds the proxy feature/model/report package from the
-  current trade-proxy event panel.
+- `just research` builds the canonical V5 Phase 1 proxy feature/model/report
+  package from the current trade-proxy event panel.
 - `just mamba-install` installs the local CUDA Mamba wheels and `just
   mamba-doctor` verifies the official `mamba-ssm` runtime.
 - Current data range is `2022-12-01` through `2025-12-31`, because the observed
@@ -95,7 +95,8 @@ just mamba-doctor
 just mamba-install
 just data args="--dry-run"
 just data
-just research args="--stage all --sequence-suite phase1 --allow-high-sequence-risk --bootstrap-iter 200"
+just research
+just research-report
 just docs
 ```
 
@@ -135,9 +136,22 @@ Default data parameters:
   15 minutes before the exit-date close. Same-contract option day-aggregate
   close is retained only as fallback/diagnostic.
 
-`just research` does not download market data. It consumes the current proxy
-panel, builds features, trains/evaluates models, and writes metrics, figures,
-and the proxy report.
+`just research` does not download market data. With no arguments, it runs the
+current canonical V5 Phase 1 package:
+
+```bash
+just research args="--stage all --sequence-suite phase1 --allow-high-sequence-risk --bootstrap-iter 200"
+```
+
+It consumes the current proxy panel, builds features, trains/evaluates models,
+writes metrics, writes `reports/modeling/proxy_research_report.md`, regenerates
+`reports/modeling/figures/*.png`, and syncs those figures into
+`docs/assets/images/modeling/`.
+
+`just research-report` regenerates only the generated report and figure assets
+from existing modeling artifacts. The curated reader-facing
+`docs/results_snapshot.md` is intentionally manual: update it when a run changes
+the paper-facing tables or interpretation, then run `just check`.
 
 ## Key Outputs
 
