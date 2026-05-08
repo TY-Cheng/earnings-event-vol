@@ -386,7 +386,47 @@ higher multipliers matters because the current route lacks bid/ask data.
 LightGBM and XGBoost remain the main proxy-stage contenders in the displayed
 cost stress.
 
-### 4.7 Calibration
+Selected `day_c2c` net proxy PnL under entry-premium haircut multipliers:
+
+| Model | 1x cost | 3x cost | 5x cost |
+|:---|---:|---:|---:|
+| Goyal-Saretto spread | -461 | -2,155 | -3,849 |
+| Elastic Net | 47,938 | 46,244 | 44,550 |
+| LightGBM | 69,908 | 68,214 | 66,520 |
+| XGBoost | 68,344 | 66,650 | 64,956 |
+
+### 4.7 Robustness and Inference
+
+The current robustness package is still a proxy-stage package, not final
+paper-grade inference. It nevertheless gives the conservative manuscript a
+better spine than a model-family story: the claim rests on cost persistence,
+event-date and ticker clustered loss diagnostics, and the fact that the same
+tabular models lead both ranking and economic screens.
+
+Forecast-loss inference uses the test rows and reports the mean squared-loss
+improvement versus market IVAR. Positive values mean lower squared forecast
+loss than IVAR. The current common test set has 100 rows, 46 event-date
+clusters, and 72 ticker clusters.
+
+| Target | Model | Mean loss improvement vs IVAR | Two-way cluster SE | Ratio |
+|:---|:---|---:|---:|---:|
+| `jump_c2o` | Goyal-Saretto spread | 0.000030 | 0.000022 | 1.35 |
+| `jump_c2o` | Elastic Net | 0.000068 | 0.000042 | 1.60 |
+| `jump_c2o` | LightGBM | 0.000074 | 0.000034 | 2.19 |
+| `jump_c2o` | XGBoost | 0.000080 | 0.000043 | 1.87 |
+| `day_c2c` | Goyal-Saretto spread | -0.000005 | 0.000039 | -0.13 |
+| `day_c2c` | Elastic Net | 0.000101 | 0.000051 | 1.99 |
+| `day_c2c` | LightGBM | 0.000177 | 0.000070 | 2.51 |
+| `day_c2c` | XGBoost | 0.000081 | 0.000108 | 0.75 |
+
+**Interpretation.** The inference table supports a conservative tabular-model
+story rather than a deep-sequence headline. LightGBM has the strongest clustered
+forecast-loss diagnostic in the current proxy run, while XGBoost has the
+strongest `jump_c2o` ranking metrics. The missing paper-grade step is not
+another Mamba variant; it is quote/NBBO execution evidence and broader
+robustness by DTE, liquidity, timing, ticker concentration, and calendar time.
+
+### 4.8 Calibration
 
 ![Calibration plot](assets/images/modeling/calibration_plot.png)
 
@@ -394,7 +434,7 @@ cost stress.
 right scale, not only correctly ranked. The current evidence is stronger for
 ranking than for perfectly calibrated variance levels.
 
-### 4.8 QLIKE Diagnostic
+### 4.9 QLIKE Diagnostic
 
 ![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
 
@@ -403,7 +443,7 @@ The QLIKE figure is a diagnostic guardrail, not a headline metric. It prevents
 the paper from over-weighting a loss function dominated by a small number of
 near-zero forecast cases.
 
-### 4.9 C2O Post-Open Diagnostic
+### 4.10 C2O Post-Open Diagnostic
 
 Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 
@@ -470,4 +510,3 @@ hard to beat under realistic earnings-option frictions.
 | E. Feature Schema | Event-level, VIX, SPY/QQQ, daily sequence, hybrid sequence, and as-of timestamps. |
 | F. Model Configuration | Splits, hyperparameters, seeds, training status, and fit diagnostics. |
 | G. Robustness and Inference | DTE windows, liquidity buckets, timing splits, ticker/year concentration, clustered SEs, and bootstrap checks. |
-

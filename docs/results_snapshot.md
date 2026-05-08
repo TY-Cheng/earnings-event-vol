@@ -174,6 +174,47 @@ Selected `jump_c2o` 5-15 minute post-open option-VWAP proxy diagnostics:
 The C2O proxy rows are diagnostic and have
 `pnl_headline_eligible=false`. The V1 proxy-PnL headline remains `day_c2c`.
 
+## Robustness and Inference
+
+The current robustness package is still proxy-stage, but it is now enough for a
+conservative manuscript draft to discuss cost stress and clustered forecast-loss
+diagnostics. The robustness tables focus on the classical benchmark and tabular
+contenders because those are the only current sellable models; sequence models
+remain diagnostic until sequence-selection risk is reduced.
+
+Selected `day_c2c` net proxy PnL under entry-premium haircut multipliers:
+
+| Model | 1x cost | 3x cost | 5x cost |
+|:---|---:|---:|---:|
+| Goyal-Saretto spread | -461 | -2,155 | -3,849 |
+| Elastic Net | 47,938 | 46,244 | 44,550 |
+| LightGBM | 69,908 | 68,214 | 66,520 |
+| XGBoost | 68,344 | 66,650 | 64,956 |
+
+Forecast-loss inference uses the test rows and reports the mean squared-loss
+improvement versus market IVAR. Positive values mean lower squared forecast
+loss than IVAR. The current table uses 46 event-date clusters and 72 ticker
+clusters for the common 100-row test set.
+
+Selected two-way clustered forecast-loss diagnostics:
+
+| Target | Model | Mean loss improvement vs IVAR | Two-way cluster SE | Ratio |
+|:---|:---|---:|---:|---:|
+| `jump_c2o` | Goyal-Saretto spread | 0.000030 | 0.000022 | 1.35 |
+| `jump_c2o` | Elastic Net | 0.000068 | 0.000042 | 1.60 |
+| `jump_c2o` | LightGBM | 0.000074 | 0.000034 | 2.19 |
+| `jump_c2o` | XGBoost | 0.000080 | 0.000043 | 1.87 |
+| `day_c2c` | Goyal-Saretto spread | -0.000005 | 0.000039 | -0.13 |
+| `day_c2c` | Elastic Net | 0.000101 | 0.000051 | 1.99 |
+| `day_c2c` | LightGBM | 0.000177 | 0.000070 | 2.51 |
+| `day_c2c` | XGBoost | 0.000081 | 0.000108 | 0.75 |
+
+Interpretation: cost stress supports the same tabular ranking story as the
+headline proxy strategy table. Clustered forecast-loss diagnostics are strongest
+for LightGBM in the current proxy run, with XGBoost still leading the
+`jump_c2o` ranking metrics. These diagnostics are not a substitute for
+paper-grade execution inference under bid/ask or NBBO data.
+
 ## Conservative Results
 
 The current proxy evidence supports three narrow statements:
@@ -271,4 +312,3 @@ Published docs assets:
 | --- | --- |
 | Curated results page | `docs/results_snapshot.md` |
 | Published figure copies | `docs/assets/images/modeling/*.png` |
-

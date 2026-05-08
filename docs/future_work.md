@@ -31,8 +31,9 @@ Full sample:
 
 Robustness and inference:
 
+- Promote the current cost-stress and clustered forecast-loss diagnostics into
+  final tables only after the paper-grade data route is rebuilt.
 - Re-run main DTE `5-14` and robustness DTE `3-21` samples separately.
-- Add event-date, ticker, and two-way clustered inference.
 - Add block bootstrap confidence intervals.
 - Add model-confidence-set or SPA-style checks if many thresholds or models are
   compared.

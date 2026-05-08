@@ -19,10 +19,18 @@ _format: _sync
     uv run ruff format {{ format_paths }}
     uv run ruff check --fix {{ format_paths }}
 
+_sync-doc-figures:
+    @mkdir -p docs/assets/images/modeling
+    @shopt -s nullglob; figures=(reports/modeling/figures/*.png); if (( ${#figures[@]} == 0 )); then echo "No reports/modeling/figures/*.png to sync"; exit 0; fi; cp "${figures[@]}" docs/assets/images/modeling/
+
+_check-doc-figures:
+    @shopt -s nullglob; figures=(reports/modeling/figures/*.png); if (( ${#figures[@]} == 0 )); then echo "No reports/modeling/figures/*.png to check"; exit 0; fi; failures=0; for src in "${figures[@]}"; do dest="docs/assets/images/modeling/$(basename "$src")"; if [[ ! -f "$dest" ]]; then echo "missing synced docs figure: $dest"; failures=1; elif ! cmp -s "$src" "$dest"; then echo "stale synced docs figure: $dest"; failures=1; fi; done; docs_figures=(docs/assets/images/modeling/*.png); for dest in "${docs_figures[@]}"; do src="reports/modeling/figures/$(basename "$dest")"; if [[ ! -f "$src" ]]; then echo "docs figure has no report source: $dest"; failures=1; fi; done; exit "$failures"
+
 check: _format
     uv run mypy {{ active_src }} {{ active_tests }}
     uv run pytest
     uv run mkdocs build --strict --clean
+    just _check-doc-figures
     {{ cli }} status
     {{ cli }} source-probe all
 
@@ -37,6 +45,7 @@ data stage="proxy-all" args="": _require-external-uv-env
 
 research args="": _sync
     @extra='{{ args }}'; extra="${extra#args=}"; read -r -a extra_args <<< "$extra"; {{ cli }} research "${extra_args[@]}"
+    just _sync-doc-figures
 
 docs port="8000": _format
     uv run mkdocs build --strict --clean
