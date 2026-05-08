@@ -167,6 +167,7 @@ from earnings_event_vol.research import (
     FORECAST_FLOOR,
     HYBRID_SEQUENCE_FEATURE_NAMES,
     HYBRID_STEPS,
+    PHASE1_TARGET_IDS,
     SEQUENCE_FEATURE_NAMES,
     aggregate_sequence_features,
     assign_event_splits,
@@ -177,6 +178,7 @@ from earnings_event_vol.research import (
     enrich_feature_matrix_for_research,
     hybrid_sequence_coverage_by_event,
     inference_table,
+    o2c_scale_diagnostic,
     prepare_target_frame,
     proxy_surface_distribution_audit,
     proxy_transaction_cost,
@@ -4935,13 +4937,22 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
             "dte_1": [8, 16] * 20,
             "universe_rank": list(range(1, 41)),
             "entry_premium_usd": np.linspace(300, 500, 40),
+            "open_option_vwap_0_5_anchor_usd": np.linspace(280, 480, 40),
+            "open_option_vwap_5_15_anchor_usd": np.linspace(260, 460, 40),
             "gross_proxy_pnl_usd": np.linspace(-50, 80, 40),
             "gross_c2o_intrinsic_proxy_pnl_usd": np.linspace(-120, 60, 40),
             "gross_post_open_option_vwap_0_5_proxy_pnl_usd": np.linspace(-100, 70, 40),
             "gross_post_open_option_vwap_5_15_proxy_pnl_usd": np.linspace(-90, 90, 40),
+            "gross_reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy_pnl_usd": np.linspace(
+                -80, 50, 40
+            ),
+            "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd": np.linspace(
+                -70, 60, 40
+            ),
             "haircut_pnl_usd": np.linspace(-55, 70, 40),
         }
     )
+    assert "reaction_o2c" in PHASE1_TARGET_IDS
     rows: list[dict[str, object]] = []
     for event_idx, event_id in enumerate(events["event_id"]):
         for seq_idx in range(20):
@@ -4990,6 +5001,8 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     )
     assert target_rows.groupby("event_id")["split"].nunique().max() == 1
     assert set(target_rows["target_id"]) == {"jump_c2o", "day_c2c", "reaction_o2c"}
+    target_rows["forecast_market_implied_event_variance"] = target_rows["ivar_event"]
+    target_rows["forecast_linear_elastic_net"] = target_rows["rvar_event"] * 1.02
     assert set(features["split"]) == {"train", "validation", "test"}
     assert features.groupby("event_id")["split"].nunique().max() == 1
     tensor_path = tmp_path / "sequence_tensor.npz"
@@ -5146,11 +5159,23 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").parent.mkdir()
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").write_text("stale\n")
     (metrics_dir / "strategy_trades_mask_only_mamba_sequence_encoder.csv").write_text("stale\n")
+    (metrics_dir / "o2c_option_vwap_5_15_strategy_trades_mamba_sequence_encoder.csv").write_text(
+        "stale\n"
+    )
+    (metrics_dir / "o2c_option_vwap_0_5_strategy_trades_mamba_sequence_encoder.csv").write_text(
+        "stale\n"
+    )
     metric_paths = build_metric_tables(target_rows, out_dir=metrics_dir)
     assert not (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").exists()
     assert not (metrics_dir / "strategy_trades_mask_only_mamba_sequence_encoder.csv").exists()
+    assert not (
+        metrics_dir / "o2c_option_vwap_5_15_strategy_trades_mamba_sequence_encoder.csv"
+    ).exists()
+    assert not (
+        metrics_dir / "o2c_option_vwap_0_5_strategy_trades_mamba_sequence_encoder.csv"
+    ).exists()
     strategy = pd.read_csv(metric_paths["strategy_metrics"])
-    assert {"day_c2c", "jump_c2o"}.issubset(set(strategy["target_id"]))
+    assert {"day_c2c", "jump_c2o", "reaction_o2c"}.issubset(set(strategy["target_id"]))
     c2o_strategy = strategy.loc[strategy["target_id"].eq("jump_c2o")]
     assert {
         "c2o_intrinsic_open_diagnostic",
@@ -5158,7 +5183,31 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         "post_open_option_vwap_5_15_proxy",
     }.issubset(set(c2o_strategy["strategy_proxy_kind"]))
     assert c2o_strategy["pnl_headline_eligible"].astype(str).str.lower().eq("false").all()
-    assert "reaction_o2c" not in set(strategy["target_id"])
+    o2c_strategy = strategy.loc[strategy["target_id"].eq("reaction_o2c")]
+    assert {
+        "reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy",
+        "reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy",
+    }.issubset(set(o2c_strategy["strategy_proxy_kind"]))
+    assert o2c_strategy["pnl_headline_eligible"].astype(str).str.lower().eq("false").all()
+    o2c_trades = pd.read_csv(
+        metrics_dir / "o2c_option_vwap_5_15_strategy_trades_linear_elastic_net.csv"
+    )
+    if not o2c_trades.empty:
+        expected_anchor = events[["event_id", "open_option_vwap_5_15_anchor_usd"]]
+        anchored = o2c_trades.merge(expected_anchor, on="event_id", how="left")
+        assert np.allclose(
+            anchored["capital_at_risk_usd"],
+            anchored["open_option_vwap_5_15_anchor_usd_y"],
+        )
+        assert np.allclose(
+            o2c_trades["estimated_transaction_cost_usd"],
+            0.005 * o2c_trades["capital_at_risk_usd"],
+        )
+    scale = pd.read_csv(metric_paths["o2c_scale_diagnostic"])
+    assert np.isfinite(scale["sd_ratio_o2c_to_ivar"].iloc[0])
+    assert np.isfinite(scale["mean_ratio_o2c_to_ivar"].iloc[0])
+    direct_scale = o2c_scale_diagnostic(target_rows)
+    assert int(direct_scale["paired_rows"].iloc[0]) == len(events)
 
 
 def test_market_index_second_surface_and_underlying_features() -> None:

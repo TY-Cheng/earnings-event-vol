@@ -127,7 +127,7 @@ HYBRID_SURFACE_VALUE_FEATURE_NAMES = [
     }
 ]
 TARGET_IDS = ["jump_c2o", "day_c2c", "reaction_o2c"]
-PHASE1_TARGET_IDS = ["jump_c2o", "day_c2c"]
+PHASE1_TARGET_IDS = TARGET_IDS
 PHASE2_TARGET_IDS = TARGET_IDS
 RETIRED_MAMBA_MODEL_IDS = [
     "daily_mamba_20step",
@@ -1726,6 +1726,44 @@ def prepare_target_frame(base: pd.DataFrame, *, target_id: str) -> pd.DataFrame:
     return out
 
 
+def o2c_scale_diagnostic(frame: pd.DataFrame) -> pd.DataFrame:
+    target = frame.copy()
+    if "target_id" in target.columns:
+        target = target.loc[target["target_id"].astype(str).eq("reaction_o2c")].copy()
+    required = {"rvar_event", "ivar_event"}
+    if not required.issubset(target.columns):
+        paired = pd.DataFrame()
+    else:
+        paired = target.dropna(subset=["rvar_event", "ivar_event"]).copy()
+    if paired.empty:
+        sd_rvar = np.nan
+        sd_ivar = np.nan
+        mean_rvar = np.nan
+        mean_ivar = np.nan
+    else:
+        sd_rvar = float(pd.to_numeric(paired["rvar_event"], errors="coerce").std())
+        sd_ivar = float(pd.to_numeric(paired["ivar_event"], errors="coerce").std())
+        mean_rvar = float(pd.to_numeric(paired["rvar_event"], errors="coerce").mean())
+        mean_ivar = float(pd.to_numeric(paired["ivar_event"], errors="coerce").mean())
+    return pd.DataFrame(
+        [
+            {
+                "target_id": "reaction_o2c",
+                "paired_rows": int(len(paired)),
+                "sd_rvar_reaction_o2c": sd_rvar,
+                "sd_ivar_event": sd_ivar,
+                "sd_ratio_o2c_to_ivar": sd_rvar / sd_ivar
+                if np.isfinite(sd_rvar) and np.isfinite(sd_ivar) and sd_ivar != 0
+                else np.nan,
+                "mean_ratio_o2c_to_ivar": mean_rvar / mean_ivar
+                if np.isfinite(mean_rvar) and np.isfinite(mean_ivar) and mean_ivar != 0
+                else np.nan,
+                "ivar_baseline_interpretation": "weak_full_event_comparator_only",
+            }
+        ]
+    )
+
+
 def research_prediction_column(model_id: str) -> str:
     mapping = {
         "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
@@ -2756,6 +2794,8 @@ MODEL_LEVEL_CSV_ARTIFACT_GLOBS = (
     "c2o_option_vwap_5_15_strategy_trades_*.csv",
     "c2o_option_vwap_0_5_strategy_trades_*.csv",
     "c2o_intrinsic_strategy_trades_*.csv",
+    "o2c_option_vwap_5_15_strategy_trades_*.csv",
+    "o2c_option_vwap_0_5_strategy_trades_*.csv",
 )
 
 
@@ -3248,12 +3288,36 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                         "trade_prefix": "c2o_intrinsic_strategy_trades",
                     },
                 ],
+                "reaction_o2c": [
+                    {
+                        "realized_col": (
+                            "gross_reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy_pnl_usd"
+                        ),
+                        "proxy_kind": "reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy",
+                        "headline_eligible": False,
+                        "trade_prefix": "o2c_option_vwap_5_15_strategy_trades",
+                        "entry_premium_col": "open_option_vwap_5_15_anchor_usd",
+                        "cost_col": "open_option_vwap_5_15_proxy_cost_usd",
+                    },
+                    {
+                        "realized_col": (
+                            "gross_reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy_pnl_usd"
+                        ),
+                        "proxy_kind": "reaction_o2c_option_vwap_0_5_to_c2c_exit_proxy",
+                        "headline_eligible": False,
+                        "trade_prefix": "o2c_option_vwap_0_5_strategy_trades",
+                        "entry_premium_col": "open_option_vwap_0_5_anchor_usd",
+                        "cost_col": "open_option_vwap_0_5_proxy_cost_usd",
+                    },
+                ],
             }.get(target_id, [])
             if not strategy_specs:
                 continue
             for strategy_spec in strategy_specs:
                 realized_col = str(strategy_spec["realized_col"])
-                if {realized_col, "entry_premium_usd"}.issubset(scored.columns):
+                entry_premium_col = str(strategy_spec.get("entry_premium_col", "entry_premium_usd"))
+                cost_col = str(strategy_spec.get("cost_col", "proxy_cost_usd"))
+                if {realized_col, entry_premium_col}.issubset(scored.columns):
                     proxy_kind = str(strategy_spec["proxy_kind"])
                     headline_eligible = bool(strategy_spec["headline_eligible"])
                     trade_prefix = str(strategy_spec["trade_prefix"])
@@ -3261,7 +3325,8 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                         scored,
                         forecast_col=column,
                         realized_long_pnl_col=realized_col,
-                        cost_col="proxy_cost_usd",
+                        entry_premium_col=entry_premium_col,
+                        cost_col=cost_col,
                         min_edge_var=0.0,
                     )
                     strategy["strategy_proxy_kind"] = proxy_kind
@@ -3319,6 +3384,8 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
     (pd.concat(breakdown_frames, ignore_index=True) if breakdown_frames else pd.DataFrame()).to_csv(
         breakdown_path, index=False
     )
+    o2c_scale_path = out_dir / "o2c_scale_diagnostic.csv"
+    o2c_scale_diagnostic(predictions).to_csv(o2c_scale_path, index=False)
     qlike_frames: list[pd.DataFrame] = []
     extreme_frames: list[pd.DataFrame] = []
     inference_frames: list[pd.DataFrame] = []
@@ -3352,6 +3419,7 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
         "strategy_metrics": str(strategy_path),
         "cost_sensitivity": str(cost_path),
         "strategy_breakdowns": str(breakdown_path),
+        "o2c_scale_diagnostic": str(o2c_scale_path),
         "qlike_sanity": str(qlike_path),
         "extreme_predictions": str(extreme_path),
         "inference": str(inference_path),
@@ -3487,6 +3555,11 @@ def write_proxy_research_report(
         if (artifacts_dir / "cost_sensitivity.csv").exists()
         else pd.DataFrame()
     )
+    o2c_scale = (
+        pd.read_csv(artifacts_dir / "o2c_scale_diagnostic.csv")
+        if (artifacts_dir / "o2c_scale_diagnostic.csv").exists()
+        else pd.DataFrame()
+    )
     sequence_report_path = artifacts_dir / "sequence_coverage_report.json"
     sequence_report = (
         json.loads(sequence_report_path.read_text(encoding="utf-8"))
@@ -3540,6 +3613,30 @@ def write_proxy_research_report(
             .eq("post_open_option_vwap_5_15_proxy")
         ].copy()
         if not c2o_strategy_diag.empty and "strategy_proxy_kind" in c2o_strategy_diag
+        else pd.DataFrame()
+    )
+    o2c_forecast = (
+        forecast.loc[forecast["target_id"].astype(str).eq("reaction_o2c")].copy()
+        if "target_id" in forecast
+        else pd.DataFrame()
+    )
+    o2c_ranking = (
+        ranking.loc[ranking["target_id"].astype(str).eq("reaction_o2c")].copy()
+        if "target_id" in ranking
+        else pd.DataFrame()
+    )
+    o2c_strategy_diag = (
+        strategy.loc[strategy["target_id"].astype(str).eq("reaction_o2c")].copy()
+        if "target_id" in strategy
+        else pd.DataFrame()
+    )
+    o2c_strategy_primary = (
+        o2c_strategy_diag.loc[
+            o2c_strategy_diag.get("strategy_proxy_kind", pd.Series(dtype=str))
+            .astype(str)
+            .eq("reaction_o2c_option_vwap_5_15_to_c2c_exit_proxy")
+        ].copy()
+        if not o2c_strategy_diag.empty and "strategy_proxy_kind" in o2c_strategy_diag
         else pd.DataFrame()
     )
     if not forecast_main.empty:
@@ -3710,6 +3807,8 @@ def write_proxy_research_report(
     best_net = _best(strategy_main, "net_pnl_usd", higher_is_better=True)
     best_return = _best(strategy_main, "return_on_premium", higher_is_better=True)
     best_c2o_diag_net = _best(c2o_strategy_primary, "net_pnl_usd", higher_is_better=True)
+    best_o2c_diag_net = _best(o2c_strategy_primary, "net_pnl_usd", higher_is_better=True)
+    best_o2c_auc = _best(o2c_ranking, "auc", higher_is_better=True)
     qlike_worst = _best(qlike, "raw_qlike", higher_is_better=True)
     qlike_share_worst = _best(
         qlike,
@@ -3772,6 +3871,71 @@ def write_proxy_research_report(
         c2o_strategy_table = c2o_strategy_table[
             [column for column in keep if column in c2o_strategy_table.columns]
         ].round(4)
+    o2c_summary_table = pd.DataFrame()
+    if not o2c_forecast.empty:
+        o2c_summary_table = o2c_forecast.merge(
+            o2c_ranking, on=["target_id", "model_id"], how="left", suffixes=("", "_ranking")
+        )
+        o2c_summary_table = o2c_summary_table.loc[
+            o2c_summary_table["model_id"].isin(selected_models)
+        ].copy()
+        o2c_summary_table["model_id"] = pd.Categorical(
+            o2c_summary_table["model_id"], categories=selected_models, ordered=True
+        )
+        o2c_summary_table = o2c_summary_table.sort_values("model_id")
+        keep = [
+            "model_id",
+            "n",
+            "mae",
+            "rmse",
+            "oos_r2_vs_ivar",
+            "top_decile_precision",
+            "auc",
+            "edge_decile_spearman",
+        ]
+        o2c_summary_table = o2c_summary_table[
+            [column for column in keep if column in o2c_summary_table.columns]
+        ].round(4)
+
+    o2c_strategy_table = pd.DataFrame()
+    if not o2c_strategy_diag.empty:
+        o2c_strategy_table = (
+            o2c_strategy_diag.loc[o2c_strategy_diag["model_id"].isin(selected_models)]
+            .copy()
+            .sort_values(["strategy_proxy_kind", "model_id"])
+        )
+        keep = [
+            "strategy_proxy_kind",
+            "model_id",
+            "n",
+            "net_pnl_usd",
+            "return_on_premium",
+            "sharpe",
+            "max_drawdown_usd",
+            "pnl_headline_eligible",
+        ]
+        o2c_strategy_table = o2c_strategy_table[
+            [column for column in keep if column in o2c_strategy_table.columns]
+        ].round(4)
+
+    o2c_scale_table = (
+        o2c_scale[
+            [
+                column
+                for column in [
+                    "paired_rows",
+                    "sd_rvar_reaction_o2c",
+                    "sd_ivar_event",
+                    "sd_ratio_o2c_to_ivar",
+                    "mean_ratio_o2c_to_ivar",
+                    "ivar_baseline_interpretation",
+                ]
+                if column in o2c_scale.columns
+            ]
+        ].round(4)
+        if not o2c_scale.empty
+        else pd.DataFrame()
+    )
 
     diagnostics_model_id = diagnostics.get("model_id", pd.Series(dtype=str)).astype(str)
     diagnostics_snapshot = diagnostics.loc[diagnostics_model_id.isin(selected_models)].copy()
@@ -4039,6 +4203,51 @@ def write_proxy_research_report(
             (
                 "Interpret the 5-15 minute mark as the V1 C2O trade-aggregate comparison "
                 "against C2C; the intrinsic mark is not an option-price exit."
+            ),
+            "",
+        ]
+    )
+    lines.extend(
+        [
+            "### O2C Post-Open Diagnostic Proxy PnL",
+            "",
+            (
+                "`reaction_o2c` is now modeled in Phase 1 as a diagnostic target. "
+                "Its realized variance is post-open only, while `IVAR_event` is a "
+                "full-event implied-variance comparator; this makes O2C evidence "
+                "suitable for ranking and directional diagnostics, not level-calibrated "
+                "mispricing claims."
+            ),
+            "",
+            "#### O2C Forecast and Ranking",
+            "",
+            _markdown_table(o2c_summary_table, "O2C forecast/ranking metrics were unavailable."),
+            "",
+            "#### O2C Premium-Space Diagnostic Strategy",
+            "",
+            _markdown_table(
+                o2c_strategy_table,
+                "O2C premium-space diagnostic strategy metrics were unavailable.",
+            ),
+            "",
+            "#### O2C Scale Diagnostic",
+            "",
+            _markdown_table(o2c_scale_table, "O2C scale diagnostics were unavailable."),
+            "",
+            (
+                f"Best O2C 5-15 minute diagnostic net PnL is "
+                f"{_label(best_o2c_diag_net[0])} at {_fmt(best_o2c_diag_net[1], money=True)}."
+                if best_o2c_diag_net
+                else "O2C 5-15 minute diagnostic proxy metrics were unavailable."
+            ),
+            (
+                f"Best O2C ranking AUC is {_label(best_o2c_auc[0])} at {_fmt(best_o2c_auc[1])}."
+                if best_o2c_auc
+                else "O2C ranking metrics were unavailable."
+            ),
+            (
+                "All O2C strategy rows are `pnl_headline_eligible=false` and remain "
+                "no-NBBO trade-aggregate proxy diagnostics."
             ),
             "",
         ]

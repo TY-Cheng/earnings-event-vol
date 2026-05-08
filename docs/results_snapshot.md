@@ -57,7 +57,7 @@ midpoints, bid/ask records, OPRA, or NBBO.
 | --- | --- | --- | --- |
 | C2C | `day_c2c` | Modeled in V5 Phase 1 | Literature-compatible event-day variance and the only current proxy-PnL headline |
 | C2O | `jump_c2o` | Modeled in V5 Phase 1 | Primary scientific ranking target for overnight earnings jumps |
-| O2C | `reaction_o2c` | Not modeled in V5 Phase 1 | Post-open digestion diagnostic; reserved for Phase 2 only if sequence diagnostics justify expansion |
+| O2C | `reaction_o2c` | Modeled in V5 Phase 1 | Post-open digestion diagnostic; IVAR is a weak full-event comparator only |
 
 ## Data Coverage
 
@@ -226,20 +226,53 @@ is post-open trade-aggregate VWAP rather than an executable quote-based mark.
 
 ## O2C Diagnostic Results
 
-No `reaction_o2c` model table is present in the V5 Phase 1 artifacts. This is
-intentional: Phase 1 runs only `jump_c2o` and `day_c2c`; `reaction_o2c` is
-reserved for Phase 2 only if a real sequence model passes the diagnostic gate.
+`reaction_o2c` is now modeled in V5 Phase 1, but it remains diagnostic. The
+realized target is post-open variance, while `IVAR_event` is the full-event
+implied variance. This scale mismatch means O2C supports ranking/direction
+diagnostics, not calibrated O2C mispricing or a headline trading claim.
 
-The current O2C evidence is therefore limited to trade-proxy decomposition:
+### O2C Forecast and Ranking
 
-| O2C diagnostic | Value |
+| Model | N | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Edge-decile Spearman |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| Market IVAR | 100 | 0.011 | 0.014 | 0.000 | 0.000 | 0.500 | 0.079 |
+| Goyal-Saretto spread | 100 | 0.004 | 0.007 | 0.776 | 0.200 | 0.612 | 0.976 |
+| Elastic Net | 122 | 0.003 | 0.008 | 0.944 | 0.200 | 0.695 | 0.988 |
+| LightGBM | 122 | 0.003 | 0.008 | 0.926 | 0.300 | 0.818 | 1.000 |
+| XGBoost | 122 | 0.003 | 0.008 | 0.909 | 0.300 | 0.810 | 0.988 |
+| LightGBM/XGBoost ensemble | 122 | 0.003 | 0.008 | 0.927 | 0.300 | 0.823 | 1.000 |
+| FT-Transformer | 122 | 0.039 | 0.039 | -6.569 | 0.200 | 0.688 | 0.988 |
+| Official `mamba-ssm` sequence | 100 | 0.002 | 0.004 | 0.933 | 0.100 | 0.600 | 0.988 |
+
+### O2C Premium-Space Diagnostic Strategy
+
+| Model | 5-15m trades | 5-15m net proxy PnL | 5-15m return on premium | 5-15m Sharpe | 0-5m trades | 0-5m net proxy PnL | 0-5m return on premium |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| Market IVAR | 0 | n/a | n/a | n/a | 0 | n/a | n/a |
+| Goyal-Saretto spread | 93 | -1,322 | -0.008 | -0.221 | 95 | 227 | 0.001 |
+| Elastic Net | 93 | -4,962 | -0.029 | -0.833 | 95 | -5,538 | -0.033 |
+| LightGBM | 93 | -2,270 | -0.013 | -0.380 | 95 | -261 | -0.002 |
+| XGBoost | 93 | -6,715 | -0.040 | -1.130 | 95 | -8,092 | -0.048 |
+| LightGBM/XGBoost ensemble | 93 | -4,180 | -0.025 | -0.701 | 95 | -8,092 | -0.048 |
+| FT-Transformer | 93 | 753 | 0.004 | 0.127 | 95 | -1,206 | -0.007 |
+| Official `mamba-ssm` sequence | 88 | -5,421 | -0.034 | -0.933 | 90 | -2,191 | -0.014 |
+
+### O2C Scale Diagnostic
+
+| Diagnostic | Value |
 | --- | ---: |
-| Mean O2C option VWAP 5-15m to primary C2C exit diagnostic PnL | -24.31 USD |
-| Mean option-proxy decomposition residual, 5-15m | 0.00 USD |
+| Paired O2C/IVAR rows | 693 |
+| SD(`RVAR_event_reaction_o2c`) | 0.0065 |
+| SD(`IVAR_event`) | 0.0269 |
+| SD ratio O2C / IVAR | 0.240 |
+| Mean ratio O2C / IVAR | 0.167 |
 
-**O2C interpretation.** The current data support an O2C decomposition check, not
-an O2C model claim. This should be written as a diagnostic appendix item unless
-Phase 2 is reopened with broader sequence evidence.
+**O2C interpretation.** LightGBM/XGBoost rank O2C realized variance best, but
+the premium-space O2C proxy strategy does not support a headline claim: 5-15m
+net PnL is negative for the tree models, and the only positive selected row is
+FT-Transformer in a diagnostic table. All O2C rows are
+`pnl_headline_eligible=false`; the correct paper wording is that O2C provides a
+post-open digestion diagnostic under a weak full-event IVAR comparator.
 
 ## Sequence and Mamba Diagnostics
 
@@ -261,6 +294,9 @@ No sequence model passes this gate in the current sample.
 | `day_c2c` | Ridge-flat aggregates | 100 | 0.636 | 0.104 vs time-shuffle | -0.044 | 0.282 | fail |
 | `day_c2c` | BiGRU | 93 | 0.541 | 0.009 vs time-shuffle | -0.009 | 0.029 | fail |
 | `day_c2c` | Official `mamba-ssm` | 93 | 0.504 | -0.027 vs time-shuffle | -0.099 | 0.037 | fail |
+| `reaction_o2c` | Ridge-flat aggregates | 100 | 0.800 | 0.199 vs mask/time controls | -0.125 | 0.540 | fail |
+| `reaction_o2c` | BiGRU | 93 | 0.600 | 0.000 vs time-shuffle | 0.000 | 0.000 | fail |
+| `reaction_o2c` | Official `mamba-ssm` | 93 | 0.600 | 0.000 vs time-shuffle | 0.000 | 0.000 | fail |
 
 Cross-fitted stacking into the LightGBM/XGBoost ensemble is also negative on
 the locked test sample:
@@ -369,7 +405,10 @@ The current proxy evidence supports a conservative tabular-model contribution:
    the current cost haircut.
 3. C2O rankings and diagnostic post-open option-VWAP proxies point in the same
    direction, but remain diagnostic rather than headline tradability evidence.
-4. Sequence diagnostics are informative as a negative result: at current proxy
+4. O2C is now modeled as a post-open diagnostic; its ranking table is usable,
+   but its IVAR comparator is weak and its strategy proxy is not headline
+   eligible.
+5. Sequence diagnostics are informative as a negative result: at current proxy
    coverage and quality, ordered pre-event proxy-surface paths do not beat
    tabular aggregates or controls.
 
@@ -382,7 +421,7 @@ The current run does not support:
 - a claim of NBBO-executable performance;
 - full-spread tradability;
 - a paper claim based only on lower RMSE;
-- a modeled `reaction_o2c` result.
+- a calibrated O2C mispricing or O2C strategy headline.
 
 ### Sellable Claim
 

@@ -76,13 +76,18 @@ Latest proxy modeling artifacts:
   bidirectional `mamba-ssm`, mask-only, and deterministic time-shuffle controls.
 - Sequence audit: 678 eligible events out of 810 under the default path
   coverage rule; flagged as high sequence-selection risk.
-- In the current no-NBBO proxy run, XGBoost leads `jump_c2o` ranking AUC
-  (0.781), while LightGBM leads `day_c2c` net proxy PnL (about 69,908 USD).
-  This is signal-screening evidence, not a paper-grade executable trading
-  result.
+- In the current no-NBBO proxy run, the LightGBM/XGBoost rank-average ensemble
+  leads `jump_c2o` ranking AUC (about 0.788) and `day_c2c` net proxy PnL
+  (about 72,155 USD). This is signal-screening evidence, not a paper-grade
+  executable trading result.
+- `reaction_o2c` is now included in the V5 Phase 1 model artifacts as a
+  diagnostic target. The LightGBM/XGBoost rank-average ensemble leads O2C AUC
+  at about 0.823, but O2C uses full-event `IVAR_event` only as a weak comparator
+  and all O2C strategy rows remain `pnl_headline_eligible=false`.
 - Phase 1 sequence diagnostics did not pass the common-row bootstrap gate:
-  official `mamba-ssm` has `jump_c2o` AUC 0.495 and `day_c2c` AUC 0.504, and it
-  does not add value to the tabular ensemble in locked-test stacking.
+  official `mamba-ssm` has `jump_c2o` AUC 0.495, `day_c2c` AUC 0.504, and
+  `reaction_o2c` AUC 0.600; it does not add value to the tabular ensemble in
+  locked-test stacking.
 
 ## Command Surface
 

@@ -31,16 +31,19 @@ earnings jump variance (`jump_c2o`); the V1 proxy-PnL headline is
 close-to-close event variance (`day_c2c`); post-open digestion (`reaction_o2c`)
 is diagnostic.
 
-In the current proxy run, XGBoost has the strongest `jump_c2o` ranking result
-with AUC 0.781 and edge-decile Spearman 0.927. LightGBM produces the strongest
-`day_c2c` net proxy PnL, about 69,908 USD, followed by XGBoost at about
-68,344 USD. The legacy in-repo proxy-Mamba rows are retired because they used a
-gated recurrent encoder rather than official `mamba-ssm`. The new sequence
-suite is a diagnostic-grade test of whether ordered pre-event proxy-surface
-paths add incremental information beyond tabular aggregates. The defensible
-conclusion is that nonlinear tabular models show preliminary cross-sectional
-ranking signal for earnings event-variance mispricing in a no-NBBO proxy
-sample. Paper-grade claims require historical quote/NBBO or equivalent data,
+In the current proxy run, the LightGBM/XGBoost rank-average ensemble has the
+strongest `jump_c2o` ranking result with AUC 0.788 and edge-decile Spearman
+1.000. The same ensemble produces the strongest `day_c2c` net proxy PnL, about
+72,155 USD. `reaction_o2c` is now modeled as a diagnostic target, but its
+post-open realized variance is compared to full-event `IVAR_event`, so it is not
+a calibrated O2C mispricing or headline strategy result. The legacy in-repo
+proxy-Mamba rows are retired because they used a gated recurrent encoder rather
+than official `mamba-ssm`. The new sequence suite is a diagnostic-grade test of
+whether ordered pre-event proxy-surface paths add incremental information
+beyond tabular aggregates. The defensible conclusion is that nonlinear tabular
+models show preliminary cross-sectional ranking signal for earnings
+event-variance mispricing in a no-NBBO proxy sample. Paper-grade claims require
+historical quote/NBBO or equivalent data,
 quote-based IVAR, and leg-level execution with realistic bid/ask crossing.
 
 ## 1. Introduction
@@ -278,9 +281,9 @@ Sequence coverage is 678 eligible events out of 810. The default drop rate is
 | Neural tabular | FT-Transformer | Deep tabular comparator. |
 | Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU, official bidirectional `mamba-ssm`, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
 
-The sequence suite is diagnostic-grade in the current sample. Phase 1 runs only
-`jump_c2o` and `day_c2c`; Phase 2 expands to attention pooling, non-causal
-dilated CNN, and `reaction_o2c` only if a real sequence model passes the common-
+The sequence suite is diagnostic-grade in the current sample. Phase 1 now runs
+`jump_c2o`, `day_c2c`, and `reaction_o2c`; Phase 2 expands only to attention
+pooling and non-causal dilated CNN if a real sequence model passes the common-
 row bootstrap gate. The official Mamba wrapper is bidirectional over completed
 pre-entry tokens and is therefore a non-causal encoder of the pre-event path,
 not a post-entry leakage channel.
