@@ -72,6 +72,7 @@ class ProjectConfig:
     massive_requests_per_minute: int | None
     sec_company_tickers_url: str
     sec_submissions_url_template: str
+    sec_companyfacts_url_template: str
     sec_user_agent: str
     massive_8k_text_path: str
     fred_vixcls_url: str
@@ -159,6 +160,10 @@ def load_project_config() -> ProjectConfig:
         sec_submissions_url_template=os.getenv(
             "SEC_SUBMISSIONS_URL_TEMPLATE",
             "https://data.sec.gov/submissions/CIK{cik:010d}.json",
+        ),
+        sec_companyfacts_url_template=os.getenv(
+            "SEC_COMPANYFACTS_URL_TEMPLATE",
+            "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
         ),
         sec_user_agent=os.getenv(
             "SEC_USER_AGENT",

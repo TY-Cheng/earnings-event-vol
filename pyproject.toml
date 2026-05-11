@@ -59,7 +59,7 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["src"]
-addopts = "-q --cov=earnings_event_vol --cov-report=term-missing --cov-fail-under=93"
+addopts = "-q --cov=earnings_event_vol --cov-report=term-missing --cov-fail-under=95"
 
 [tool.coverage.run]
 branch = true

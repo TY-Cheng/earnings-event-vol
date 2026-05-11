@@ -11,8 +11,8 @@ variance edge.
 - Final proxy data-engineering entrypoint:
   - The public command remains `just data` / `proxy-all`.
   - `proxy-all` runs `options-day-aggs-bulk -> universe ->
-    dynamic-calendar -> event-window-panel -> contract-reference-validation ->
-    trade-proxy-panel`.
+    dynamic-calendar -> sec-companyfacts -> event-window-panel ->
+    contract-reference-validation -> trade-proxy-panel`.
   - The runnable Massive-entitlement default is 2022-12-01 through
     2025-12-31. Universe construction downloads the trailing six-month lookback
     beginning 2022-06-01 for the December 2022 universe.
@@ -149,6 +149,62 @@ variance edge.
   - `expected_strategy_edge_usd = expected_strategy_value_usd - market_entry_cost_usd`.
   - Primary rule: `expected_strategy_edge_usd > 1.5 * estimated_transaction_cost_usd`.
 - Every feature row must satisfy `feature_asof_timestamp <= event_entry_timestamp`.
+- Default signal time is `event_entry_timestamp`, meaning the pre-cutoff entry
+  window is complete before the model signal is generated. Under this contract,
+  pre-cutoff entry-window fields such as entry premium, volume, transactions,
+  latest bar age, premium-to-spot, and proxy cost-to-premium may be model
+  features. If a future protocol changes to orders placed before the entry
+  window starts, those fields must be removed from the model-feature allowlist.
+- The active feature schema is versioned by `feature_schema_version`.
+  - `fe_v2_sec_xbrl` is the default research schema.
+  - `fe_v1_legacy` is retained only for same-code ablations.
+  - `feature_schema_version` must propagate to the feature matrix, resolved
+    feature schema report, transform parameters, research manifest, model-fit
+    diagnostics, forecasts, ranking/strategy metrics, tuning trials, selected
+    parameters, generated reports, and curated docs snapshots.
+  - `artifacts/modeling/feature_schema_report.csv` is the resolved
+    model-feature selector. Only rows with `model_feature=true` may enter
+    trainable models. The committed schema logic is the template; the resolved
+    report records `feature_name`, family, source, as-of rule, inclusion flag,
+    reason, schema version, and coverage for the actual run.
+  - `fe_v2_sec_xbrl` excludes raw numeric identifiers such as CIKs, raw
+    `event_year`/`event_month`, exit values, intrinsic fallback outcomes,
+    post-event/post-open outcomes, realized labels, strategy PnL, and other
+    leakage columns. It adds cyclic month features (`event_month_sin`,
+    `event_month_cos`) instead of raw month/year.
+  - Split-fitted normalized/rank features must not use locked-test
+    distribution. Validation tuning uses train-fitted parameters; locked-test
+    evaluation records a train+validation refit transform in
+    `feature_transform_params.json`.
+- Rolling earnings-history features are point-in-time same-ticker history.
+  Events are ordered by `event_entry_timestamp`, and a current event may only
+  use prior events satisfying
+  `prior_event.event_entry_timestamp < current_event.event_entry_timestamp`.
+  Same-timestamp rows must not see each other.
+- `sec-companyfacts` is the public SEC XBRL CompanyFacts stage.
+  - CIK mapping reuses SEC company-ticker metadata and dynamic-calendar CIKs,
+    and CompanyFacts requests use 10-digit zero-padded CIKs.
+  - Request pacing defaults to at most eight SEC requests per second, with
+    User-Agent headers, raw cache, retry/backoff through the configured client,
+    and graceful degradation when SEC data is unavailable.
+  - CompanyFacts is a public financial-statement data source. It is not a
+    market-data, quote, or execution feed.
+  - As-of gating is conservative: when an XBRL fact accession maps to SEC
+    `acceptanceDateTime`, require
+    `acceptanceDateTime <= feature_asof_timestamp`; otherwise allow only
+    `filed < feature_asof_date`. Same-day filed facts without acceptance time
+    are dropped.
+  - Diagnostics must report CIK misses, HTTP/cache status, mapped-acceptance
+    coverage, fallback-filed coverage, dropped same-day rows when measurable,
+    and concept coverage/missingness.
+- Single-name run-up/surface features are separate from SPY/QQQ
+  `market-second-covariates`.
+  - Single-name run-up features use pre-cutoff daily/hybrid rows and carry
+    `*_proxy` names for ATM IV, event IVAR, skew, butterfly, straddle
+    premium-to-spot, activity, and missingness changes.
+  - Delta-grid and RND-like columns are weak day-aggregate or second-aggregate
+    trade-implied proxies. They are not quote surfaces, NBBO surfaces, or
+    paper-grade risk-neutral-density estimates.
 - Main sizing uses fractional theoretical contracts; integer-contract PnL is
   reported as tradability robustness.
 - Ticker eligibility and mapping should prefer point-in-time vendor mappings
@@ -199,7 +255,10 @@ does not estimate a rolling cutpoint.
 
 ## V1 Boundaries
 
-- Massive is the v1 data route, subject to field audit.
+- Massive is the v1 market-data route, subject to field audit. The active
+  pipeline/entitlement uses options day aggregates and targeted option second
+  aggregates. Although quote configuration may exist for future work, current
+  proxy evidence does not use quote, bid/ask, OPRA, or NBBO data.
 - Earnings calendar input must provide explicit BMO/AMC/DMH/UNKNOWN timing.
   The active candidate route is SEC EDGAR 8-K Item 2.02 metadata plus SEC
   primary filing document text validation. Massive 8-K text may be used only as
@@ -211,7 +270,12 @@ does not estimate a rolling cutpoint.
   paper-grade deep-model tuning claims in this pass. The proxy research layer
   may train the registered benchmark/model suite for diagnostics, but outputs
   remain `no_nbbo_trade_proxy` until quote/NBBO ingestion exists.
-- The explicit `tuned_phase1` research profile is a fairness and robustness
-  extension, not the default protocol. Hyperparameter selection may use only
-  train and locked-validation rows, with locked test rows excluded from tuning
-  artifacts and evaluated once after train+validation refit.
+- The canonical proxy research protocol is tuned-only. Hyperparameter
+  selection may use only train and locked-validation rows, with locked test rows
+  excluded from tuning artifacts and evaluated once after train+validation
+  refit. Paired original tabular and single-seed sequence rows are not emitted
+  in current research artifacts.
+- Feature/schema changes are not allowed to cherry-pick locked-test results. If
+  `fe_v2_sec_xbrl` underperforms `fe_v1_legacy` on locked-test ranking or
+  economics, report the comparison as a diagnostic finding and keep both rows
+  in the ablation ledger.

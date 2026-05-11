@@ -10,6 +10,8 @@ import pandas as pd
 import torch
 from torch import nn
 
+from earnings_event_vol.features import feature_columns_from_schema_report
+
 TARGET_COL = "rvar_event"
 MARKET_BASELINE_COL = "ivar_event"
 PREDICTION_PREFIX = "forecast_"
@@ -106,13 +108,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Trailing RV-IV spread adjustment to the market-implied event variance.",
         risk="Useful benchmark, not a full replication of the original portfolio design.",
     ),
-    "linear_elastic_net": ModelSpec(
-        model_id="linear_elastic_net",
-        role="model",
-        implemented=True,
-        justification="Transparent semi-structural tabular benchmark.",
-        risk="Limited nonlinear interaction capacity.",
-    ),
     "linear_elastic_net_tuned": ModelSpec(
         model_id="linear_elastic_net_tuned",
         role="model_tuned",
@@ -122,26 +117,12 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "Available through the research tuned_phase1 protocol, not the legacy train-models CLI."
         ),
     ),
-    "lightgbm": ModelSpec(
-        model_id="lightgbm",
-        role="model",
-        implemented=True,
-        justification="Strong tabular ML baseline before deep models.",
-        risk="Depends on optional LightGBM package availability.",
-    ),
     "lightgbm_tuned": ModelSpec(
         model_id="lightgbm_tuned",
         role="model_tuned",
         implemented=True,
         justification="LightGBM with validation-only Optuna tuning and early stopping.",
         risk="Depends on optional LightGBM, scikit-learn, and Optuna package availability.",
-    ),
-    "xgboost": ModelSpec(
-        model_id="xgboost",
-        role="model",
-        implemented=True,
-        justification="Strong tree-boosting benchmark paired with LightGBM.",
-        risk="Depends on optional XGBoost package availability.",
     ),
     "xgboost_tuned": ModelSpec(
         model_id="xgboost_tuned",
@@ -152,23 +133,16 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
     "ft_transformer": ModelSpec(
         model_id="ft_transformer",
-        role="deep_model",
-        implemented=True,
-        justification="Deep tabular architecture for mixed event features.",
-        risk="May not beat GBDT on small tabular panels.",
-    ),
-    "ft_transformer_tuned": ModelSpec(
-        model_id="ft_transformer_tuned",
         role="deep_model_tuned",
         implemented=True,
-        justification="FT-Transformer architecture/dropout/lr tuning in tuned_phase1.",
+        justification="Validation-tuned FT-Transformer architecture for mixed event features.",
         risk="May overfit small event panels despite validation-only selection.",
     ),
     "lightgbm_xgboost_mean_ensemble": ModelSpec(
         model_id="lightgbm_xgboost_mean_ensemble",
         role="ensemble",
         implemented=True,
-        justification="Equal-weight LightGBM/XGBoost ensemble sanity check.",
+        justification="Equal-weight tuned LightGBM/XGBoost rank-average ensemble.",
         risk="Should not be tuned on the locked test sample.",
     ),
     "ridge_flat_aggregates_sequence": ModelSpec(
@@ -188,13 +162,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Learned-query attention pooling over pre-entry sequence tokens.",
         risk="Diagnostic; may overfit on small sequence samples.",
     ),
-    "bigru_sequence": ModelSpec(
-        model_id="bigru_sequence",
-        role="sequence_baseline",
-        implemented=True,
-        justification="LayerNorm BiGRU baseline for ordered pre-entry proxy-surface paths.",
-        risk="Diagnostic; sequence sample has selection risk.",
-    ),
     "bigru_sequence_5seed": ModelSpec(
         model_id="bigru_sequence_5seed",
         role="sequence_baseline_tuned",
@@ -208,15 +175,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         implemented=True,
         justification="Non-causal dilated 1D CNN baseline for short pre-entry paths.",
         risk="Diagnostic; non-causal only because all tokens are pre-entry.",
-    ),
-    "mamba_ssm_sequence": ModelSpec(
-        model_id="mamba_ssm_sequence",
-        role="sequence_challenger",
-        implemented=True,
-        justification=(
-            "Official mamba-ssm selective state-space block used as a diagnostic challenger."
-        ),
-        risk="Requires Linux/NVIDIA/CUDA; skipped when mamba-ssm is unavailable.",
     ),
     "mamba_ssm_sequence_5seed": ModelSpec(
         model_id="mamba_ssm_sequence_5seed",
@@ -319,7 +277,13 @@ def add_benchmark_predictions(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def default_feature_columns(frame: pd.DataFrame) -> list[str]:
+def default_feature_columns(
+    frame: pd.DataFrame,
+    *,
+    schema_report: pd.DataFrame | None = None,
+) -> list[str]:
+    if schema_report is not None:
+        return feature_columns_from_schema_report(schema_report, frame=frame)
     columns: list[str] = []
     for column in frame.columns:
         lower = column.lower()
@@ -332,20 +296,6 @@ def default_feature_columns(frame: pd.DataFrame) -> list[str]:
         ):
             columns.append(column)
     return columns
-
-
-def _numeric_feature_frame(frame: pd.DataFrame, features: Sequence[str]) -> pd.DataFrame:
-    return frame[list(features)].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
-
-
-def _finite_target_training_frame(
-    frame: pd.DataFrame, target_col: str
-) -> tuple[pd.DataFrame, np.ndarray]:
-    target = pd.to_numeric(frame[target_col], errors="coerce")
-    valid = np.isfinite(target)
-    if not bool(valid.any()):
-        raise ValueError(f"no finite {target_col} rows for model fit")
-    return frame.loc[valid].copy(), target.loc[valid].to_numpy(dtype=float)
 
 
 class LinearElasticNetRegressor:
@@ -439,113 +389,6 @@ def temporal_train_test_split(
     if train.empty or test.empty:
         raise ValueError("temporal split produced an empty train or test set")
     return train, test
-
-
-def fit_linear_elastic_net(
-    frame: pd.DataFrame,
-    *,
-    target_col: str = TARGET_COL,
-    feature_columns: Sequence[str] | None = None,
-    split_date: str | pd.Timestamp | None = None,
-) -> ModelFitResult:
-    features = list(feature_columns or default_feature_columns(frame))
-    train, test = temporal_train_test_split(frame, split_date=split_date)
-    model = LinearElasticNetRegressor()
-    model.fit(train, target_col=target_col, feature_columns=features)
-    predictions = test.copy()
-    predictions["forecast_linear_elastic_net"] = model.predict(test)
-    return ModelFitResult(
-        model_id="linear_elastic_net",
-        predictions=predictions,
-        feature_columns=features,
-        diagnostics={"train_rows": int(len(train)), "test_rows": int(len(test))},
-        model=model,
-    )
-
-
-def fit_lightgbm(
-    frame: pd.DataFrame,
-    *,
-    target_col: str = TARGET_COL,
-    feature_columns: Sequence[str] | None = None,
-    split_date: str | pd.Timestamp | None = None,
-) -> ModelFitResult:  # pragma: no cover - optional dependency exercised in integration environments
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("lightgbm extra is required for model_id=lightgbm") from exc
-    features = list(feature_columns or default_feature_columns(frame))
-    train, test = temporal_train_test_split(frame, split_date=split_date)
-    try:
-        model = lgb.LGBMRegressor(
-            n_estimators=200,
-            learning_rate=0.03,
-            max_depth=-1,
-            num_leaves=31,
-            random_state=17,
-            verbose=-1,
-        )
-        train_fit, y_train = _finite_target_training_frame(train, target_col)
-        model.fit(_numeric_feature_frame(train_fit, features), y_train)
-    except Exception as exc:  # pragma: no cover
-        message = str(exc)
-        if "scikit-learn is required" in message or "No module named 'sklearn'" in message:
-            raise RuntimeError("lightgbm extra requires scikit-learn") from exc
-        raise
-    predictions = test.copy()
-    predictions["forecast_lightgbm"] = np.maximum(
-        model.predict(_numeric_feature_frame(test, features)), 0.0
-    )
-    return ModelFitResult(
-        model_id="lightgbm",
-        predictions=predictions,
-        feature_columns=features,
-        diagnostics={"train_rows": int(len(train)), "test_rows": int(len(test))},
-        model=model,
-    )
-
-
-def fit_xgboost(
-    frame: pd.DataFrame,
-    *,
-    target_col: str = TARGET_COL,
-    feature_columns: Sequence[str] | None = None,
-    split_date: str | pd.Timestamp | None = None,
-) -> ModelFitResult:  # pragma: no cover - optional dependency exercised in integration environments
-    try:
-        xgb = importlib.import_module("xgboost")
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("xgboost extra is required for model_id=xgboost") from exc
-    features = list(feature_columns or default_feature_columns(frame))
-    train, test = temporal_train_test_split(frame, split_date=split_date)
-    try:
-        model = xgb.XGBRegressor(
-            n_estimators=200,
-            learning_rate=0.03,
-            max_depth=4,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="reg:squarederror",
-            random_state=17,
-        )
-        train_fit, y_train = _finite_target_training_frame(train, target_col)
-        model.fit(_numeric_feature_frame(train_fit, features), y_train)
-    except Exception as exc:  # pragma: no cover
-        message = str(exc)
-        if "No module named 'sklearn'" in message or "scikit-learn" in message:
-            raise RuntimeError("xgboost extra requires scikit-learn") from exc
-        raise
-    predictions = test.copy()
-    predictions["forecast_xgboost"] = np.maximum(
-        model.predict(_numeric_feature_frame(test, features)), 0.0
-    )
-    return ModelFitResult(
-        model_id="xgboost",
-        predictions=predictions,
-        feature_columns=features,
-        diagnostics={"train_rows": int(len(train)), "test_rows": int(len(test))},
-        model=model,
-    )
 
 
 class FTTransformerRegressor(nn.Module):
@@ -734,7 +577,7 @@ class MambaSSMSequenceEncoder(nn.Module):
     ):
         super().__init__()
         if not torch.cuda.is_available():
-            raise RuntimeError("mamba_ssm_sequence requires CUDA-enabled torch")
+            raise RuntimeError("official mamba-ssm encoder requires CUDA-enabled torch")
         try:
             module = importlib.import_module("mamba_ssm")
             mamba_cls = cast(Any, module.Mamba)
@@ -771,44 +614,6 @@ class MambaSSMSequenceEncoder(nn.Module):
         return cast(torch.Tensor, self.head(pooled).squeeze(-1))
 
 
-def _torch_matrix(frame: pd.DataFrame, features: Sequence[str]) -> torch.Tensor:
-    data = _numeric_feature_frame(frame, features).to_numpy(dtype=float)
-    return torch.tensor(data, dtype=torch.float32)
-
-
-def fit_ft_transformer(
-    frame: pd.DataFrame,
-    *,
-    target_col: str = TARGET_COL,
-    feature_columns: Sequence[str] | None = None,
-    split_date: str | pd.Timestamp | None = None,
-    epochs: int = 40,
-) -> ModelFitResult:
-    features = list(feature_columns or default_feature_columns(frame))
-    train, test = temporal_train_test_split(frame, split_date=split_date)
-    model = FTTransformerRegressor(n_features=len(features))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    train_fit, y_train_array = _finite_target_training_frame(train, target_col)
-    x_train = _torch_matrix(train_fit, features)
-    y_train = torch.tensor(y_train_array, dtype=torch.float32)
-    for _ in range(max(1, epochs)):
-        optimizer.zero_grad()
-        loss = torch.mean(torch.square(model(x_train) - y_train))
-        loss.backward()  # type: ignore[no-untyped-call]
-        optimizer.step()
-    with torch.no_grad():
-        pred = model(_torch_matrix(test, features)).detach().numpy()
-    predictions = test.copy()
-    predictions["forecast_ft_transformer"] = pred
-    return ModelFitResult(
-        model_id="ft_transformer",
-        predictions=predictions,
-        feature_columns=features,
-        diagnostics={"train_rows": int(len(train)), "test_rows": int(len(test)), "epochs": epochs},
-        model=model,
-    )
-
-
 def fit_model(
     model_id: str,
     frame: pd.DataFrame,
@@ -817,22 +622,7 @@ def fit_model(
     feature_columns: Sequence[str] | None = None,
     split_date: str | pd.Timestamp | None = None,
 ) -> ModelFitResult:
-    if model_id == "linear_elastic_net":
-        return fit_linear_elastic_net(
-            frame, target_col=target_col, feature_columns=feature_columns, split_date=split_date
-        )
-    if model_id == "lightgbm":
-        return fit_lightgbm(
-            frame, target_col=target_col, feature_columns=feature_columns, split_date=split_date
-        )
-    if model_id == "xgboost":
-        return fit_xgboost(
-            frame, target_col=target_col, feature_columns=feature_columns, split_date=split_date
-        )
-    if model_id == "ft_transformer":
-        return fit_ft_transformer(
-            frame, target_col=target_col, feature_columns=feature_columns, split_date=split_date
-        )
+    _ = frame, target_col, feature_columns, split_date
     raise ValueError(f"{model_id} is not a trainable tabular model")
 
 
@@ -842,25 +632,18 @@ def prediction_column_for_model(model_id: str) -> str:
         "last_four_rvar": "forecast_last_four_rvar",
         "last_four_ivar": "forecast_last_four_ivar",
         "goyal_saretto_rv_iv_spread": "forecast_goyal_saretto_rv_iv_spread",
-        "linear_elastic_net": "forecast_linear_elastic_net",
         "linear_elastic_net_tuned": "forecast_linear_elastic_net_tuned",
-        "lightgbm": "forecast_lightgbm",
         "lightgbm_tuned": "forecast_lightgbm_tuned",
-        "xgboost": "forecast_xgboost",
         "xgboost_tuned": "forecast_xgboost_tuned",
         "ft_transformer": "forecast_ft_transformer",
-        "ft_transformer_tuned": "forecast_ft_transformer_tuned",
         "lightgbm_xgboost_mean_ensemble": "forecast_lightgbm_xgboost_mean_ensemble",
         "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence",
         "attention_pooling_sequence": "forecast_attention_pooling_sequence",
-        "bigru_sequence": "forecast_bigru_sequence",
         "bigru_sequence_5seed": "forecast_bigru_sequence_5seed",
         "dilated_cnn_sequence": "forecast_dilated_cnn_sequence",
-        "mamba_ssm_sequence": "forecast_mamba_ssm_sequence",
         "mamba_ssm_sequence_5seed": "forecast_mamba_ssm_sequence_5seed",
         "mask_only_sequence": "forecast_mask_only_sequence",
         "time_shuffle_sequence": "forecast_time_shuffle_sequence",
-        "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
     }
     return mapping[model_id]
 
@@ -908,12 +691,6 @@ def run_model_suite(
     split_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, list[ModelFitResult]]:
     base = add_benchmark_predictions(frame)
-    trainable = {
-        "linear_elastic_net",
-        "lightgbm",
-        "xgboost",
-        "ft_transformer",
-    }
     results: list[ModelFitResult] = []
     predictions = base.copy()
     for model_id in model_ids:
@@ -937,25 +714,7 @@ def run_model_suite(
                 )
             )
             continue
-        if model_id in trainable:
-            try:
-                result = fit_model(model_id, base, split_date=split_date)
-            except RuntimeError as exc:
-                results.append(
-                    ModelFitResult(
-                        model_id=model_id,
-                        predictions=pd.DataFrame(),
-                        feature_columns=[],
-                        diagnostics={"status": "skipped_dependency_unavailable", "error": str(exc)},
-                    )
-                )
-                continue
-        else:
-            raise ValueError(f"unknown model_id: {model_id}")
-        results.append(result)
-        column = prediction_column_for_model(model_id)
-        if not result.predictions.empty and column in result.predictions.columns:
-            predictions.loc[result.predictions.index, column] = result.predictions[column]
+        raise ValueError(f"unknown model_id: {model_id}")
     return predictions, results
 
 

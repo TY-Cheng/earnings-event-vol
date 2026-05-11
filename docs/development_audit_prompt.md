@@ -27,7 +27,7 @@ Project identity and workflow:
 - Public command surface stays small: `status`, `audit`, `data`, `research`,
   `docs`, and `check`.
 - `just check` remains the handoff gate.
-- The test gate enforces at least 93% coverage.
+- The test gate enforces at least 95% coverage.
 
 Credential safety:
 

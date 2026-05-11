@@ -31,22 +31,23 @@ earnings jump variance (`jump_c2o`); the V1 proxy-PnL headline is
 close-to-close event variance (`day_c2c`); post-open digestion (`reaction_o2c`)
 is diagnostic.
 
-In the current 2026-05-11 `tuned_phase1` proxy run, the LightGBM/XGBoost
-rank-average ensemble has the strongest `jump_c2o` ranking result with AUC
-0.788 and edge-decile Spearman 1.000. The same ensemble produces the strongest
-`day_c2c` net proxy PnL, about 72,155 USD. Tuned rows are included as fairness
-checks and do not replace the untuned rows. The untuned FT-Transformer row is
-invalid because it produced no finite validation/test predictions; the tuned
-FT-Transformer trains but is not competitive. `reaction_o2c` is modeled as a
-diagnostic target, but its post-open realized variance is compared to
-full-event `IVAR_event`, so it is not a calibrated O2C mispricing or headline
-strategy result. The legacy in-repo proxy-Mamba rows are retired because they
-used a gated recurrent encoder rather than official `mamba-ssm`. The new
-sequence suite is a diagnostic-grade test of whether ordered pre-event
-proxy-surface paths add incremental information beyond tabular aggregates. The
-defensible conclusion is that nonlinear tabular models show preliminary
-cross-sectional ranking signal for earnings event-variance mispricing in a
-no-NBBO proxy sample. Paper-grade claims require historical quote/NBBO or
+In the current 2026-05-12 canonical tuned proxy package, the default
+`fe_v2_sec_xbrl` feature schema is not the sell: its strongest `jump_c2o` AUC is
+the Goyal-Saretto-style spread at 0.602, and the positive `day_c2c` ridge-flat
+sequence proxy PnL of about 19,918 USD remains diagnostic because the sequence
+gate does not pass. The same-code `fe_v1_legacy` ablation is stronger:
+LightGBM reaches `jump_c2o` AUC 0.677, XGBoost has best `jump_c2o` OOS R2
+versus IVAR at 0.375, and LightGBM leads the `day_c2c` headline proxy strategy
+at about 53,664 USD net PnL. `FT-Transformer` refers to the validation-tuned
+tabular transformer specification; it trains but is not competitive.
+`reaction_o2c` is modeled as a diagnostic target, but its post-open realized
+variance is compared to full-event `IVAR_event`, so it is not a calibrated O2C
+mispricing or headline strategy result. The legacy in-repo proxy-Mamba rows are
+retired because they used a gated recurrent encoder rather than official
+`mamba-ssm`. The defensible conclusion is that a parsimonious tabular feature
+set shows preliminary cross-sectional ranking signal for earnings
+event-variance mispricing in a no-NBBO proxy sample, while FE V2 is currently a
+negative diagnostic result. Paper-grade claims require historical quote/NBBO or
 equivalent data, quote-based IVAR, and leg-level execution with realistic
 bid/ask crossing.
 
@@ -107,8 +108,8 @@ diagnostic gate, ordered pre-event proxy-surface paths may contain incremental
 information. If LightGBM/XGBoost win, event-level nonlinear tabular
 interactions are sufficient for the current proxy data. If IVAR wins after
 costs, the evidence supports a hard-to-beat earnings option market. The current
-proxy result favors the tabular nonlinear interpretation, not a deep-sequence
-headline.
+same-code ablation favors a parsimonious FE V1 tabular interpretation, not an
+FE V2 or deep-sequence headline.
 
 ### Related Literature and Positioning
 
@@ -257,15 +258,33 @@ from tradable samples and reported as diagnostics.
 
 ### 3.4 Features
 
+The default research feature schema is `fe_v2_sec_xbrl`; `fe_v1_legacy` is kept
+only for same-code ablations. The resolved run-level allowlist is
+`artifacts/modeling/feature_schema_report.csv`, and only
+`model_feature=true` rows enter trainable models. FE V2 removes raw numeric
+identifiers, raw year/month, exit/outcome/PnL fields, and post-event labels
+from the model matrix. The signal timestamp is `event_entry_timestamp`, so
+completed pre-cutoff entry-window features are valid under the current
+protocol.
+
 The feature matrix combines event-level state, realized history, option-surface
 proxies, market controls, and sequence inputs:
 
 - `IVAR_event`, ATM IV, term spread, skew, butterfly/concavity proxies.
 - Option activity and liquidity measures.
-- RV5/RV20/RV60 and last-four earnings history.
+- RV5/RV20/RV60, last-four earnings history, and strict point-in-time
+  same-ticker rolling earnings-history distributions.
 - BMO/AMC timing and universe rank.
 - Prior-close VIX level, changes, percentile, and regime.
 - SPY/QQQ controls when available.
+- SEC CompanyFacts XBRL fundamentals with conservative as-of gating:
+  use `acceptanceDateTime <= feature_asof_timestamp` when mapped, otherwise
+  allow only `filed < feature_asof_date`.
+- Train-fitted cross-sectional z-score/rank transforms; locked-test
+  distribution is never fit.
+- Single-name 1/3/5/10-day run-up, weak delta-grid, and RND-like
+  `*_proxy` features from trade-aggregate implied surfaces. These are not
+  quote surfaces, NBBO surfaces, or paper-grade RND estimates.
 - Daily 20-step close-trade-implied option-surface sequences.
 - Hybrid 31-step sequences with 19 daily states and 12 entry-day five-minute
   trade-aggregate proxy bins.
@@ -280,27 +299,25 @@ Sequence coverage is 678 eligible events out of 810. The default drop rate is
 | Market benchmark | Market-implied IVAR | Central level and no-edge baseline. |
 | Historical baselines | Last-four RVAR, last-four IVAR | Tests whether simple earnings history is enough. |
 | Classical mispricing benchmark | Goyal-Saretto-style RV-IV spread | Required option-return predictability comparator. |
-| Linear tabular | Elastic Net, Elastic Net tuned | Sparse linear event-level benchmark and sklearn `ElasticNetCV` fairness row. |
-| Nonlinear tabular | LightGBM, LightGBM tuned, XGBoost, XGBoost tuned | Main current contenders plus validation-only tuning rows. |
-| Neural tabular | FT-Transformer, FT-Transformer tuned | Deep tabular comparator; untuned FT is invalid/no usable predictions in the current run. |
-| Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU, BiGRU 5-seed, official bidirectional `mamba-ssm`, official `mamba-ssm` 5-seed, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
+| Linear tabular | Elastic Net | Sparse linear event-level benchmark using sklearn `ElasticNetCV`. |
+| Nonlinear tabular | LightGBM, XGBoost | Main current contenders with validation-only tuning. |
+| Ensemble | LightGBM/XGBoost rank-average | Robustness ensemble built from tuned base forecasts. |
+| Neural tabular | FT-Transformer | Validation-tuned deep tabular comparator. |
+| Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU 5-seed, official bidirectional `mamba-ssm` 5-seed, attention pooling, non-causal dilated CNN, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
 
-The default protocol remains untuned and keeps the current model ids. The
-explicit `tuned_phase1` extension appends `linear_elastic_net_tuned`,
-`lightgbm_tuned`, `xgboost_tuned`, `ft_transformer_tuned`,
-`bigru_sequence_5seed`, and `mamba_ssm_sequence_5seed` rows. Tuning uses only
-train and locked-validation rows, selects on validation `jump_c2o` predicted-
-edge AUC with top-decile precision and RMSE tie-breakers, then refits on
-train+validation before a single locked-test evaluation. Untuned Elastic Net is
-the repo's custom coordinate-descent model; tuned Elastic Net uses sklearn
-`ElasticNetCV`.
+The canonical protocol is the tuned-only proxy protocol. Tuning
+uses only train and locked-validation rows, selects on validation `jump_c2o`
+predicted-edge AUC with top-decile precision and RMSE tie-breakers, then refits
+on train+validation before a single locked-test evaluation. Paired original
+tabular rows and single-seed BiGRU/Mamba rows are intentionally excluded from
+the current artifacts.
 
-The sequence suite is diagnostic-grade in the current sample. Phase 1 now runs
-`jump_c2o`, `day_c2c`, and `reaction_o2c`; Phase 2 expands only to attention
-pooling and non-causal dilated CNN if a real sequence model passes the common-
-row bootstrap gate. The official Mamba wrapper is bidirectional over completed
-pre-entry tokens and is therefore a non-causal encoder of the pre-event path,
-not a post-entry leakage channel.
+The full sequence diagnostic suite is diagnostic-grade in the current sample.
+It runs `jump_c2o`, `day_c2c`, and `reaction_o2c` for ridge-flat, BiGRU
+5-seed, official `mamba-ssm` 5-seed, attention pooling, non-causal dilated CNN,
+mask-only, and time-shuffle controls. The official Mamba wrapper is
+bidirectional over completed pre-entry tokens and is therefore a non-causal
+encoder of the pre-event path, not a post-entry leakage channel.
 
 ### 3.6 Splits, Strategy, and Metrics
 
@@ -329,32 +346,26 @@ complete C2C/C2O/O2C tables, figures, diagnostics, and interpretation now live
 in [Results Snapshot](results_snapshot.md). This section records the intended
 paper-facing organization and the selected headline excerpt.
 
-### 4.1 Selected Headline Table
+### 4.1 Feature-Schema Ablation Headline
 
-Forecast and ranking columns use `jump_c2o`. Strategy columns use `day_c2c`, the
-only V1 proxy-PnL headline.
+The active default artifacts use `fe_v2_sec_xbrl`, but the same-code ablation is
+negative for FE V2. Forecast and ranking columns below use `jump_c2o` unless
+the target column states otherwise. Strategy columns use `day_c2c` only for the
+headline proxy-PnL interpretation; C2O/O2C premium-space rows are diagnostic.
 
-| Model | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Day-C2C net proxy PnL |
-|:---|---:|---:|---:|---:|---:|---:|
-| Market IVAR | 0.0097 | 0.0145 | 0.000 | 0.000 | 0.500 | n/a |
-| Goyal-Saretto spread | 0.0076 | 0.0134 | 0.141 | 0.300 | 0.602 | -461 |
-| Elastic Net | 0.0095 | 0.0213 | 0.323 | 0.500 | 0.629 | 47,938 |
-| Elastic Net tuned | 0.0086 | 0.0200 | 0.372 | 0.600 | 0.644 | 48,770 |
-| LightGBM | 0.0077 | 0.0192 | 0.355 | 0.500 | 0.745 | 69,908 |
-| LightGBM tuned | 0.0085 | 0.0197 | 0.321 | 0.500 | 0.666 | 50,370 |
-| XGBoost | 0.0074 | 0.0191 | 0.380 | 0.500 | 0.781 | 68,344 |
-| XGBoost tuned | 0.0079 | 0.0191 | 0.415 | 0.500 | 0.714 | 59,497 |
-| LightGBM/XGBoost ensemble | 0.0074 | 0.0191 | 0.397 | 0.500 | 0.788 | 72,155 |
-| FT-Transformer | n/a | n/a | n/a | n/a | n/a | n/a |
-| FT-Transformer tuned | 0.2111 | 0.2122 | -214.079 | 0.200 | 0.490 | -5,934 |
-| Official `mamba-ssm` sequence | 0.0087 | 0.0238 | 0.044 | 0.200 | 0.510 | -2,692 |
-| Official `mamba-ssm` 5-seed | 0.0088 | 0.0239 | 0.024 | 0.200 | 0.501 | -1,793 |
+| Feature schema | Target | Best AUC model | Best AUC | Best OOS R2 model | Best OOS R2 vs IVAR | Best headline/diagnostic PnL model | Best net PnL |
+|:---|:---|:---|---:|:---|---:|:---|---:|
+| `fe_v1_legacy` | `jump_c2o` | LightGBM | 0.677 | XGBoost | 0.375 | Official `mamba-ssm` 5-seed, C2O intrinsic diagnostic | 28,898 |
+| `fe_v1_legacy` | `day_c2c` | LightGBM | 0.925 | XGBoost | 0.574 | LightGBM, C2C headline | 53,664 |
+| `fe_v1_legacy` | `reaction_o2c` | Ridge-flat sequence | 0.799 | XGBoost | 0.949 | FT-Transformer, O2C diagnostic | 643 |
+| `fe_v2_sec_xbrl` | `jump_c2o` | Goyal-Saretto spread | 0.602 | LightGBM | 0.203 | Official `mamba-ssm` 5-seed, C2O intrinsic diagnostic | 28,898 |
+| `fe_v2_sec_xbrl` | `day_c2c` | Ridge-flat sequence | 0.636 | Ridge-flat sequence | 0.264 | Ridge-flat sequence, C2C headline | 19,918 |
+| `fe_v2_sec_xbrl` | `reaction_o2c` | Ridge-flat sequence | 0.799 | LightGBM/XGBoost ensemble | 0.945 | FT-Transformer, O2C diagnostic | 753 |
 
-The central result is not that the lowest MAE model wins economically. The
-LightGBM/XGBoost ensemble has the strongest current combination of `jump_c2o`
-ranking and `day_c2c` premium-space proxy economics. The tuned rows are
-important fairness checks, but they do not overturn the ensemble headline.
-Retired in-repo fake-Mamba rows are excluded from the paper table.
+The central result is not that the richest feature schema wins. The current
+paper-facing signal screen is the parsimonious FE V1 tabular result; FE V2,
+FT-Transformer, and sequence rows remain diagnostic until follow-up feature
+audits show otherwise.
 
 ### 4.2 Results Order for the Manuscript
 
@@ -369,10 +380,11 @@ The results section should be written in this order:
    post-open premium-space diagnostic strategy table, scale-mismatch diagnostic,
    and interpretation. O2C is diagnostic because `IVAR_event` is a weak
    full-event comparator for post-open realized variance.
-4. Sequence diagnostics: ridge-flat, BiGRU, official bidirectional
-   `mamba-ssm`, mask-only, and time-shuffle controls. The current conclusion is
-   negative: ordered proxy-surface paths do not beat tabular aggregates or the
-   controls.
+4. Sequence diagnostics: ridge-flat, BiGRU 5-seed, official bidirectional
+   `mamba-ssm` 5-seed, attention pooling, non-causal dilated CNN, mask-only,
+   and time-shuffle controls. The current
+   conclusion is negative: ordered proxy-surface paths do not beat tabular
+   aggregates or the controls.
 5. Robustness and inference: cost sensitivity, clustered forecast-loss
    inference, calibration, and QLIKE caveats. These support a conservative
    tabular-model claim and do not replace quote/NBBO execution evidence.
@@ -399,12 +411,11 @@ robustness, and clustered or bootstrap inference.
 ## 6. Conclusion
 
 The current proxy-stage evidence supports a disciplined, limited conclusion.
-Nonlinear tabular models improve the ranking of earnings event-variance
-mispricing relative to market IVAR and simple historical benchmarks, and the
-best tabular models map this ranking signal into positive `day_c2c`
-premium-space proxy economics. The LightGBM/XGBoost rank-average ensemble leads
-both `jump_c2o` ranking quality and the current `day_c2c` proxy strategy
-screen.
+The same-code ablation says a parsimonious FE V1 tabular feature set improves
+the ranking of earnings event-variance mispricing relative to market IVAR and
+simple historical benchmarks, and maps this ranking signal into positive
+`day_c2c` premium-space proxy economics. The richer FE V2 default is currently
+a negative diagnostic result rather than a headline improvement.
 
 The result is not a final execution claim. It is a credible signal-screening
 result that justifies either a paper-grade quote/NBBO extension or a conservative

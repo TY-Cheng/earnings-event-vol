@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import gzip
 import json
 import subprocess
@@ -17,8 +18,11 @@ import polars as pl
 import pytest
 import torch
 
+import earnings_event_vol.cli as cli_module
 import earnings_event_vol.contract_reference as contract_reference
 import earnings_event_vol.data_pipeline as data_pipeline
+import earnings_event_vol.massive as massive_module
+import earnings_event_vol.trade_proxy as trade_proxy_module
 import scripts.build_trade_proxy_panel as trade_proxy_panel_script
 from earnings_event_vol.backtest import (
     GaussianEventJumpDistribution,
@@ -86,12 +90,20 @@ from earnings_event_vol.events import (
     validate_calendar_frame,
 )
 from earnings_event_vol.features import (
+    FEATURE_SCHEMA_V1_LEGACY,
+    FEATURE_SCHEMA_V2_SEC_XBRL,
+    add_rolling_earnings_history,
+    add_train_fit_normalized_features,
+    build_feature_schema_report,
     build_model_feature_matrix,
     build_option_surface_sequence_matrix,
+    feature_columns_from_schema_report,
     has_required_sequence_history,
     iv_butterfly_25d,
+    normalization_params_only,
     sequence_eligibility_reason,
     universe_by_trailing_option_dollar_volume,
+    validate_feature_schema_version,
 )
 from earnings_event_vol.leakage_audit import audit_feature_leakage, make_feature_timestamps
 from earnings_event_vol.market_covariates import (
@@ -151,8 +163,6 @@ from earnings_event_vol.models import (
     LinearElasticNetRegressor,
     MambaSSMSequenceEncoder,
     add_benchmark_predictions,
-    fit_ft_transformer,
-    fit_linear_elastic_net,
     fit_model,
     get_model_spec,
     model_diagnostics_as_frame,
@@ -167,9 +177,10 @@ from earnings_event_vol.research import (
     FORECAST_FLOOR,
     HYBRID_SEQUENCE_FEATURE_NAMES,
     HYBRID_STEPS,
-    PHASE1_TARGET_IDS,
     SEQUENCE_FEATURE_NAMES,
+    TARGET_IDS,
     TuningState,
+    _latest_xbrl_values_for_event,
     _model_ids_for_sequence_suite,
     _train_sequence_seed_ensemble,
     _write_tuning_artifacts,
@@ -395,6 +406,98 @@ def test_massive_flat_file_manifest_uses_safe_head_metadata(
     )
     assert manifest_without_head["head_object_ran"] is False
     assert all(item["ok"] is None for item in manifest_without_head["objects"])
+
+
+def test_massive_low_level_error_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert read_secret_file(None) is None
+    with pytest.raises(ValueError, match="access key and secret key"):
+        parse_flat_file_key_text("access-only\n")
+    with pytest.raises(ValueError, match="MASSIVE_FLAT_FILE_KEY_FILE"):
+        massive_module.read_flat_file_credentials(None)
+    assert massive_module._ls_metadata_from_stdout(
+        "2025-02-07 20:00:02 94947767406 2025-02-05.csv.gz\n"
+    ) == (94947767406, "2025-02-07T20:00:02")
+    assert massive_module._ls_metadata_from_stdout("not an s3 ls row") is None
+    assert (
+        massive_module._safe_error_text(MassiveCommandResult(returncode=7, stdout="", stderr=""))
+        == "aws command failed with exit code 7"
+    )
+
+    def missing_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = args, kwargs
+        raise FileNotFoundError("aws missing")
+
+    monkeypatch.setattr("earnings_event_vol.massive.subprocess.run", missing_run)
+    missing = massive_module._run_head_object_command(["aws"], {}, 1.0)
+    assert missing.returncode == 127
+    assert "aws missing" in missing.stderr
+
+    def timeout_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = args, kwargs
+        raise subprocess.TimeoutExpired(cmd=["aws"], timeout=1.0, output=b"out", stderr=b"err")
+
+    monkeypatch.setattr("earnings_event_vol.massive.subprocess.run", timeout_run)
+    timed_out = massive_module._run_head_object_command(["aws"], {}, 1.0)
+    assert timed_out.returncode == 124
+    assert timed_out.stdout == "out"
+    assert timed_out.stderr == "err"
+
+    key_file = tmp_path / "flat_file_key"
+    key_file.write_text("access\nsecret\n", encoding="utf-8")
+    config = replace(load_project_config(), massive_flat_file_key_file=key_file)
+
+    def failing_runner(
+        command: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> MassiveCommandResult:
+        _ = command, env, timeout
+        return MassiveCommandResult(returncode=1, stdout="", stderr="download failed")
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        massive_module.download_sample_allowed_flat_files(
+            config,
+            date_value=date(2025, 2, 5),
+            out_dir=tmp_path / "downloads",
+            runner=failing_runner,
+        )
+
+
+def test_massive_head_object_command_success_and_failed_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def completed_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        _ = args, kwargs
+        return subprocess.CompletedProcess(["aws"], 0, stdout='{"ok": true}', stderr="")
+
+    monkeypatch.setattr("earnings_event_vol.massive.subprocess.run", completed_run)
+    completed = massive_module._run_head_object_command(["aws"], {}, 1.0)
+    assert completed.returncode == 0
+    assert completed.stdout == '{"ok": true}'
+
+    secret = tmp_path / "massive_flat_file_key"
+    secret.write_text("access\nsecret\n", encoding="utf-8")
+    monkeypatch.setenv("MASSIVE_FLAT_FILE_KEY_FILE", str(secret))
+    config = load_project_config()
+
+    def failing_runner(
+        command: Sequence[str],
+        env: Mapping[str, str],
+        timeout: float,
+    ) -> MassiveCommandResult:
+        _ = env, timeout
+        if command[1:3] == ["s3api", "head-object"]:
+            return MassiveCommandResult(returncode=1, stdout="", stderr="head denied")
+        return MassiveCommandResult(returncode=1, stdout="", stderr="ls denied")
+
+    results = head_flat_file_objects(
+        config,
+        date_value=date(2025, 2, 5),
+        runner=failing_runner,
+    )
+
+    assert len(results) == 3
+    assert all(result.ok is False for result in results)
+    assert all(result.error == "head denied" for result in results)
 
 
 def test_massive_head_fallback_to_s3_ls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1106,6 +1209,75 @@ def test_sec_archived_submission_files_are_cached_normalized_and_deduped(
         "sec_edgar_submissions_recent",
         "sec_edgar_submissions_archive",
     ]
+
+
+def test_sec_submission_archives_cache_failure_and_missing_ticker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEC_COMPANY_TICKERS_URL", "https://sec.example/tickers.json")
+    monkeypatch.setenv(
+        "SEC_SUBMISSIONS_URL_TEMPLATE", "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+    )
+    config = load_project_config()
+    cache_dir = tmp_path / "sec_cache"
+    corrupt_archive = cache_dir / "ticker=AAPL" / "bad.json"
+    cached_archive = cache_dir / "ticker=AAPL" / "cached.json"
+    corrupt_archive.parent.mkdir(parents=True)
+    corrupt_archive.write_text("{bad json", encoding="utf-8")
+    cached_archive.write_text(
+        json.dumps(
+            {
+                "accessionNumber": ["cached"],
+                "filingDate": ["2025-01-03"],
+                "acceptanceDateTime": ["2025-01-03T20:00:00.000Z"],
+                "form": ["8-K"],
+                "items": ["2.02"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "https://sec.example/tickers.json":
+            return httpx.Response(200, json={"0": {"ticker": "AAPL", "cik_str": 320193}})
+        if url == "https://data.sec.gov/submissions/CIK0000320193.json":
+            return httpx.Response(
+                200,
+                json={
+                    "filings": {
+                        "recent": {},
+                        "files": [
+                            "bad-item",
+                            {},
+                            {"name": ""},
+                            {"name": "bad.json"},
+                            {"name": "cached.json"},
+                        ],
+                    }
+                },
+            )
+        if url == "https://data.sec.gov/submissions/bad.json":
+            return httpx.Response(503, json={"error": "temporary"})
+        raise AssertionError(f"unexpected URL {url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        payloads = fetch_sec_submission_payloads(
+            tickers=["AAPL", "MSFT"],
+            config=config,
+            client=client,
+            archive_cache_dir=cache_dir,
+            fail_on_missing_tickers=False,
+            request_interval_seconds=0,
+        )
+
+    assert payloads["MSFT"]["sec_fetch_status"] == "ticker_not_found"
+    assert payloads["AAPL"]["sec_fetch_status"] == "ok"
+    assert len(payloads["AAPL"]["archive_payloads"]) == 1
+    assert payloads["AAPL"]["archive_payloads"][0]["accessionNumber"] == ["cached"]
+    failures = payloads["AAPL"]["sec_archive_fetch_failed"]
+    assert [failure["name"] for failure in failures] == ["bad.json", "bad.json"]
 
 
 def test_earnings_calendar_timing_and_text_classification() -> None:
@@ -2510,6 +2682,192 @@ def test_bulk_day_aggs_bronze_statuses_and_refresh(tmp_path: Path) -> None:
     assert failed["status"] == "failed"
 
 
+def test_data_pipeline_completion_and_bulk_helper_edges(tmp_path: Path) -> None:
+    output = tmp_path / "out.txt"
+    manifest = tmp_path / "manifest.json"
+    step = DataPipelineStep(
+        "unit",
+        "ran",
+        outputs=(output,),
+        reason="because",
+        metadata={"rows": 1},
+    )
+    assert step.as_dict() == {
+        "name": "unit",
+        "status": "ran",
+        "outputs": [str(output)],
+        "reason": "because",
+        "metadata": {"rows": 1},
+    }
+    assert parse_text_list(None) == []
+    assert parse_text_list("AAPL, MSFT\nNVDA") == ["AAPL", "MSFT", "NVDA"]
+    assert data_pipeline._complete([]) is False
+    assert data_pipeline._complete([output]) is False
+    assert data_pipeline._json_params_match(manifest, {"x": 1}) is False
+    manifest.write_text("{bad json", encoding="utf-8")
+    assert data_pipeline._json_params_match(manifest, {"x": 1}) is False
+    output.write_text("ok", encoding="utf-8")
+    manifest.write_text(json.dumps({"pipeline_params": {"x": 1}}), encoding="utf-8")
+    assert data_pipeline._complete_with_params(
+        [output], params_path=manifest, expected_params={"x": 1}
+    )
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {"x": 1},
+                "status_counts": {"failed": 1},
+                "dataset_counts": {"options_day_aggs": {"downloaded": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        data_pipeline._bulk_day_aggs_complete_with_params(
+            [output], manifest_path=manifest, expected_params={"x": 1}
+        )
+        is False
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {"x": 1},
+                "status_counts": {"failed": 0},
+                "dataset_counts": {"options_day_aggs": {"hit": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert data_pipeline._bulk_day_aggs_complete_with_params(
+        [output], manifest_path=manifest, expected_params={"x": 1}
+    )
+
+    assert data_pipeline._date_partition_value(
+        tmp_path / "date=2025-01-02" / "part.parquet"
+    ) == date(2025, 1, 2)
+    assert data_pipeline._date_partition_value(tmp_path / "date=bad" / "part.parquet") is None
+    assert data_pipeline._date_partition_value(tmp_path / "part.parquet") is None
+    with pytest.raises(ValueError, match="unsupported bulk day-agg dataset"):
+        data_pipeline._day_agg_key(
+            load_project_config(), dataset="bad", date_value=date(2025, 1, 2)
+        )
+    assert data_pipeline._parquet_has_columns(tmp_path / "missing.parquet", {"ticker"}) is False
+    corrupt = tmp_path / "corrupt.parquet"
+    corrupt.write_text("not parquet", encoding="utf-8")
+    assert data_pipeline._parquet_has_columns(corrupt, {"ticker"}) is False
+    with pytest.raises(ValueError, match="unsupported bulk day-agg dataset"):
+        data_pipeline._bulk_required_columns("bad")
+    with pytest.raises(ValueError, match="flat file missing ticker column"):
+        data_pipeline._normalize_bulk_day_agg_frame(
+            pl.DataFrame({"close": [1.0], "volume": [2.0]}),
+            dataset="options_day_aggs",
+            date_value=date(2025, 1, 2),
+            source_key="key",
+        )
+    normalized = data_pipeline._normalize_bulk_day_agg_frame(
+        pl.DataFrame({"ticker": ["A"], "close": [1], "volume": [2], "vwap": [1.1]}),
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 2),
+        source_key="key",
+    )
+    assert normalized["source_date"].to_list() == ["2025-01-02"]
+    assert normalized["vwap"].dtype == pl.Float64
+    assert (
+        data_pipeline._download_error_status(
+            MassiveCommandResult(returncode=1, stdout="", stderr="NoSuchKey")
+        )
+        == "missing_flat_file"
+    )
+    assert (
+        data_pipeline._download_error_status(
+            MassiveCommandResult(returncode=124, stdout="", stderr="timeout")
+        )
+        == "failed"
+    )
+    assert (
+        data_pipeline._download_error_text(MassiveCommandResult(returncode=2, stdout="", stderr=""))
+        == "aws command failed with exit code 2"
+    )
+
+
+def test_market_covariates_step_success_skip_and_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        silver_data_dir=tmp_path / "silver",
+        fred_vixcls_url="https://example.test/vix.csv",
+        massive_request_timeout_seconds=1.0,
+    )
+    out_root = tmp_path / "artifacts"
+
+    class FakeResponse:
+        content = b"DATE,VIXCLS\n2025-01-02,18.5\n"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == 1.0
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: object,
+        ) -> None:
+            _ = exc_type, exc, tb
+            return None
+
+        def get(self, url: str) -> FakeResponse:
+            assert url == "https://example.test/vix.csv"
+            return FakeResponse()
+
+    def fake_normalize(
+        raw: pd.DataFrame,
+        *,
+        source_snapshot_date: date,
+        source_url: str,
+    ) -> pd.DataFrame:
+        assert raw.loc[0, "VIXCLS"] == 18.5
+        assert source_snapshot_date <= date.today()
+        assert source_url == "https://example.test/vix.csv"
+        return pd.DataFrame(
+            {
+                "date": [date(2025, 1, 2)],
+                "vix_close": [18.5],
+                "is_holiday_or_missing": [False],
+            }
+        )
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline.httpx.Client", FakeClient)
+    monkeypatch.setattr(data_pipeline, "normalize_fred_vixcls_csv", fake_normalize)
+    step = data_pipeline._market_covariates_step(config, out_root=out_root, force=False)
+    assert step.status == "ran"
+    skipped = data_pipeline._market_covariates_step(config, out_root=out_root, force=False)
+    assert skipped.status == "skipped"
+
+    def failing_normalize(
+        raw: pd.DataFrame,
+        *,
+        source_snapshot_date: date,
+        source_url: str,
+    ) -> pd.DataFrame:
+        _ = raw, source_snapshot_date, source_url
+        raise ValueError("bad vix")
+
+    monkeypatch.setattr(data_pipeline, "normalize_fred_vixcls_csv", failing_normalize)
+    failed = data_pipeline._market_covariates_step(config, out_root=out_root, force=True)
+    assert failed.status == "blocked"
+    assert failed.reason == "market_covariates_failed"
+
+
 def test_data_pipeline_source_readers_and_massive_probe_parallel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3283,6 +3641,9 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
             (csv_path, parquet_path, report_path),
         )
 
+    def fake_sec_companyfacts(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("sec-companyfacts", "ran")
+
     def fake_event_window_panel(*args: object, **kwargs: object) -> DataPipelineStep:
         assert kwargs["calendar_path"] == out_root / "dynamic_calendar" / (
             "earnings_calendar_candidates.csv"
@@ -3314,6 +3675,9 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
         "earnings_event_vol.data_pipeline._dynamic_calendar_step", fake_dynamic_calendar
     )
     monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._sec_companyfacts_step", fake_sec_companyfacts
+    )
+    monkeypatch.setattr(
         "earnings_event_vol.data_pipeline._event_window_panel_step", fake_event_window_panel
     )
     monkeypatch.setattr(
@@ -3339,15 +3703,191 @@ def test_data_pipeline_proxy_all_orchestrates_dynamic_top50_proxy_dag(
         "options-day-aggs-bulk",
         "universe",
         "dynamic-calendar",
+        "sec-companyfacts",
         "event-window-panel",
         "contract-reference-validation",
         "trade-proxy-panel",
     ]
-    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran", "ran"]
+    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran", "ran", "ran"]
     assert len(captured_commands) == 1
     trade_command = captured_commands[0]
     assert "build_trade_proxy_panel.py" in trade_command[1]
     assert "--max-contracts" in trade_command
+
+
+def test_sec_companyfacts_stage_writes_silver_and_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        silver_data_dir=tmp_path / "silver",
+        sec_companyfacts_url_template="https://example.test/CIK{cik:010d}.json",
+        massive_request_timeout_seconds=1.0,
+    )
+    out_root = tmp_path / "artifacts" / "data_pipeline"
+    dynamic_out = out_root / "dynamic_calendar"
+    dynamic_out.mkdir(parents=True)
+    pd.DataFrame([{"ticker": "AAPL"}]).to_csv(
+        dynamic_out / "earnings_calendar_candidates.csv", index=False
+    )
+    companyfacts_payload: dict[str, object] = {
+        "facts": {
+            "us-gaap": {
+                "Assets": {
+                    "units": {
+                        "USD": [
+                            {
+                                "accn": "0000320193-25-000001",
+                                "val": 100.0,
+                                "filed": "2025-01-03",
+                                "end": "2024-12-31",
+                                "fy": 2024,
+                                "fp": "FY",
+                                "form": "10-K",
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+
+    def fake_ticker_map(client: object, cfg: object) -> dict[str, int]:
+        _ = client, cfg
+        return {"AAPL": 320193}
+
+    def fake_submissions(
+        *,
+        tickers: Sequence[str],
+        config: object,
+        client: object,
+        archive_cache_dir: Path,
+        fail_on_missing_tickers: bool,
+        request_interval_seconds: float,
+    ) -> dict[str, dict[str, object]]:
+        _ = tickers, config, client, archive_cache_dir, fail_on_missing_tickers
+        assert request_interval_seconds == pytest.approx(0.125)
+        return {
+            "AAPL": {
+                "filings": {
+                    "recent": {
+                        "accessionNumber": ["0000320193-25-000001"],
+                        "acceptanceDateTime": ["2025-01-03T20:00:00.000Z"],
+                    }
+                }
+            }
+        }
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return companyfacts_payload
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+            self.urls: list[str] = []
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: object,
+        ) -> None:
+            _ = exc_type, exc, tb
+            return None
+
+        def get(self, url: str, *, headers: Mapping[str, str]) -> FakeResponse:
+            assert headers["User-Agent"] == config.sec_user_agent
+            self.urls.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline.fetch_sec_ticker_map", fake_ticker_map)
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.fetch_sec_submission_payloads", fake_submissions
+    )
+    monkeypatch.setattr("earnings_event_vol.data_pipeline.httpx.Client", FakeClient)
+
+    step = data_pipeline._sec_companyfacts_step(config, out_root=out_root, force=True)
+
+    assert step.status == "ran"
+    facts = pd.read_parquet(config.silver_data_dir / "sec" / "companyfacts.parquet")
+    assert facts.loc[0, "ticker"] == "AAPL"
+    assert facts.loc[0, "cik"] == 320193
+    assert facts.loc[0, "feature_concept"] == "assets"
+    assert facts.loc[0, "acceptance_datetime"] == "2025-01-03T20:00:00.000Z"
+    diagnostics = pd.read_csv(out_root / "sec_companyfacts" / "sec_companyfacts_diagnostics.csv")
+    assert diagnostics.loc[0, "status"] == "fetched"
+    manifest = json.loads(
+        (out_root / "sec_companyfacts" / "sec_companyfacts_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["mapped_acceptance_rows"] == 1
+    assert manifest["fallback_filed_rows"] == 0
+
+
+def test_sec_companyfacts_stage_graceful_degradation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        silver_data_dir=tmp_path / "silver",
+    )
+    out_root = tmp_path / "artifacts" / "data_pipeline"
+    dynamic_out = out_root / "dynamic_calendar"
+    dynamic_out.mkdir(parents=True)
+    pd.DataFrame([{"ticker": "AAPL"}]).to_csv(
+        dynamic_out / "earnings_calendar_candidates.csv", index=False
+    )
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            _ = timeout
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: object,
+        ) -> None:
+            _ = exc_type, exc, tb
+            return None
+
+    def failing_ticker_map(client: object, cfg: object) -> dict[str, int]:
+        _ = client, cfg
+        raise RuntimeError("sec unavailable")
+
+    monkeypatch.setattr("earnings_event_vol.data_pipeline.httpx.Client", FakeClient)
+    monkeypatch.setattr("earnings_event_vol.data_pipeline.fetch_sec_ticker_map", failing_ticker_map)
+
+    step = data_pipeline._sec_companyfacts_step(config, out_root=out_root, force=True)
+
+    assert step.status == "ran"
+    assert step.reason == "sec_companyfacts_failed_graceful_degradation"
+    facts = pd.read_parquet(config.silver_data_dir / "sec" / "companyfacts.parquet")
+    assert list(facts.columns) == ["ticker", "cik", "feature_concept"]
+    diagnostics = pd.read_csv(out_root / "sec_companyfacts" / "sec_companyfacts_diagnostics.csv")
+    assert diagnostics.loc[0, "status"] == "http_or_parse_degraded"
+    manifest = json.loads(
+        (out_root / "sec_companyfacts" / "sec_companyfacts_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "degraded"
+    assert manifest["reason"] == "sec_companyfacts_failed_graceful_degradation"
 
 
 def test_data_pipeline_proxy_all_stops_after_blocked_upstream_stage(
@@ -3614,6 +4154,55 @@ def test_post_open_option_vwap_windows_use_trade_weighted_prices() -> None:
     put_exit = exit_out.loc[exit_out["options_ticker"].eq(put_ticker), "option_exit_vwap"].iloc[0]
     assert call_exit == pytest.approx((6.0 * 2 + 8.0 * 3) / 5)
     assert put_exit == pytest.approx((5.0 * 1 + 7.0 * 3) / 4)
+
+
+def test_trade_proxy_window_validation_edge_cases() -> None:
+    start = pd.Timestamp("2026-02-06 09:30:00", tz="America/New_York").to_pydatetime()
+    end = pd.Timestamp("2026-02-06 09:35:00", tz="America/New_York").to_pydatetime()
+    cutoff = pd.Timestamp("2026-02-05 16:00:00", tz="America/New_York").to_pydatetime()
+
+    with pytest.raises(ValueError, match="buffer_minutes"):
+        filter_pre_cutoff_buffer(pd.DataFrame(), cutoff_timestamp=cutoff, buffer_minutes=0)
+    with pytest.raises(ValueError, match="timestamp_et"):
+        filter_pre_cutoff_buffer(
+            pd.DataFrame({"option_vwap": [1.0]}),
+            cutoff_timestamp=cutoff,
+            buffer_minutes=5,
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        filter_pre_cutoff_buffer(
+            pd.DataFrame({"timestamp_et": ["2026-02-05 15:59:00"], "option_vwap": [1.0]}),
+            cutoff_timestamp=cutoff,
+            buffer_minutes=5,
+        )
+
+    with pytest.raises(ValueError, match="price_field"):
+        select_option_window_vwap(
+            pd.DataFrame(), window_start=start, window_end=end, price_field="bad"
+        )
+    with pytest.raises(ValueError, match="window_end"):
+        select_option_window_vwap(pd.DataFrame(), window_start=start, window_end=start)
+    with pytest.raises(ValueError, match="timestamp_et"):
+        select_option_window_vwap(
+            pd.DataFrame({"option_vwap": [1.0], "volume": [1]}),
+            window_start=start,
+            window_end=end,
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        select_option_window_vwap(
+            pd.DataFrame(
+                {"timestamp_et": ["2026-02-06 09:31:00"], "option_vwap": [1.0], "volume": [1]}
+            ),
+            window_start=start,
+            window_end=end,
+        )
+
+    assert build_post_open_option_vwap_frame(pd.DataFrame(), {}).empty
+    assert build_exit_preclose_option_vwap_frame(pd.DataFrame(), {}).empty
+    with pytest.raises(ValueError, match="post-open option price frame"):
+        trade_proxy_module._post_open_option_vwap_lookup(pd.DataFrame({"event_id": ["x"]}))
+    with pytest.raises(ValueError, match="exit preclose option price frame"):
+        trade_proxy_module._exit_preclose_option_vwap_lookup(pd.DataFrame({"event_id": ["x"]}))
 
 
 def test_trade_proxy_validation_branches_and_summaries(tmp_path: Path) -> None:
@@ -4603,7 +5192,15 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     assert get_model_spec("last_four_rvar").implemented is True
     assert get_model_spec("last_four_ivar").implemented is True
     assert get_model_spec("patell_wolfson_diagnostic").implemented is True
-    assert get_model_spec("xgboost").implemented is True
+    assert get_model_spec("xgboost_tuned").implemented is True
+    for removed_model_id in [
+        "linear_elastic_net",
+        "lightgbm",
+        "xgboost",
+        "bigru_sequence",
+        "mamba_ssm_sequence",
+    ]:
+        assert removed_model_id not in MODEL_REGISTRY
     assert "implemented as a deterministic baseline" in unimplemented_model_message(
         "market_implied_event_variance"
     ) or "implemented and available" in unimplemented_model_message("market_implied_event_variance")
@@ -4617,9 +5214,7 @@ def test_black_scholes_and_model_registry_protocol() -> None:
         assert retired_id not in MODEL_REGISTRY
     for sequence_id in [
         "ridge_flat_aggregates_sequence",
-        "bigru_sequence",
         "bigru_sequence_5seed",
-        "mamba_ssm_sequence",
         "mamba_ssm_sequence_5seed",
         "mask_only_sequence",
         "time_shuffle_sequence",
@@ -4670,21 +5265,32 @@ def test_research_tuning_cli_and_model_ids() -> None:
 
     assert args.tuning_profile == "tuned_phase1"
     assert args.tuning_seed == 123
+    assert args.feature_schema_version == FEATURE_SCHEMA_V2_SEC_XBRL
     with pytest.raises(SystemExit):
         parser.parse_args(["research", "--tuning-profile", "bad_profile"])
 
-    default_ids = _model_ids_for_sequence_suite("phase1")
-    tuned_ids = _model_ids_for_sequence_suite("phase1", tuning_profile="tuned_phase1")
+    default_ids = _model_ids_for_sequence_suite("all")
+    tuned_ids = _model_ids_for_sequence_suite("all", tuning_profile="tuned_phase1")
     tuned_no_sequence_ids = _model_ids_for_sequence_suite("none", tuning_profile="tuned_phase1")
+    with pytest.raises(ValueError, match="unsupported sequence_suite"):
+        _model_ids_for_sequence_suite("phase1")
 
-    assert "linear_elastic_net_tuned" not in default_ids
+    assert "linear_elastic_net" not in default_ids
+    assert "lightgbm" not in default_ids
+    assert "xgboost" not in default_ids
+    assert "ft_transformer" in default_ids
     assert "linear_elastic_net_tuned" in tuned_ids
     assert "lightgbm_tuned" in tuned_ids
     assert "xgboost_tuned" in tuned_ids
-    assert "ft_transformer_tuned" in tuned_ids
+    assert "ft_transformer" in tuned_ids
     assert "bigru_sequence_5seed" in tuned_ids
     assert "mamba_ssm_sequence_5seed" in tuned_ids
+    assert "attention_pooling_sequence" in tuned_ids
+    assert "dilated_cnn_sequence" in tuned_ids
     assert "bigru_sequence_5seed" not in tuned_no_sequence_ids
+    assert "attention_pooling_sequence" not in tuned_no_sequence_ids
+    assert "dilated_cnn_sequence" not in tuned_no_sequence_ids
+    assert default_ids == tuned_ids
 
 
 def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> None:
@@ -4695,7 +5301,7 @@ def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> 
     predictions, diagnostics = run_proxy_model_suite(
         frame,
         tensor_path=tmp_path / "unused_sequence_tensor.npz",
-        model_ids=["linear_elastic_net", "linear_elastic_net_tuned"],
+        model_ids=["linear_elastic_net_tuned"],
         tuning_state=tuning_state,
         target_id="jump_c2o",
     )
@@ -4703,7 +5309,7 @@ def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> 
     selected_payload = json.loads(Path(outputs["tuning_selected_params"]).read_text())
     trials = pd.read_csv(outputs["tuning_trials"])
 
-    assert "forecast_linear_elastic_net" in predictions
+    assert "forecast_linear_elastic_net" not in predictions
     assert "forecast_linear_elastic_net_tuned" in predictions
     assert (
         predictions.loc[predictions["split"].eq("test"), "forecast_linear_elastic_net_tuned"]
@@ -4721,6 +5327,8 @@ def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> 
     assert set(selected["params"]) >= {"alpha", "l1_ratio"}
     assert not any(key.startswith("test") for key in selected["validation_metrics"])
     assert not any(column.startswith("test") for column in trials.columns)
+    assert trials["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
+    assert trials["tuning_profile"].eq("tuned_phase1").all()
     assert {"validation_auc", "validation_top_decile_precision", "validation_rmse"}.issubset(
         trials.columns
     )
@@ -4736,8 +5344,10 @@ def test_trained_model_with_no_usable_predictions_is_invalid(
         frame: pd.DataFrame,
         *,
         features: Sequence[str],
+        target_id: str,
+        tuning_state: TuningState,
     ) -> tuple[pd.Series, dict[str, object], object | None]:
-        _ = features
+        _ = features, target_id, tuning_state
         return (
             pd.Series(np.nan, index=frame.index),
             {"status": "trained", "train_rows": 28, "validation_rows": 6, "test_rows": 6},
@@ -4794,7 +5404,7 @@ def test_sequence_seed_ensemble_records_fixed_seed_list(
         frame,
         tensor_path=tmp_path / "sequence_tensor.npz",
         model_id="bigru_sequence_5seed",
-        base_model_id="bigru_sequence",
+        base_model_id="bigru_encoder",
         seeds=(17, 42, 123, 456, 789),
     )
 
@@ -4840,10 +5450,8 @@ def test_feature_matrix_benchmarks_models_and_metrics() -> None:
     assert "forecast_goyal_saretto_rv_iv_spread" in features
     assert features["mispricing_realized"].iloc[0] == pytest.approx(0.01)
 
-    fit = fit_linear_elastic_net(features, split_date="2025-05-01")
-    assert fit.model_id == "linear_elastic_net"
-    assert "forecast_linear_elastic_net" in fit.predictions
-    assert fit.predictions["forecast_linear_elastic_net"].ge(0).all()
+    with pytest.raises(ValueError, match="not a trainable"):
+        fit_model("linear_elastic_net", features, split_date="2025-05-01")
 
     forecast = forecast_metrics(
         features,
@@ -4874,6 +5482,239 @@ def test_feature_matrix_benchmarks_models_and_metrics() -> None:
     metrics = strategy_metrics(trades)
     assert metrics["turnover"] == len(trades)
     assert cost_sensitivity(trades).shape[0] == 5
+
+
+def test_feature_schema_allowlist_blocks_raw_ids_and_outcomes() -> None:
+    frame = pd.DataFrame(
+        {
+            "cik": [320193],
+            "company_cik": [320193],
+            "event_year": [2025],
+            "event_month": [2],
+            "event_month_sin": [0.5],
+            "ivar_event": [0.04],
+            "entry_premium_usd": [400.0],
+            "exit_option_value_usd": [300.0],
+            "exit_intrinsic_usd": [100.0],
+            "gross_proxy_pnl_usd": [10.0],
+            "prior_day_c2c_rvar_median": [0.03],
+            "xbrl_log_assets": [10.0],
+            "xbrl_dropped_same_day_filed_rows": [1],
+            "feature_schema_version": [FEATURE_SCHEMA_V2_SEC_XBRL],
+        }
+    )
+
+    schema = build_feature_schema_report(frame, feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL)
+    selected = set(feature_columns_from_schema_report(schema, frame=frame))
+
+    assert "cik" not in selected
+    assert "company_cik" not in selected
+    assert "event_year" not in selected
+    assert "event_month" not in selected
+    assert "exit_option_value_usd" not in selected
+    assert "exit_intrinsic_usd" not in selected
+    assert "gross_proxy_pnl_usd" not in selected
+    assert "xbrl_dropped_same_day_filed_rows" not in selected
+    assert {
+        "event_month_sin",
+        "ivar_event",
+        "entry_premium_usd",
+        "prior_day_c2c_rvar_median",
+        "xbrl_log_assets",
+    } <= selected
+
+
+def test_feature_schema_versions_and_selector_branches() -> None:
+    with pytest.raises(ValueError, match="unsupported feature_schema_version"):
+        validate_feature_schema_version("bad")
+    frame = pd.DataFrame(
+        {
+            "ivar_event": [0.04],
+            "prior_day_c2c_rvar_median": [0.03],
+            "prior_text": ["old"],
+            "xbrl_log_assets": [10.0],
+            "runup_5d_atm_iv_proxy_mean_proxy": [0.2],
+            "delta_grid_proxy_curvature": [0.01],
+            "rnd_proxy_tail_asymmetry": [-0.5],
+            "vix_level": [18.0],
+            "entry_cost_to_premium": [0.02],
+            "seqagg_surface_missing_rate_mean": [0.1],
+            "seq_t00_atm_iv_proxy": [0.2],
+            "company_cik": [320193],
+            "forecast_xgboost": [0.05],
+            "post_event_outcome": [1.0],
+            "event_month_sin": [0.5],
+            "ivar_event_train_z": [0.0],
+            "ticker_text": ["AAPL"],
+        }
+    )
+
+    legacy = build_feature_schema_report(frame, feature_schema_version=FEATURE_SCHEMA_V1_LEGACY)
+    legacy_selected = set(feature_columns_from_schema_report(legacy, frame=frame))
+    assert "ivar_event" in legacy_selected
+    assert "prior_day_c2c_rvar_median" not in legacy_selected
+    assert "xbrl_log_assets" not in legacy_selected
+    assert "event_month_sin" not in legacy_selected
+    assert "ivar_event_train_z" not in legacy_selected
+    assert "ticker_text" not in legacy_selected
+
+    v2 = build_feature_schema_report(frame, feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL)
+    v2_selected = set(
+        feature_columns_from_schema_report(v2, frame=frame, include_sequence_aggregates=False)
+    )
+    assert {
+        "prior_day_c2c_rvar_median",
+        "xbrl_log_assets",
+        "runup_5d_atm_iv_proxy_mean_proxy",
+        "delta_grid_proxy_curvature",
+        "rnd_proxy_tail_asymmetry",
+        "vix_level",
+        "entry_cost_to_premium",
+    } <= v2_selected
+    assert "seqagg_surface_missing_rate_mean" not in v2_selected
+    assert "seq_t00_atm_iv_proxy" not in v2_selected
+    assert "company_cik" not in v2_selected
+    assert "forecast_xgboost" not in v2_selected
+    assert "post_event_outcome" not in v2_selected
+    assert "prior_text" not in v2_selected
+    with pytest.raises(ValueError, match="feature schema report missing columns"):
+        feature_columns_from_schema_report(pd.DataFrame({"feature_name": ["x"]}))
+
+
+def test_rolling_history_no_peeking_on_same_ticker_timestamps() -> None:
+    frame = pd.DataFrame(
+        {
+            "event_id": ["OLD", "TIE", "NEW"],
+            "ticker": ["AAA", "AAA", "AAA"],
+            "event_entry_timestamp": [
+                "2025-01-01T21:00:00Z",
+                "2025-02-01T21:00:00Z",
+                "2025-02-01T21:00:00Z",
+            ],
+            "event_date": ["2025-01-01", "2025-02-01", "2025-02-01"],
+            "rvar_event": [0.01, 0.50, 0.09],
+            "RVAR_event_day_c2c": [0.01, 0.50, 0.09],
+            "RVAR_event_jump_c2o": [0.02, 0.60, 0.08],
+            "ivar_event": [0.02, 0.03, 0.04],
+        }
+    )
+
+    out = add_rolling_earnings_history(frame)
+
+    assert out.loc[out["event_id"].eq("OLD"), "prior_earnings_count"].iloc[0] == 0
+    assert out.loc[out["event_id"].eq("TIE"), "prior_earnings_count"].iloc[0] == 1
+    new = out.loc[out["event_id"].eq("NEW")].iloc[0]
+    assert new["prior_earnings_count"] == 1
+    assert new["prior_day_c2c_rvar_median"] == pytest.approx(0.01)
+    assert new["prior_day_c2c_rvar_median"] != pytest.approx(0.50)
+
+
+def test_rolling_history_fallbacks_without_ticker_or_entry_timestamp() -> None:
+    no_ticker = pd.DataFrame({"event_date": ["2025-01-01"], "rvar_event": [0.01]})
+    assert add_rolling_earnings_history(no_ticker).equals(no_ticker)
+    frame = pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA"],
+            "event_date": ["2025-01-01", "2025-02-01"],
+            "rvar_event": [0.02, 0.04],
+        }
+    )
+
+    out = add_rolling_earnings_history(frame)
+
+    assert out.loc[0, "prior_earnings_count"] == 0
+    assert out.loc[1, "prior_earnings_count"] == 1
+    assert out.loc[1, "prior_day_c2c_rvar_median"] == pytest.approx(0.02)
+    assert "prior_day_c2c_rv_iv_spread_median" in out.columns
+
+
+def test_train_fit_normalizer_does_not_use_test_distribution() -> None:
+    frame = pd.DataFrame(
+        {
+            "split": ["train", "train", "validation", "test"],
+            "ivar_event": [1.0, 3.0, 100.0, 1000.0],
+        }
+    )
+
+    out, params = add_train_fit_normalized_features(
+        frame,
+        columns=["ivar_event"],
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    assert params["test_distribution_used"] is False
+    normalizer_columns = cast(dict[str, Any], params["columns"])
+    ivar_params = cast(dict[str, Any], normalizer_columns["ivar_event"])
+    ivar_rank_bins = cast(dict[str, float], ivar_params["rank_bins"])
+    assert ivar_params["center"] == pytest.approx(2.0)
+    assert ivar_params["scale"] == pytest.approx(1.0)
+    assert ivar_rank_bins["0.5"] == pytest.approx(2.0)
+    assert out.loc[3, "ivar_event_train_z"] == pytest.approx(998.0)
+
+
+def test_normalizer_params_only_train_validation_and_skips() -> None:
+    frame = pd.DataFrame(
+        {
+            "split": ["train", "validation", "test"],
+            "constant_feature": [2.0, 2.0, 99.0],
+            "empty_feature": [np.nan, np.nan, 1.0],
+            "text_feature": ["a", "b", "c"],
+        }
+    )
+
+    params = normalization_params_only(
+        frame,
+        columns=["constant_feature", "empty_feature", "text_feature", "missing_feature"],
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+        fit_split="train_validation",
+    )
+
+    columns = cast(dict[str, Any], params["columns"])
+    constant = cast(dict[str, Any], columns["constant_feature"])
+    assert params["fit_split"] == "train_validation"
+    assert constant["n_fit"] == 2
+    assert constant["scale"] == pytest.approx(1.0)
+    assert "z_feature" not in constant
+    assert "rank_feature" not in constant
+    assert "empty_feature" not in columns
+    assert "text_feature" not in columns
+
+
+def test_sec_xbrl_asof_gate_prefers_acceptance_timestamp_and_drops_same_day_filed() -> None:
+    payload = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["A", "B"],
+                "acceptanceDateTime": ["2025-01-02T20:00:00.000Z", "2025-01-03T22:00:00.000Z"],
+            }
+        }
+    }
+    acceptance = data_pipeline._submission_acceptance_lookup(payload)
+    facts = pd.DataFrame(
+        {
+            "ticker": ["AAA", "AAA", "AAA"],
+            "feature_concept": ["assets", "assets", "revenue"],
+            "val": [100.0, 999.0, 50.0],
+            "filed": ["2025-01-02", "2025-01-03", "2025-01-03"],
+            "end": ["2024-12-31", "2024-12-31", "2024-12-31"],
+            "accn": ["A", "B", "MISSING"],
+            "acceptance_datetime": [acceptance["A"], acceptance["B"], None],
+        }
+    )
+    event = pd.Series(
+        {
+            "ticker": "AAA",
+            "feature_asof_timestamp": pd.Timestamp("2025-01-03T21:00:00Z"),
+            "event_entry_timestamp": pd.Timestamp("2025-01-03T21:00:00Z"),
+        }
+    )
+
+    features = _latest_xbrl_values_for_event(facts, event)
+
+    assert features["xbrl_available"] is True
+    assert features["xbrl_log_assets"] == pytest.approx(np.log1p(100.0))
+    assert np.isnan(float(cast(float, features["xbrl_log_revenue"])))
+    assert features["xbrl_mapped_acceptance_rows"] == 1
 
 
 def test_event_target_decomposition_amc_bmo_and_open_audit() -> None:
@@ -5126,7 +5967,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
             "haircut_pnl_usd": np.linspace(-55, 70, 40),
         }
     )
-    assert "reaction_o2c" in PHASE1_TARGET_IDS
+    assert "reaction_o2c" in TARGET_IDS
     rows: list[dict[str, object]] = []
     for event_idx, event_id in enumerate(events["event_id"]):
         for seq_idx in range(20):
@@ -5176,7 +6017,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert target_rows.groupby("event_id")["split"].nunique().max() == 1
     assert set(target_rows["target_id"]) == {"jump_c2o", "day_c2c", "reaction_o2c"}
     target_rows["forecast_market_implied_event_variance"] = target_rows["ivar_event"]
-    target_rows["forecast_linear_elastic_net"] = target_rows["rvar_event"] * 1.02
+    target_rows["forecast_linear_elastic_net_tuned"] = target_rows["rvar_event"] * 1.02
     assert set(features["split"]) == {"train", "validation", "test"}
     assert features.groupby("event_id")["split"].nunique().max() == 1
     tensor_path = tmp_path / "sequence_tensor.npz"
@@ -5251,6 +6092,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     audit = proxy_surface_distribution_audit(hybrid_long.assign(iv_extraction_source="synthetic"))
     assert {"iv_extraction_source", "metric", "missing_rate"}.issubset(audit.columns)
 
+    pytest.importorskip("sklearn")
     model_frame = prepare_target_frame(features, target_id="day_c2c")
     predictions, diagnostics = run_proxy_model_suite(
         model_frame,
@@ -5258,9 +6100,9 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         hybrid_tensor_path=hybrid_tensor_path,
         model_ids=[
             "market_implied_event_variance",
-            "linear_elastic_net",
+            "linear_elastic_net_tuned",
             "ridge_flat_aggregates_sequence",
-            "mamba_ssm_sequence",
+            "mamba_ssm_sequence_5seed",
         ],
     )
     assert (
@@ -5275,7 +6117,9 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         ].iloc[0]
         == "trained"
     )
-    assert diagnostics.loc[diagnostics["model_id"].eq("mamba_ssm_sequence"), "status"].iloc[0] in {
+    assert diagnostics.loc[diagnostics["model_id"].eq("mamba_ssm_sequence_5seed"), "status"].iloc[
+        0
+    ] in {
         "trained",
         "skipped_dependency_unavailable",
     }
@@ -5325,6 +6169,9 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         bootstrap_iter=10,
     )
     assert Path(diagnostics_paths["common_row_universe"]).exists()
+    common_rows = pd.read_csv(diagnostics_paths["common_row_universe"])
+    assert common_rows["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
+    assert common_rows["tuning_profile"].eq("tuned_phase1").all()
     retired_manifest = write_retired_model_manifest(tmp_path / "manifest")
     retired_payload = json.loads(retired_manifest.read_text())
     assert "daily_mamba_20step" in retired_payload["retired_model_ids"]
@@ -5349,6 +6196,17 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         metrics_dir / "o2c_option_vwap_0_5_strategy_trades_mamba_sequence_encoder.csv"
     ).exists()
     strategy = pd.read_csv(metric_paths["strategy_metrics"])
+    for artifact_name in (
+        "forecast_metrics",
+        "ranking_metrics",
+        "strategy_metrics",
+        "cost_sensitivity",
+        "qlike_sanity",
+        "inference",
+    ):
+        artifact = pd.read_csv(metric_paths[artifact_name])
+        assert artifact["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
+        assert artifact["tuning_profile"].eq("tuned_phase1").all()
     assert {"day_c2c", "jump_c2o", "reaction_o2c"}.issubset(set(strategy["target_id"]))
     c2o_strategy = strategy.loc[strategy["target_id"].eq("jump_c2o")]
     assert {
@@ -5364,9 +6222,11 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     }.issubset(set(o2c_strategy["strategy_proxy_kind"]))
     assert o2c_strategy["pnl_headline_eligible"].astype(str).str.lower().eq("false").all()
     o2c_trades = pd.read_csv(
-        metrics_dir / "o2c_option_vwap_5_15_strategy_trades_linear_elastic_net.csv"
+        metrics_dir / "o2c_option_vwap_5_15_strategy_trades_linear_elastic_net_tuned.csv"
     )
     if not o2c_trades.empty:
+        assert o2c_trades["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
+        assert o2c_trades["tuning_profile"].eq("tuned_phase1").all()
         expected_anchor = events[["event_id", "open_option_vwap_5_15_anchor_usd"]]
         anchored = o2c_trades.merge(expected_anchor, on="event_id", how="left")
         assert np.allclose(
@@ -5767,6 +6627,25 @@ def test_research_model_suite_and_error_paths() -> None:
         LinearElasticNetRegressor(alpha=-0.1)
     with pytest.raises(ValueError, match="l1_ratio"):
         LinearElasticNetRegressor(l1_ratio=1.5)
+    regressor = LinearElasticNetRegressor(max_iter=25)
+    regressor.fit(
+        feature_frame, target_col="rvar_event", feature_columns=["feature_a", "feature_b"]
+    )
+    regressor_predictions = regressor.predict(feature_frame)
+    assert regressor_predictions.shape == (len(feature_frame),)
+    assert np.isfinite(regressor_predictions).all()
+    with pytest.raises(ValueError, match="no finite target"):
+        regressor.fit(
+            feature_frame.assign(rvar_event=np.nan),
+            target_col="rvar_event",
+            feature_columns=["feature_a", "feature_b"],
+        )
+    split_train, split_test = temporal_train_test_split(feature_frame, split_date="2024-06-01")
+    assert len(split_train) == 6
+    assert len(split_test) == 2
+    frac_train, frac_test = temporal_train_test_split(feature_frame, train_fraction=0.5)
+    assert len(frac_train) == 4
+    assert len(frac_test) == 4
 
     predictions, results = run_model_suite(
         feature_frame,
@@ -5775,19 +6654,16 @@ def test_research_model_suite_and_error_paths() -> None:
             "last_four_rvar",
             "last_four_ivar",
             "goyal_saretto_rv_iv_spread",
-            "linear_elastic_net",
         ],
         split_date="2024-06-01",
     )
     assert "forecast_market_implied_event_variance" in predictions
-    assert "forecast_linear_elastic_net" in predictions
     diagnostics = model_diagnostics_as_frame(results)
     assert set(diagnostics["model_id"]) == {
         "market_implied_event_variance",
         "last_four_rvar",
         "last_four_ivar",
         "goyal_saretto_rv_iv_spread",
-        "linear_elastic_net",
     }
     assert (
         diagnostics.loc[diagnostics["model_id"].eq("market_implied_event_variance"), "status"].iloc[
@@ -5795,8 +6671,6 @@ def test_research_model_suite_and_error_paths() -> None:
         ]
         == "evaluated"
     )
-    ft_fit = fit_ft_transformer(feature_frame, split_date="2024-06-01", epochs=1)
-    assert ft_fit.predictions["forecast_ft_transformer"].ge(0).all()
     seq_frame = feature_frame.assign(
         seq_t00_atm_iv=np.linspace(0.2, 0.3, len(feature_frame)),
         seq_t01_atm_iv=np.linspace(0.21, 0.31, len(feature_frame)),
@@ -5809,11 +6683,12 @@ def test_research_model_suite_and_error_paths() -> None:
         "seq_t01_atm_iv",
         "seq_t01_volume",
     ]
-    assert prediction_column_for_model("linear_elastic_net") == "forecast_linear_elastic_net"
     assert (
         prediction_column_for_model("linear_elastic_net_tuned")
         == "forecast_linear_elastic_net_tuned"
     )
+    with pytest.raises(KeyError):
+        prediction_column_for_model("linear_elastic_net")
     with pytest.raises(ValueError, match="unknown model_id"):
         run_model_suite(feature_frame, model_ids=["not_a_model"])
     with pytest.raises(ValueError, match="not a trainable"):
@@ -6309,7 +7184,7 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
                 "--out",
                 str(models_out),
                 "--models",
-                "market_implied_event_variance,last_four_rvar,linear_elastic_net",
+                "market_implied_event_variance,last_four_rvar,goyal_saretto_rv_iv_spread",
             ]
         )
         == 0
@@ -6322,6 +7197,90 @@ def test_cli_comma_int_parser_validates_mamba_seed_lists() -> None:
     assert _parse_comma_ints("17, 31,,47") == [17, 31, 47]
     with pytest.raises(ValueError, match="expected at least one integer seed"):
         _parse_comma_ints(" , ")
+
+
+def test_cli_private_command_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    csv_path = tmp_path / "table.csv"
+    cli_module._write_table(csv_path, pd.DataFrame({"x": [1]}))
+    assert cli_module._read_table(csv_path)["x"].tolist() == [1]
+    assert cli_module._model_ids_from_args([]) == [
+        "market_implied_event_variance",
+        "last_four_rvar",
+        "last_four_ivar",
+        "goyal_saretto_rv_iv_spread",
+    ]
+    assert cli_module._model_ids_from_args(["market_implied_event_variance,last_four_rvar"]) == [
+        "market_implied_event_variance",
+        "last_four_rvar",
+    ]
+    with pytest.raises(ValueError, match="unknown model ids"):
+        cli_module._model_ids_from_args(["does_not_exist"])
+    with pytest.raises(SystemExit):
+        cli_module._source_probe("bad", load_project_config())
+
+    manifest: dict[str, object] = {
+        "date": "2025-02-05",
+        "objects": [{"dataset": "options_day_aggs", "ok": True}],
+    }
+
+    def fake_manifest(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        assert kwargs["run_head"] is False
+        return manifest
+
+    monkeypatch.setattr(cli_module, "massive_flat_file_manifest", fake_manifest)
+    metadata_args = argparse.Namespace(
+        date="2025-02-05",
+        out=tmp_path / "metadata",
+        metadata_only=True,
+        no_head=True,
+        aws_executable="aws",
+        sample_rows=3,
+    )
+    assert cli_module._massive_flat_files(metadata_args, load_project_config()) == 0
+    assert (tmp_path / "metadata" / "massive_flat_file_manifest.json").exists()
+
+    def fake_sample(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        assert kwargs["sample_rows"] == 3
+        return {
+            "manifest": {
+                "date": "2025-02-05",
+                "objects": [{"dataset": "options_day_aggs", "ok": False}],
+            }
+        }
+
+    monkeypatch.setattr(cli_module, "build_massive_day_agg_sample", fake_sample)
+    sample_args = argparse.Namespace(
+        date="2025-02-05",
+        out=tmp_path / "sample",
+        metadata_only=False,
+        no_head=False,
+        aws_executable="aws",
+        sample_rows=3,
+    )
+    assert cli_module._massive_flat_files(sample_args, load_project_config()) == 1
+
+    def fake_research_package(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        assert kwargs["feature_schema_version"] == FEATURE_SCHEMA_V2_SEC_XBRL
+        return {"ok": False, "stage": kwargs["stage"]}
+
+    monkeypatch.setattr(cli_module, "run_proxy_research_package", fake_research_package)
+    research_args = argparse.Namespace(
+        stage="features",
+        split_design="chronological_proxy_70_15_15",
+        split_date=None,
+        allow_high_sequence_risk=True,
+        sequence_suite="all",
+        mamba_backend="mamba_ssm",
+        mamba_seeds="17,42",
+        bootstrap_iter=10,
+        tuning_profile="tuned_phase1",
+        tuning_seed=17,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+    assert cli_module._research(research_args, load_project_config()) == 1
 
 
 def test_compute_variance_uses_event_exit_date_and_rejects_duplicates(tmp_path: Path) -> None:

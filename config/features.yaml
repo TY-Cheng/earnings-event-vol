@@ -1,3 +1,46 @@
+feature_schema:
+  default_version: fe_v2_sec_xbrl
+  ablation_versions:
+    - fe_v1_legacy
+  resolved_report: artifacts/modeling/feature_schema_report.csv
+  transform_params: artifacts/modeling/feature_transform_params.json
+  selector_rule: "only model_feature=true rows in the resolved report may enter trainable models"
+  signal_timestamp: event_entry_timestamp
+  fe_v2_sec_xbrl:
+    allow_families:
+      - event_level
+      - liquidity_execution_proxy
+      - market_covariate
+      - sequence_aggregate
+      - rolling_earnings_history
+      - train_fit_normalization
+      - sec_xbrl_companyfacts
+      - single_name_runup_proxy
+      - single_name_surface_proxy
+    block_exact:
+      - cik
+      - event_year
+      - event_month
+      - feature_asof_timestamp
+      - event_entry_timestamp
+      - signal_timestamp
+      - split
+      - target_id
+      - feature_schema_version
+    block_patterns:
+      - accession
+      - realized
+      - post_event
+      - exit_option_value
+      - exit_intrinsic
+      - gross_proxy_pnl_usd
+      - haircut_pnl_usd
+      - net_proxy_pnl_usd
+    as_of_notes:
+      - "same-ticker rolling history must satisfy prior_event_entry_timestamp < current_event_entry_timestamp"
+      - "SEC XBRL uses acceptanceDateTime <= feature_asof_timestamp when mapped, else filed < feature_asof_date"
+      - "entry-window features are allowed only because signal_timestamp == event_entry_timestamp"
+
 event_level:
   - ivar_event
   - atm_iv_event_expiry

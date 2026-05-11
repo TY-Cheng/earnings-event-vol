@@ -19,7 +19,16 @@ from scipy.optimize import brentq
 from earnings_event_vol.backtest import black_scholes_price, build_proxy_strategy_frame
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.event_targets import available_target_columns, target_label_column
-from earnings_event_vol.features import build_model_feature_matrix
+from earnings_event_vol.features import (
+    DEFAULT_FEATURE_SCHEMA_VERSION,
+    FEATURE_SCHEMA_V2_SEC_XBRL,
+    add_train_fit_normalized_features,
+    build_feature_schema_report,
+    build_model_feature_matrix,
+    feature_columns_from_schema_report,
+    normalization_params_only,
+    validate_feature_schema_version,
+)
 from earnings_event_vol.market_covariates import (
     VIX_ALIGNMENT_PRIOR_CLOSE,
     build_vix_features,
@@ -127,8 +136,6 @@ HYBRID_SURFACE_VALUE_FEATURE_NAMES = [
     }
 ]
 TARGET_IDS = ["jump_c2o", "day_c2c", "reaction_o2c"]
-PHASE1_TARGET_IDS = TARGET_IDS
-PHASE2_TARGET_IDS = TARGET_IDS
 RETIRED_MAMBA_MODEL_IDS = [
     "daily_mamba_20step",
     "hybrid_mamba_31step",
@@ -140,14 +147,16 @@ MODEL_IDS = [
     "last_four_rvar",
     "last_four_ivar",
     "goyal_saretto_rv_iv_spread",
-    "linear_elastic_net",
-    "lightgbm",
-    "xgboost",
+    "linear_elastic_net_tuned",
+    "lightgbm_tuned",
+    "xgboost_tuned",
     "lightgbm_xgboost_mean_ensemble",
     "ft_transformer",
     "ridge_flat_aggregates_sequence",
-    "bigru_sequence",
-    "mamba_ssm_sequence",
+    "bigru_sequence_5seed",
+    "mamba_ssm_sequence_5seed",
+    "attention_pooling_sequence",
+    "dilated_cnn_sequence",
     "mask_only_sequence",
     "time_shuffle_sequence",
 ]
@@ -155,15 +164,11 @@ TUNED_TABULAR_MODEL_IDS = [
     "linear_elastic_net_tuned",
     "lightgbm_tuned",
     "xgboost_tuned",
-    "ft_transformer_tuned",
+    "ft_transformer",
 ]
 SEQUENCE_ENSEMBLE_MODEL_IDS = [
     "bigru_sequence_5seed",
     "mamba_ssm_sequence_5seed",
-]
-PHASE2_SEQUENCE_MODEL_IDS = [
-    "attention_pooling_sequence",
-    "dilated_cnn_sequence",
 ]
 DETERMINISTIC_MODEL_IDS = {
     "market_implied_event_variance",
@@ -172,19 +177,13 @@ DETERMINISTIC_MODEL_IDS = {
     "goyal_saretto_rv_iv_spread",
 }
 TRAINABLE_TABULAR_MODEL_IDS = {
-    "linear_elastic_net",
-    "lightgbm",
-    "xgboost",
-    "ft_transformer",
     *TUNED_TABULAR_MODEL_IDS,
 }
-GBDT_MODEL_IDS = {"lightgbm", "xgboost", "lightgbm_tuned", "xgboost_tuned"}
+GBDT_MODEL_IDS = {"lightgbm_tuned", "xgboost_tuned"}
 SEQUENCE_MODEL_IDS = {
     "ridge_flat_aggregates_sequence",
     "attention_pooling_sequence",
-    "bigru_sequence",
     "dilated_cnn_sequence",
-    "mamba_ssm_sequence",
     "bigru_sequence_5seed",
     "mamba_ssm_sequence_5seed",
     "mask_only_sequence",
@@ -195,8 +194,8 @@ REAL_SEQUENCE_MODEL_IDS = (
     SEQUENCE_MODEL_IDS - SEQUENCE_CONTROL_MODEL_IDS - {"ridge_flat_aggregates_sequence"}
 )
 SplitName = Literal["train", "validation", "test"]
-TuningProfile = Literal["untuned", "tuned_phase1"]
-TUNING_PROFILES = {"untuned", "tuned_phase1"}
+TuningProfile = Literal["tuned_phase1"]
+TUNING_PROFILES = {"tuned_phase1"}
 TUNING_SELECTION_TARGET_ID = "jump_c2o"
 TUNING_LIGHTGBM_TRIALS = 50
 TUNING_XGBOOST_TRIALS = 50
@@ -206,7 +205,7 @@ TUNING_SEQUENCE_ENSEMBLE_SEEDS = (17, 42, 123, 456, 789)
 
 @dataclass
 class TuningState:
-    profile: TuningProfile = "untuned"
+    profile: TuningProfile = "tuned_phase1"
     seed: int = 17
     selected_params: dict[str, dict[str, object]] | None = None
     trial_records: list[dict[str, object]] | None = None
@@ -1816,10 +1815,7 @@ def o2c_scale_diagnostic(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def research_prediction_column(model_id: str) -> str:
-    mapping = {
-        "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",
-    }
-    return mapping.get(model_id, prediction_column_for_model(model_id))
+    return prediction_column_for_model(model_id)
 
 
 def _numeric_matrix(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
@@ -1991,237 +1987,6 @@ def _safe_training_frames(
 def _finite_target_frame(frame: pd.DataFrame, *, target_col: str = "rvar_event") -> pd.DataFrame:
     target = pd.to_numeric(frame[target_col], errors="coerce")
     return frame.loc[np.isfinite(target)].copy()
-
-
-def _train_elastic_net(
-    frame: pd.DataFrame,
-    *,
-    features: Sequence[str],
-) -> tuple[pd.Series, dict[str, object], object | None]:
-    train = frame.loc[frame["split"].eq("train")]
-    validation = frame.loc[frame["split"].eq("validation")]
-    test = frame.loc[frame["split"].eq("test")]
-    skip = _safe_training_frames(frame, train=train, validation=validation, test=test)
-    if skip:
-        return pd.Series(np.nan, index=frame.index), {"status": skip}, None
-    model = LinearElasticNetRegressor()
-    model.fit(train, target_col="rvar_event", feature_columns=features)
-    pred = pd.Series(np.nan, index=frame.index, dtype=float)
-    pred.loc[validation.index] = model.predict(validation)
-    pred.loc[test.index] = model.predict(test)
-    return (
-        pred.clip(lower=FORECAST_FLOOR),
-        {
-            "status": "trained",
-            "train_rows": int(len(train)),
-            "validation_rows": int(len(validation)),
-            "test_rows": int(len(test)),
-        },
-        model,
-    )
-
-
-def _train_lightgbm(
-    frame: pd.DataFrame,
-    *,
-    features: Sequence[str],
-) -> tuple[pd.Series, dict[str, object], object | None]:  # pragma: no cover - optional dependency
-    try:
-        import lightgbm as lgb
-    except ImportError:
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_dependency_unavailable"},
-            None,
-        )
-    train = frame.loc[frame["split"].eq("train")]
-    validation = frame.loc[frame["split"].eq("validation")]
-    test = frame.loc[frame["split"].eq("test")]
-    train_fit = _finite_target_frame(train)
-    validation_fit = _finite_target_frame(validation)
-    skip = _safe_training_frames(frame, train=train, validation=validation, test=test)
-    if skip:
-        return pd.Series(np.nan, index=frame.index), {"status": skip}, None
-    if len(train_fit) < 20 or len(validation_fit) < 5:
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_insufficient_finite_targets"},
-            None,
-        )
-    model = lgb.LGBMRegressor(
-        n_estimators=250,
-        learning_rate=0.03,
-        num_leaves=31,
-        random_state=17,
-        verbose=-1,
-    )
-    y_train = pd.to_numeric(train_fit["rvar_event"], errors="coerce")
-    model.fit(_numeric_matrix(train_fit, features), y_train)
-    pred = pd.Series(np.nan, index=frame.index, dtype=float)
-    pred.loc[validation.index] = model.predict(_numeric_matrix(validation, features))
-    pred.loc[test.index] = model.predict(_numeric_matrix(test, features))
-    return (
-        pred.clip(lower=FORECAST_FLOOR),
-        {
-            "status": "trained",
-            "train_rows": int(len(train)),
-            "validation_rows": int(len(validation)),
-            "test_rows": int(len(test)),
-        },
-        model,
-    )
-
-
-def _train_xgboost(
-    frame: pd.DataFrame,
-    *,
-    features: Sequence[str],
-) -> tuple[pd.Series, dict[str, object], object | None]:  # pragma: no cover - optional dependency
-    try:
-        import xgboost as xgb
-    except ImportError:
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_dependency_unavailable"},
-            None,
-        )
-    train = frame.loc[frame["split"].eq("train")]
-    validation = frame.loc[frame["split"].eq("validation")]
-    test = frame.loc[frame["split"].eq("test")]
-    train_fit = _finite_target_frame(train)
-    validation_fit = _finite_target_frame(validation)
-    skip = _safe_training_frames(frame, train=train, validation=validation, test=test)
-    if skip:
-        return pd.Series(np.nan, index=frame.index), {"status": skip}, None
-    if len(train_fit) < 20 or len(validation_fit) < 5:
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_insufficient_finite_targets"},
-            None,
-        )
-    model = xgb.XGBRegressor(
-        n_estimators=250,
-        learning_rate=0.03,
-        max_depth=4,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=17,
-        objective="reg:squarederror",
-    )
-    y_train = pd.to_numeric(train_fit["rvar_event"], errors="coerce")
-    try:
-        model.fit(_numeric_matrix(train_fit, features), y_train)
-    except Exception as exc:  # pragma: no cover - optional dependency instability
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_training_error", "error": str(exc)},
-            None,
-        )
-    pred = pd.Series(np.nan, index=frame.index, dtype=float)
-    pred.loc[validation.index] = model.predict(_numeric_matrix(validation, features))
-    pred.loc[test.index] = model.predict(_numeric_matrix(test, features))
-    return (
-        pred.clip(lower=FORECAST_FLOOR),
-        {
-            "status": "trained",
-            "train_rows": int(len(train)),
-            "validation_rows": int(len(validation)),
-            "test_rows": int(len(test)),
-        },
-        model,
-    )
-
-
-def _train_ft_transformer(
-    frame: pd.DataFrame,
-    *,
-    features: Sequence[str],
-    seed: int = 17,
-    max_epochs: int = 40,
-    patience: int = 8,
-) -> tuple[pd.Series, dict[str, object], object | None]:
-    train = frame.loc[frame["split"].eq("train")]
-    validation = frame.loc[frame["split"].eq("validation")]
-    test = frame.loc[frame["split"].eq("test")]
-    train_fit = _finite_target_frame(train)
-    validation_fit = _finite_target_frame(validation)
-    skip = _safe_training_frames(frame, train=train, validation=validation, test=test)
-    if skip:
-        return pd.Series(np.nan, index=frame.index), {"status": skip}, None
-    if len(train_fit) < 20 or len(validation_fit) < 5:
-        return (
-            pd.Series(np.nan, index=frame.index),
-            {"status": "skipped_insufficient_finite_targets"},
-            None,
-        )
-    torch.manual_seed(seed)
-    model = FTTransformerRegressor(n_features=len(features))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    x_train = torch.tensor(
-        _numeric_matrix(train_fit, features).to_numpy(dtype=float), dtype=torch.float32
-    )
-    y_train = torch.tensor(
-        pd.to_numeric(train_fit["rvar_event"], errors="coerce").to_numpy(dtype=float),
-        dtype=torch.float32,
-    )
-    x_val = torch.tensor(
-        _numeric_matrix(validation_fit, features).to_numpy(dtype=float), dtype=torch.float32
-    )
-    y_val = torch.tensor(
-        pd.to_numeric(validation_fit["rvar_event"], errors="coerce").to_numpy(dtype=float),
-        dtype=torch.float32,
-    )
-    best_state: dict[str, torch.Tensor] | None = None
-    best_loss = float("inf")
-    stale = 0
-    epochs_run = 0
-    for epoch in range(max_epochs):
-        epochs_run = epoch + 1
-        model.train()
-        optimizer.zero_grad()
-        loss = torch.mean(torch.square(model(x_train) - y_train))
-        loss.backward()  # type: ignore[no-untyped-call]
-        optimizer.step()
-        model.eval()
-        with torch.no_grad():
-            val_loss = float(torch.mean(torch.square(model(x_val) - y_val)).item())
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    pred = pd.Series(np.nan, index=frame.index, dtype=float)
-    model.eval()
-    for split_name, split_frame in (("validation", validation), ("test", test)):
-        with torch.no_grad():
-            values = (
-                model(
-                    torch.tensor(
-                        _numeric_matrix(split_frame, features).to_numpy(dtype=float),
-                        dtype=torch.float32,
-                    )
-                )
-                .detach()
-                .numpy()
-            )
-        _ = split_name
-        pred.loc[split_frame.index] = values
-    return (
-        pred.clip(lower=FORECAST_FLOOR),
-        {
-            "status": "trained",
-            "train_rows": int(len(train)),
-            "validation_rows": int(len(validation)),
-            "test_rows": int(len(test)),
-            "epochs": int(epochs_run),
-        },
-        model,
-    )
 
 
 def _train_elastic_net_tuned(
@@ -2662,7 +2427,7 @@ def _fit_ft_transformer_once(
     return model
 
 
-def _train_ft_transformer_tuned(
+def _train_ft_transformer(
     frame: pd.DataFrame,
     *,
     features: Sequence[str],
@@ -2685,10 +2450,10 @@ def _train_ft_transformer_tuned(
             {"status": "skipped_insufficient_finite_targets"},
             None,
         )
-    params = _cached_params(tuning_state, "ft_transformer_tuned")
+    params = _cached_params(tuning_state, "ft_transformer")
     selection_target = cast(
         str,
-        tuning_state.selected.get("ft_transformer_tuned", {}).get("selection_target_id", target_id),
+        tuning_state.selected.get("ft_transformer", {}).get("selection_target_id", target_id),
     )
     if params is None:
         x_val = torch.tensor(
@@ -2785,13 +2550,13 @@ def _train_ft_transformer_tuned(
         _record_optuna_trials(
             state=tuning_state,
             study=study,
-            model_id="ft_transformer_tuned",
+            model_id="ft_transformer",
             target_id=target_id,
             selected_number=int(best.number),
         )
         _cache_selected_params(
             state=tuning_state,
-            model_id="ft_transformer_tuned",
+            model_id="ft_transformer",
             target_id=target_id,
             params=params,
             metrics=best.user_attrs,
@@ -2927,7 +2692,7 @@ def _make_sequence_encoder(
     hidden_size: int,
     n_layers: int,
 ) -> torch.nn.Module:
-    if model_id in {"bigru_sequence", "mask_only_sequence", "time_shuffle_sequence"}:
+    if model_id in {"bigru_encoder", "mask_only_sequence", "time_shuffle_sequence"}:
         return BiGRUSequenceEncoder(
             n_features=n_features,
             hidden_size=hidden_size,
@@ -2938,7 +2703,7 @@ def _make_sequence_encoder(
         return AttentionPoolingSequenceEncoder(n_features=n_features, hidden_size=hidden_size)
     if model_id == "dilated_cnn_sequence":
         return DilatedCNNSequenceEncoder(n_features=n_features)
-    if model_id == "mamba_ssm_sequence":
+    if model_id == "mamba_ssm_encoder":
         return MambaSSMSequenceEncoder(
             n_features=n_features,
             hidden_size=hidden_size,
@@ -3292,11 +3057,11 @@ def _train_ridge_flat_sequence(
 def _train_lightgbm_xgboost_ensemble(
     predictions: pd.DataFrame,
 ) -> tuple[pd.Series, dict[str, object], object | None]:
-    required = ["forecast_lightgbm", "forecast_xgboost"]
+    required = ["forecast_lightgbm_tuned", "forecast_xgboost_tuned"]
     if any(column not in predictions.columns for column in required):
         return pd.Series(np.nan, index=predictions.index), {"status": "skipped_missing_base"}, None
-    lgbm = pd.to_numeric(predictions["forecast_lightgbm"], errors="coerce")
-    xgboost = pd.to_numeric(predictions["forecast_xgboost"], errors="coerce")
+    lgbm = pd.to_numeric(predictions["forecast_lightgbm_tuned"], errors="coerce")
+    xgboost = pd.to_numeric(predictions["forecast_xgboost_tuned"], errors="coerce")
     raw_mean = (lgbm + xgboost) / 2.0
     rank_average = (lgbm.rank(pct=True) + xgboost.rank(pct=True)) / 2.0
     pred = pd.Series(np.nan, index=predictions.index, dtype=float)
@@ -3310,7 +3075,7 @@ def _train_lightgbm_xgboost_ensemble(
         pred.clip(lower=FORECAST_FLOOR),
         {
             "status": "evaluated",
-            "ensemble_method": "equal_weight_rank_average",
+            "ensemble_method": "equal_weight_tuned_rank_average",
             "train_rows": int(predictions["split"].eq("train").sum()),
             "validation_rows": int(predictions["split"].eq("validation").sum()),
             "test_rows": int(predictions["split"].eq("test").sum()),
@@ -3373,8 +3138,6 @@ def _train_model_dispatch(
     tuning_state: TuningState,
     target_id: str,
 ) -> tuple[pd.Series, dict[str, object], object | None]:
-    if model_id == "linear_elastic_net":
-        return _train_elastic_net(predictions, features=event_features)
     if model_id == "linear_elastic_net_tuned":
         return _train_elastic_net_tuned(
             predictions,
@@ -3382,8 +3145,6 @@ def _train_model_dispatch(
             target_id=target_id,
             tuning_state=tuning_state,
         )
-    if model_id == "lightgbm":
-        return _train_lightgbm(predictions, features=tree_features)
     if model_id == "lightgbm_tuned":
         return _train_lightgbm_tuned(
             predictions,
@@ -3391,8 +3152,6 @@ def _train_model_dispatch(
             target_id=target_id,
             tuning_state=tuning_state,
         )
-    if model_id == "xgboost":
-        return _train_xgboost(predictions, features=tree_features)
     if model_id == "xgboost_tuned":
         return _train_xgboost_tuned(
             predictions,
@@ -3403,9 +3162,7 @@ def _train_model_dispatch(
     if model_id == "lightgbm_xgboost_mean_ensemble":
         return _train_lightgbm_xgboost_ensemble(predictions)
     if model_id == "ft_transformer":
-        return _train_ft_transformer(predictions, features=event_features)
-    if model_id == "ft_transformer_tuned":
-        return _train_ft_transformer_tuned(
+        return _train_ft_transformer(
             predictions,
             features=event_features,
             target_id=target_id,
@@ -3418,7 +3175,7 @@ def _train_model_dispatch(
             predictions,
             tensor_path=hybrid_tensor_path,
             model_id=model_id,
-            base_model_id="bigru_sequence",
+            base_model_id="bigru_encoder",
             seeds=TUNING_SEQUENCE_ENSEMBLE_SEEDS,
         )
     if model_id == "mamba_ssm_sequence_5seed":
@@ -3427,38 +3184,15 @@ def _train_model_dispatch(
             predictions,
             tensor_path=hybrid_tensor_path,
             model_id=model_id,
-            base_model_id="mamba_ssm_sequence",
+            base_model_id="mamba_ssm_encoder",
             seeds=TUNING_SEQUENCE_ENSEMBLE_SEEDS,
         )
     if model_id in {
         "attention_pooling_sequence",
-        "bigru_sequence",
         "dilated_cnn_sequence",
-        "mamba_ssm_sequence",
         "mask_only_sequence",
         "time_shuffle_sequence",
     }:
-        if model_id == "mamba_ssm_sequence":
-            seed_predictions: list[pd.Series] = []
-            seed_diagnostics: list[dict[str, object]] = []
-            for seed in mamba_seeds:
-                seed_pred, seed_diag, _ = _train_sequence_model(
-                    predictions,
-                    tensor_path=hybrid_tensor_path,
-                    model_id=model_id,
-                    seed=seed,
-                )
-                seed_predictions.append(seed_pred)
-                seed_diagnostics.append(seed_diag)
-            pred = pd.concat(seed_predictions, axis=1).mean(axis=1)
-            diag = {
-                **seed_diagnostics[0],
-                "mamba_backend": mamba_backend,
-                "mamba_seeds": ",".join(str(seed) for seed in mamba_seeds),
-                "seed_count": len(mamba_seeds),
-                "seed_statuses": ",".join(str(item.get("status")) for item in seed_diagnostics),
-            }
-            return pred.clip(lower=FORECAST_FLOOR), diag, None
         return _train_sequence_model(
             predictions,
             tensor_path=hybrid_tensor_path,
@@ -3466,8 +3200,6 @@ def _train_model_dispatch(
             mask_only=model_id == "mask_only_sequence",
             time_shuffle=model_id == "time_shuffle_sequence",
         )
-    if model_id == "lightgbm_with_hybrid_aggregates":
-        return _train_lightgbm(predictions, features=tree_features)
     raise ValueError(f"unknown model_id: {model_id}")
 
 
@@ -3514,6 +3246,8 @@ def run_proxy_model_suite(
     tensor_path: Path,
     hybrid_tensor_path: Path | None = None,
     model_ids: Sequence[str] = MODEL_IDS,
+    event_features: Sequence[str] | None = None,
+    tree_features: Sequence[str] | None = None,
     mamba_backend: str = "mamba_ssm",
     mamba_seeds: Sequence[int] = (17,),
     tuning_state: TuningState | None = None,
@@ -3525,8 +3259,14 @@ def run_proxy_model_suite(
         raise ValueError("mamba_seeds must include at least one seed")
     predictions = add_benchmark_predictions(frame)
     diagnostics: list[dict[str, object]] = []
-    event_features = event_level_feature_columns(predictions)
-    tree_features = gbdt_feature_columns(predictions)
+    event_features = (
+        list(event_features)
+        if event_features is not None
+        else event_level_feature_columns(predictions)
+    )
+    tree_features = (
+        list(tree_features) if tree_features is not None else gbdt_feature_columns(predictions)
+    )
     active_tuning_state = tuning_state or TuningState()
     for model_id in model_ids:
         if model_id in DETERMINISTIC_MODEL_IDS:
@@ -3573,12 +3313,7 @@ def run_proxy_model_suite(
                 "model_id": model_id,
                 "feature_count": len(
                     tree_features
-                    if model_id in GBDT_MODEL_IDS
-                    or model_id
-                    in {
-                        "lightgbm_with_hybrid_aggregates",
-                        "lightgbm_xgboost_mean_ensemble",
-                    }
+                    if model_id in GBDT_MODEL_IDS or model_id in {"lightgbm_xgboost_mean_ensemble"}
                     else event_features
                 ),
                 **diag,
@@ -3593,7 +3328,6 @@ def model_forecast_columns(frame: pd.DataFrame) -> dict[str, str]:
         *MODEL_IDS,
         *TUNED_TABULAR_MODEL_IDS,
         *SEQUENCE_ENSEMBLE_MODEL_IDS,
-        *PHASE2_SEQUENCE_MODEL_IDS,
     ]:
         column = research_prediction_column(model_id)
         if column in frame.columns:
@@ -3794,12 +3528,12 @@ def write_retired_model_manifest(out_dir: Path) -> Path:
         {
             "retired_model_ids": RETIRED_MAMBA_MODEL_IDS,
             "reason": "in-repo gated-RNN, not official Mamba",
-            "replacement": "mamba_ssm_sequence",
+            "replacement": "mamba_ssm_sequence_5seed",
             "records": [
                 {
                     "model_id": model_id,
                     "reason": "retired_in_repo_gated_rnn_not_official_mamba_ssm",
-                    "replacement": "mamba_ssm_sequence",
+                    "replacement": "mamba_ssm_sequence_5seed",
                     "claim_scope": "retired",
                 }
                 for model_id in RETIRED_MAMBA_MODEL_IDS
@@ -3918,6 +3652,8 @@ def build_common_row_diagnostics(
     *,
     out_dir: Path,
     bootstrap_iter: int = 200,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    tuning_profile: TuningProfile = "tuned_phase1",
 ) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     forecast_columns = model_forecast_columns(predictions)
@@ -3991,8 +3727,8 @@ def build_common_row_diagnostics(
         baseline_col: str | None = None
         for candidate in (
             "forecast_lightgbm_xgboost_mean_ensemble",
-            "forecast_lightgbm",
-            "forecast_xgboost",
+            "forecast_lightgbm_tuned",
+            "forecast_xgboost_tuned",
         ):
             if candidate in group.columns:
                 baseline_col = candidate
@@ -4080,7 +3816,7 @@ def build_common_row_diagnostics(
         non_mamba_candidates = [
             model_id
             for model_id in score_columns
-            if model_id in REAL_SEQUENCE_MODEL_IDS and model_id != "mamba_ssm_sequence"
+            if model_id in REAL_SEQUENCE_MODEL_IDS and model_id != "mamba_ssm_sequence_5seed"
         ]
         non_mamba_auc_values: list[float] = []
         for model_id in non_mamba_candidates:
@@ -4185,15 +3921,29 @@ def build_common_row_diagnostics(
         "clustered_bootstrap_ci": out_dir / "clustered_bootstrap_ci.csv",
         "sequence_model_fit_diagnostics": out_dir / "sequence_model_fit_diagnostics.csv",
     }
-    pd.DataFrame(universe_rows).to_csv(paths["common_row_universe"], index=False)
-    pd.DataFrame(pair_rows).to_csv(paths["common_row_pairwise_metrics"], index=False)
-    pd.DataFrame(incremental_rows).to_csv(paths["incremental_value_diagnostics"], index=False)
-    pd.DataFrame(bootstrap_rows).to_csv(paths["clustered_bootstrap_ci"], index=False)
-    pd.DataFrame(sequence_diag_rows).to_csv(paths["sequence_model_fit_diagnostics"], index=False)
+    for key, rows in {
+        "common_row_universe": universe_rows,
+        "common_row_pairwise_metrics": pair_rows,
+        "incremental_value_diagnostics": incremental_rows,
+        "clustered_bootstrap_ci": bootstrap_rows,
+        "sequence_model_fit_diagnostics": sequence_diag_rows,
+    }.items():
+        frame = pd.DataFrame(rows)
+        if not frame.empty and "feature_schema_version" not in frame.columns:
+            frame.insert(0, "feature_schema_version", feature_schema_version)
+        if not frame.empty and "tuning_profile" not in frame.columns:
+            frame.insert(1, "tuning_profile", tuning_profile)
+        frame.to_csv(paths[key], index=False)
     return {key: str(value) for key, value in paths.items()}
 
 
-def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str, str]:
+def build_metric_tables(
+    predictions: pd.DataFrame,
+    *,
+    out_dir: Path,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    tuning_profile: TuningProfile = "tuned_phase1",
+) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     remove_model_level_csv_artifacts(out_dir)
     forecast_columns = model_forecast_columns(predictions)
@@ -4208,6 +3958,13 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
         if "target_id" in test_all.columns
         else [("day_c2c", test_all)]
     )
+
+    def set_run_column(frame: pd.DataFrame, loc: int, column: str, value: object) -> None:
+        if column in frame.columns:
+            frame[column] = value
+        else:
+            frame.insert(loc, column, value)
+
     for target_id, test in groups:
         target_id = str(target_id)
         for model_id, column in forecast_columns.items():
@@ -4219,6 +3976,8 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
             ) - pd.to_numeric(scored["ivar_event"], errors="coerce")
             forecast_rows.append(
                 {
+                    "feature_schema_version": feature_schema_version,
+                    "tuning_profile": tuning_profile,
                     "target_id": target_id,
                     "model_id": model_id,
                     **forecast_metrics(scored, forecast_col=column),
@@ -4227,12 +3986,20 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
             if "edge_var_realized" in scored:
                 ranking_rows.append(
                     {
+                        "feature_schema_version": feature_schema_version,
+                        "tuning_profile": tuning_profile,
                         "target_id": target_id,
                         "model_id": model_id,
                         **ranking_metrics(scored, score_col=f"score_{model_id}"),
                     }
                 )
-                edge_decile_table(scored, score_col=f"score_{model_id}").to_csv(
+                edge_deciles = edge_decile_table(scored, score_col=f"score_{model_id}")
+                if not edge_deciles.empty:
+                    edge_deciles.insert(0, "feature_schema_version", feature_schema_version)
+                    edge_deciles.insert(1, "tuning_profile", tuning_profile)
+                    edge_deciles.insert(2, "target_id", target_id)
+                    edge_deciles.insert(3, "model_id", model_id)
+                edge_deciles.to_csv(
                     out_dir / f"edge_deciles_{target_id}_{model_id}.csv", index=False
                 )
             strategy_specs = {
@@ -4308,9 +4075,16 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                     strategy["strategy_proxy_kind"] = proxy_kind
                     strategy["pnl_headline_eligible"] = headline_eligible
                     trades = strategy.loc[strategy["should_trade"].astype(bool)].copy()
+                    if not trades.empty:
+                        set_run_column(trades, 0, "feature_schema_version", feature_schema_version)
+                        set_run_column(trades, 1, "tuning_profile", tuning_profile)
+                        set_run_column(trades, 2, "target_id", target_id)
+                        set_run_column(trades, 3, "model_id", model_id)
                     trades.to_csv(out_dir / f"{trade_prefix}_{model_id}.csv", index=False)
                     strategy_rows.append(
                         {
+                            "feature_schema_version": feature_schema_version,
+                            "tuning_profile": tuning_profile,
                             "target_id": target_id,
                             "model_id": model_id,
                             "strategy_proxy_kind": proxy_kind,
@@ -4325,9 +4099,11 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                         multipliers=(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0),
                     )
                     sensitivity.insert(0, "target_id", target_id)
-                    sensitivity.insert(1, "model_id", model_id)
-                    sensitivity.insert(2, "strategy_proxy_kind", proxy_kind)
-                    sensitivity.insert(3, "pnl_headline_eligible", headline_eligible)
+                    sensitivity.insert(0, "tuning_profile", tuning_profile)
+                    sensitivity.insert(0, "feature_schema_version", feature_schema_version)
+                    sensitivity.insert(3, "model_id", model_id)
+                    sensitivity.insert(4, "strategy_proxy_kind", proxy_kind)
+                    sensitivity.insert(5, "pnl_headline_eligible", headline_eligible)
                     cost_rows.append(sensitivity)
                     for breakdown in (
                         "dte_bucket",
@@ -4340,11 +4116,13 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
                     ):
                         if breakdown in trades.columns and not trades.empty:
                             table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
-                            table.insert(0, "target_id", target_id)
-                            table.insert(1, "model_id", model_id)
-                            table.insert(2, "strategy_proxy_kind", proxy_kind)
-                            table.insert(3, "pnl_headline_eligible", headline_eligible)
-                            table.insert(4, "breakdown", breakdown)
+                            table.insert(0, "feature_schema_version", feature_schema_version)
+                            table.insert(1, "tuning_profile", tuning_profile)
+                            table.insert(2, "target_id", target_id)
+                            table.insert(3, "model_id", model_id)
+                            table.insert(4, "strategy_proxy_kind", proxy_kind)
+                            table.insert(5, "pnl_headline_eligible", headline_eligible)
+                            table.insert(6, "breakdown", breakdown)
                             breakdown_frames.append(table)
     forecast_path = out_dir / "forecast_metrics.csv"
     ranking_path = out_dir / "ranking_metrics.csv"
@@ -4361,7 +4139,12 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
         breakdown_path, index=False
     )
     o2c_scale_path = out_dir / "o2c_scale_diagnostic.csv"
-    o2c_scale_diagnostic(predictions).to_csv(o2c_scale_path, index=False)
+    o2c_scale = o2c_scale_diagnostic(predictions)
+    if not o2c_scale.empty and "feature_schema_version" not in o2c_scale.columns:
+        o2c_scale.insert(0, "feature_schema_version", feature_schema_version)
+    if not o2c_scale.empty and "tuning_profile" not in o2c_scale.columns:
+        o2c_scale.insert(1, "tuning_profile", tuning_profile)
+    o2c_scale.to_csv(o2c_scale_path, index=False)
     qlike_frames: list[pd.DataFrame] = []
     extreme_frames: list[pd.DataFrame] = []
     inference_frames: list[pd.DataFrame] = []
@@ -4371,11 +4154,17 @@ def build_metric_tables(predictions: pd.DataFrame, *, out_dir: Path) -> dict[str
         else [("day_c2c", predictions)]
     ):
         qlike_one, extremes_one = qlike_sanity_table(group, forecast_columns=forecast_columns)
-        qlike_one.insert(0, "target_id", str(target_id))
+        qlike_one.insert(0, "feature_schema_version", feature_schema_version)
+        qlike_one.insert(1, "tuning_profile", tuning_profile)
+        qlike_one.insert(2, "target_id", str(target_id))
         if not extremes_one.empty:
-            extremes_one.insert(0, "target_id", str(target_id))
+            extremes_one.insert(0, "feature_schema_version", feature_schema_version)
+            extremes_one.insert(1, "tuning_profile", tuning_profile)
+            extremes_one.insert(2, "target_id", str(target_id))
         inference_one = inference_table(group, forecast_columns=forecast_columns)
-        inference_one.insert(0, "target_id", str(target_id))
+        inference_one.insert(0, "feature_schema_version", feature_schema_version)
+        inference_one.insert(1, "tuning_profile", tuning_profile)
+        inference_one.insert(2, "target_id", str(target_id))
         qlike_frames.append(qlike_one)
         extreme_frames.append(extremes_one)
         inference_frames.append(inference_one)
@@ -4425,19 +4214,13 @@ def write_research_figures(
         "last_four_rvar": "Last-four RVAR",
         "last_four_ivar": "Last-four IVAR",
         "goyal_saretto_rv_iv_spread": "Goyal-Saretto spread",
-        "linear_elastic_net": "Elastic Net",
-        "linear_elastic_net_tuned": "Elastic Net tuned",
-        "lightgbm": "LightGBM",
-        "lightgbm_tuned": "LightGBM tuned",
-        "xgboost": "XGBoost",
-        "xgboost_tuned": "XGBoost tuned",
+        "linear_elastic_net_tuned": "Elastic Net",
+        "lightgbm_tuned": "LightGBM",
+        "xgboost_tuned": "XGBoost",
         "lightgbm_xgboost_mean_ensemble": "LightGBM/XGBoost ensemble",
         "ft_transformer": "FT-Transformer",
-        "ft_transformer_tuned": "FT-Transformer tuned",
         "ridge_flat_aggregates_sequence": "Ridge-flat sequence",
-        "bigru_sequence": "BiGRU sequence",
         "bigru_sequence_5seed": "BiGRU 5-seed",
-        "mamba_ssm_sequence": "Official mamba-ssm",
         "mamba_ssm_sequence_5seed": "Official mamba-ssm 5-seed",
         "mask_only_sequence": "Mask-only sequence",
         "time_shuffle_sequence": "Time-shuffle sequence",
@@ -4463,18 +4246,12 @@ def write_research_figures(
         "last_four_rvar": "Benchmarks",
         "last_four_ivar": "Benchmarks",
         "goyal_saretto_rv_iv_spread": "Benchmarks",
-        "linear_elastic_net": "Tabular ML",
         "linear_elastic_net_tuned": "Tabular ML",
-        "lightgbm": "Tabular ML",
         "lightgbm_tuned": "Tabular ML",
-        "xgboost": "Tabular ML",
         "xgboost_tuned": "Tabular ML",
         "lightgbm_xgboost_mean_ensemble": "Tabular ML",
         "ft_transformer": "Deep/sequence",
-        "ft_transformer_tuned": "Deep/sequence",
-        "bigru_sequence": "Deep/sequence",
         "bigru_sequence_5seed": "Deep/sequence",
-        "mamba_ssm_sequence": "Deep/sequence",
         "mamba_ssm_sequence_5seed": "Deep/sequence",
         "ridge_flat_aggregates_sequence": "Sequence controls",
         "mask_only_sequence": "Sequence controls",
@@ -4488,18 +4265,12 @@ def write_research_figures(
                 "last_four_rvar",
                 "last_four_ivar",
                 "goyal_saretto_rv_iv_spread",
-                "linear_elastic_net",
                 "linear_elastic_net_tuned",
-                "lightgbm",
                 "lightgbm_tuned",
-                "xgboost",
                 "xgboost_tuned",
                 "lightgbm_xgboost_mean_ensemble",
                 "ft_transformer",
-                "ft_transformer_tuned",
-                "bigru_sequence",
                 "bigru_sequence_5seed",
-                "mamba_ssm_sequence",
                 "mamba_ssm_sequence_5seed",
                 "ridge_flat_aggregates_sequence",
                 "mask_only_sequence",
@@ -4512,13 +4283,13 @@ def write_research_figures(
         "last_four_rvar": "#9467bd",
         "last_four_ivar": "#8c564b",
         "goyal_saretto_rv_iv_spread": "#17becf",
-        "linear_elastic_net": "#1f77b4",
-        "lightgbm": "#2ca02c",
-        "xgboost": "#ff7f0e",
+        "linear_elastic_net_tuned": "#1f77b4",
+        "lightgbm_tuned": "#2ca02c",
+        "xgboost_tuned": "#ff7f0e",
         "lightgbm_xgboost_mean_ensemble": "#111827",
         "ft_transformer": "#9467bd",
-        "bigru_sequence": "#d62728",
-        "mamba_ssm_sequence": "#17becf",
+        "bigru_sequence_5seed": "#d62728",
+        "mamba_ssm_sequence_5seed": "#17becf",
         "ridge_flat_aggregates_sequence": "#4b5563",
         "mask_only_sequence": "#8c564b",
         "time_shuffle_sequence": "#bcbd22",
@@ -4528,12 +4299,7 @@ def write_research_figures(
         return model_plot_groups.get(str(model_id), "Other")
 
     def model_plot_family(model_id: object) -> str:
-        raw = str(model_id)
-        if raw.endswith("_tuned"):
-            return raw.removesuffix("_tuned")
-        if raw.endswith("_5seed"):
-            return raw.removesuffix("_5seed")
-        return raw
+        return str(model_id)
 
     def model_plot_style(model_id: object) -> dict[str, object]:
         raw = str(model_id)
@@ -4865,25 +4631,22 @@ def write_proxy_research_report(
         if tuning_selected_path.exists()
         else {}
     )
-    tuning_profile = str(tuning_selected.get("tuning_profile", "untuned"))
+    tuning_profile = str(tuning_selected.get("tuning_profile", "tuned_phase1"))
+    tuning_profile_display = (
+        "canonical tuned protocol" if tuning_profile == "tuned_phase1" else tuning_profile
+    )
     selected_models = [
         "market_implied_event_variance",
         "last_four_rvar",
         "last_four_ivar",
         "goyal_saretto_rv_iv_spread",
-        "linear_elastic_net",
         "linear_elastic_net_tuned",
-        "lightgbm",
         "lightgbm_tuned",
-        "xgboost",
         "xgboost_tuned",
         "lightgbm_xgboost_mean_ensemble",
         "ft_transformer",
-        "ft_transformer_tuned",
         "ridge_flat_aggregates_sequence",
-        "bigru_sequence",
         "bigru_sequence_5seed",
-        "mamba_ssm_sequence",
         "mamba_ssm_sequence_5seed",
         "mask_only_sequence",
         "time_shuffle_sequence",
@@ -4982,15 +4745,39 @@ def write_proxy_research_report(
     else:
         summary = pd.DataFrame()
 
+    model_display_labels = {
+        "market_implied_event_variance": "Market IVAR",
+        "last_four_rvar": "Last-four RVAR",
+        "last_four_ivar": "Last-four IVAR",
+        "goyal_saretto_rv_iv_spread": "Goyal-Saretto spread",
+        "linear_elastic_net_tuned": "Elastic Net",
+        "lightgbm_tuned": "LightGBM",
+        "xgboost_tuned": "XGBoost",
+        "lightgbm_xgboost_mean_ensemble": "LightGBM/XGBoost ensemble",
+        "ft_transformer": "FT-Transformer",
+        "ridge_flat_aggregates_sequence": "Ridge-flat sequence",
+        "bigru_sequence_5seed": "BiGRU 5-seed",
+        "mamba_ssm_sequence_5seed": "Official mamba-ssm 5-seed",
+        "mask_only_sequence": "Mask-only sequence",
+        "time_shuffle_sequence": "Time-shuffle sequence",
+        "attention_pooling_sequence": "Attention pooling",
+        "dilated_cnn_sequence": "Dilated CNN",
+    }
+
     def _markdown_table(frame: pd.DataFrame, empty_message: str) -> str:
         if frame.empty:
             return empty_message
         clean = frame.copy().astype(object)
+        for column in ("model_id", "model_a", "model_b"):
+            if column in clean.columns:
+                clean[column] = clean[column].map(
+                    lambda value: model_display_labels.get(str(value), value)
+                )
         clean = clean.where(pd.notna(clean), "n/a")
         return str(clean.to_markdown(index=False))
 
     def _label(model_id: object) -> str:
-        return str(model_id).replace("_", " ")
+        return model_display_labels.get(str(model_id), str(model_id).replace("_", " "))
 
     def _value(frame: pd.DataFrame, model_id: str, metric: str) -> float | None:
         if frame.empty or metric not in frame.columns or "model_id" not in frame.columns:
@@ -5063,7 +4850,7 @@ def write_proxy_research_report(
         else predictions.copy()
     )
     if not sequence_target.empty and {
-        "forecast_mamba_ssm_sequence",
+        "forecast_mamba_ssm_sequence_5seed",
         "forecast_mask_only_sequence",
         "rvar_event",
         "split",
@@ -5071,33 +4858,33 @@ def write_proxy_research_report(
         sequence_frame = sequence_target.loc[
             sequence_target["split"].eq("test"),
             [
-                "forecast_mamba_ssm_sequence",
+                "forecast_mamba_ssm_sequence_5seed",
                 "forecast_mask_only_sequence",
                 "rvar_event",
             ],
         ].dropna()
         if not sequence_frame.empty:
-            corr = sequence_frame["forecast_mamba_ssm_sequence"].corr(
+            corr = sequence_frame["forecast_mamba_ssm_sequence_5seed"].corr(
                 sequence_frame["forecast_mask_only_sequence"]
             )
             mean_abs_diff = (
                 (
-                    sequence_frame["forecast_mamba_ssm_sequence"]
+                    sequence_frame["forecast_mamba_ssm_sequence_5seed"]
                     - sequence_frame["forecast_mask_only_sequence"]
                 )
                 .abs()
                 .mean()
             )
-            sequence_target_corr = sequence_frame["forecast_mamba_ssm_sequence"].corr(
+            sequence_target_corr = sequence_frame["forecast_mamba_ssm_sequence_5seed"].corr(
                 sequence_frame["rvar_event"]
             )
             mask_target_corr = sequence_frame["forecast_mask_only_sequence"].corr(
                 sequence_frame["rvar_event"]
             )
             sequence_note = (
-                "On common C2O test rows, official mamba-ssm sequence and mask-only "
+                "On common C2O test rows, official mamba-ssm 5-seed sequence and mask-only "
                 f"sequence forecasts have correlation {corr:.3f}; their mean absolute "
-                f"forecast difference is {mean_abs_diff:.4f}. The mamba-ssm sequence "
+                f"forecast difference is {mean_abs_diff:.4f}. The mamba-ssm 5-seed sequence "
                 "forecast has correlation "
                 f"{sequence_target_corr:.3f} with realized `jump_c2o` variance, versus "
                 f"{mask_target_corr:.3f} for the mask-only ablation."
@@ -5119,9 +4906,9 @@ def write_proxy_research_report(
         "top_1pct_qlike_contribution_share",
         higher_is_better=True,
     )
-    mamba_auc = _value(ranking_main, "mamba_ssm_sequence", "auc")
+    mamba_auc = _value(ranking_main, "mamba_ssm_sequence_5seed", "auc")
     mask_auc = _value(ranking_main, "mask_only_sequence", "auc")
-    mamba_net = _value(strategy_main, "mamba_ssm_sequence", "net_pnl_usd")
+    mamba_net = _value(strategy_main, "mamba_ssm_sequence_5seed", "net_pnl_usd")
     mask_net = _value(strategy_main, "mask_only_sequence", "net_pnl_usd")
     sequence_drop_rate = float(sequence_report.get("drop_rate", 0.0))
     if best_auc and best_top_decile:
@@ -5150,13 +4937,9 @@ def write_proxy_research_report(
             .astype(str)
             .isin(
                 [
-                    "lightgbm",
                     "lightgbm_tuned",
-                    "xgboost",
                     "xgboost_tuned",
-                    "linear_elastic_net",
                     "linear_elastic_net_tuned",
-                    "mamba_ssm_sequence",
                     "mamba_ssm_sequence_5seed",
                 ]
             )
@@ -5285,6 +5068,13 @@ def write_proxy_research_report(
                 if column in diagnostics_snapshot.columns
             ]
         ]
+        if "tuning_profile" in diagnostics_snapshot.columns:
+            diagnostics_snapshot["tuning_profile"] = diagnostics_snapshot["tuning_profile"].map(
+                lambda value: "canonical tuned protocol" if str(value) == "tuned_phase1" else value
+            )
+            diagnostics_snapshot = diagnostics_snapshot.rename(
+                columns={"tuning_profile": "tuning_protocol"}
+            )
 
     lines = [
         "# Earnings Event Variance Mispricing",
@@ -5298,9 +5088,10 @@ def write_proxy_research_report(
         "",
         "This is a proxy-stage report based on no_nbbo_trade_proxy data.",
         "Results are not paper-grade execution evidence.",
-        f"Tuning profile: `{tuning_profile}`. Tuned rows, when present, use train/validation "
-        "selection only; locked test metrics are excluded from tuning artifacts and are "
-        "evaluated once after train+validation refit.",
+        f"Tuning protocol: {tuning_profile_display}. This is the canonical tuned-only model "
+        "suite. Hyperparameter selection uses train/validation rows only; locked test "
+        "metrics are excluded from tuning artifacts and are evaluated once after "
+        "train+validation refit.",
         "The sequence diagnostics use pre-entry proxy-surface paths, including a "
         "31-step hybrid tensor with 19 daily steps plus 12 entry-day five-minute "
         "trade-aggregate proxy bins. They are not trained on NBBO-mid IV surfaces.",
@@ -5361,14 +5152,15 @@ def write_proxy_research_report(
             "Goyal-Saretto-style RV-IV spread."
         ),
         (
-            "- Tabular models: Elastic Net, LightGBM, XGBoost, a simple GBDT ensemble, "
-            "and FT-Transformer use event-level features; GBDT models also receive "
-            "sequence aggregates."
+            "- Tabular models: tuned Elastic Net, tuned LightGBM, tuned XGBoost, a "
+            "tuned GBDT ensemble, and validation-tuned FT-Transformer use event-level "
+            "features; GBDT models also receive sequence aggregates."
         ),
         (
             f"- Sequence diagnostics use a 31 x {len(HYBRID_SEQUENCE_FEATURE_NAMES)} "
-            "mixed-clock hybrid tensor. Ridge-flat, BiGRU, official mamba-ssm, "
-            "mask-only, and time-shuffle are the phase-1 diagnostic suite."
+            "mixed-clock hybrid tensor. Ridge-flat, BiGRU 5-seed, official mamba-ssm "
+            "5-seed, attention pooling, non-causal dilated CNN, mask-only, and "
+            "time-shuffle are the full sequence diagnostic suite."
         ),
         (
             "- Sequence neural losses combine Huber loss on `log(RVAR_event)` with "
@@ -5537,7 +5329,7 @@ def write_proxy_research_report(
             "### O2C Post-Open Diagnostic Proxy PnL",
             "",
             (
-                "`reaction_o2c` is now modeled in Phase 1 as a diagnostic target. "
+                "`reaction_o2c` is included in the full diagnostic target set. "
                 "Its realized variance is post-open only, while `IVAR_event` is a "
                 "full-event implied-variance comparator; this makes O2C evidence "
                 "suitable for ranking and directional diagnostics, not level-calibrated "
@@ -5690,8 +5482,8 @@ def write_proxy_research_report(
         lines,
         [
             (
-                "The snapshot keeps the main tabular contenders and official mamba-ssm at "
-                "multipliers 0, 1, 3, and 5."
+                "The snapshot keeps the main tuned tabular contenders and official "
+                "mamba-ssm 5-seed at multipliers 0, 1, 3, and 5."
             ),
             (
                 "Use this as a stress-test table rather than an execution-cost estimate; "
@@ -5723,9 +5515,9 @@ def write_proxy_research_report(
         lines,
         [
             (
-                f"Official mamba-ssm `jump_c2o` AUC is {_fmt(mamba_auc)} versus mask-only "
-                f"AUC {_fmt(mask_auc)}; `day_c2c` net PnL is {_fmt(mamba_net, money=True)} versus "
-                f"{_fmt(mask_net, money=True)}."
+                f"Official mamba-ssm 5-seed `jump_c2o` AUC is {_fmt(mamba_auc)} versus "
+                f"mask-only AUC {_fmt(mask_auc)}; `day_c2c` net PnL is "
+                f"{_fmt(mamba_net, money=True)} versus {_fmt(mask_net, money=True)}."
             ),
             "Sequence models are diagnostic-grade unless they pass common-row, bootstrap, "
             "simple-sequence-baseline, and premium-space economics gates.",
@@ -5828,6 +5620,233 @@ def build_base_feature_matrix(config: ProjectConfig) -> pd.DataFrame:
     return build_model_feature_matrix(panel, straddle_diagnostics=straddles)
 
 
+NORMALIZED_FEATURE_BASE_COLUMNS = [
+    "ivar_event",
+    "forecast_goyal_saretto_rv_iv_spread",
+    "patell_wolfson_prior_rv_iv_spread",
+    "patell_wolfson_iv_runup_proxy",
+    "liquidity_rank_score",
+    "entry_premium_usd",
+    "proxy_cost_usd",
+    "estimated_transaction_cost_usd",
+    "hybrid_feature_mask_density",
+    "valid_sequence_days",
+    "intraday_valid_bin_count",
+    "seqagg_surface_missing_rate_last",
+    "seqagg_surface_missing_rate_mean",
+    "seqagg_straddle_premium_to_spot_last",
+    "prior_day_c2c_rv_iv_spread_median",
+    "prior_jump_c2o_rv_iv_spread_median",
+]
+
+
+def _read_sec_companyfacts(config: ProjectConfig) -> pd.DataFrame:
+    path = config.silver_data_dir / "sec" / "companyfacts.parquet"
+    if not path.exists() or path.stat().st_size <= 0:
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def _ratio_or_nan(numerator: float | None, denominator: float | None) -> float:
+    if numerator is None or denominator is None or abs(denominator) <= 1e-12:
+        return float(np.nan)
+    return float(numerator / denominator)
+
+
+def _latest_xbrl_values_for_event(facts: pd.DataFrame, event: pd.Series) -> dict[str, object]:
+    ticker = str(event.get("ticker") or "").upper()
+    if not ticker or facts.empty:
+        return {}
+    asof_ts = pd.to_datetime(event.get("feature_asof_timestamp"), errors="coerce", utc=True)
+    if pd.isna(asof_ts):
+        asof_ts = pd.to_datetime(event.get("event_entry_timestamp"), errors="coerce", utc=True)
+    asof_date = asof_ts.date() if not pd.isna(asof_ts) else pd.NaT
+    frame = facts.loc[facts["ticker"].astype(str).str.upper().eq(ticker)].copy()
+    if frame.empty:
+        return {}
+    filed_raw = frame["filed"] if "filed" in frame.columns else pd.Series(pd.NaT, index=frame.index)
+    frame["filed_date"] = pd.to_datetime(filed_raw, errors="coerce").dt.date
+    acceptance_raw = (
+        frame["acceptance_datetime"]
+        if "acceptance_datetime" in frame.columns
+        else pd.Series(pd.NaT, index=frame.index)
+    )
+    frame["acceptance_ts"] = pd.to_datetime(acceptance_raw, errors="coerce", utc=True)
+    has_acceptance = frame["acceptance_ts"].notna()
+    allowed_by_acceptance = has_acceptance & frame["acceptance_ts"].le(asof_ts)
+    allowed_by_filed = (
+        ~has_acceptance
+        & frame["filed_date"].notna()
+        & frame["filed_date"].map(lambda value: value < asof_date if pd.notna(asof_date) else False)
+    )
+    dropped_same_day_filed = (
+        ~has_acceptance
+        & frame["filed_date"].notna()
+        & frame["filed_date"].map(
+            lambda value: value == asof_date if pd.notna(asof_date) else False
+        )
+    )
+    eligible = frame.loc[allowed_by_acceptance | allowed_by_filed].copy()
+    if eligible.empty:
+        return {
+            "xbrl_available": False,
+            "xbrl_fact_coverage_count": 0,
+            "xbrl_fallback_filed_rows": int(allowed_by_filed.sum()),
+            "xbrl_mapped_acceptance_rows": int(allowed_by_acceptance.sum()),
+            "xbrl_dropped_same_day_filed_rows": int(dropped_same_day_filed.sum()),
+        }
+    eligible["sort_ts"] = eligible["acceptance_ts"]
+    eligible.loc[eligible["sort_ts"].isna(), "sort_ts"] = pd.to_datetime(
+        eligible.loc[eligible["sort_ts"].isna(), "filed_date"], errors="coerce", utc=True
+    )
+    latest: dict[str, float] = {}
+    yoy: dict[str, float] = {}
+    for concept, group in eligible.dropna(subset=["feature_concept"]).groupby("feature_concept"):
+        clean = group.dropna(subset=["val"]).sort_values(["sort_ts", "end"])
+        if clean.empty:
+            continue
+        values = pd.to_numeric(clean["val"], errors="coerce").dropna()
+        if values.empty:
+            continue
+        latest[str(concept)] = float(values.iloc[-1])
+        if len(values) >= 2 and abs(float(values.iloc[-2])) > 1e-12:
+            yoy[str(concept)] = float(values.iloc[-1] / values.iloc[-2] - 1.0)
+    assets = latest.get("assets")
+    liabilities = latest.get("liabilities")
+    cash = latest.get("cash")
+    current_assets = latest.get("current_assets")
+    current_liabilities = latest.get("current_liabilities")
+    revenue = latest.get("revenue")
+    net_income = latest.get("net_income")
+    operating_income = latest.get("operating_income")
+    latest_sort = eligible["sort_ts"].dropna().max()
+    freshness_days = (
+        float((asof_ts - latest_sort).total_seconds() / 86400.0)
+        if not pd.isna(asof_ts) and pd.notna(latest_sort)
+        else np.nan
+    )
+    return {
+        "xbrl_available": True,
+        "xbrl_log_assets": math.log1p(max(assets, 0.0)) if assets is not None else np.nan,
+        "xbrl_log_revenue": math.log1p(max(revenue, 0.0)) if revenue is not None else np.nan,
+        "xbrl_cash_to_assets": _ratio_or_nan(cash, assets),
+        "xbrl_liabilities_to_assets": _ratio_or_nan(liabilities, assets),
+        "xbrl_current_ratio": _ratio_or_nan(current_assets, current_liabilities),
+        "xbrl_roa": _ratio_or_nan(net_income, assets),
+        "xbrl_operating_margin": _ratio_or_nan(operating_income, revenue),
+        "xbrl_revenue_yoy_growth": yoy.get("revenue", np.nan),
+        "xbrl_net_income_yoy_growth": yoy.get("net_income", np.nan),
+        "xbrl_fact_freshness_days": freshness_days,
+        "xbrl_fact_coverage_count": int(eligible["feature_concept"].nunique()),
+        "xbrl_fallback_filed_rows": int((eligible["acceptance_ts"].isna()).sum()),
+        "xbrl_mapped_acceptance_rows": int((eligible["acceptance_ts"].notna()).sum()),
+        "xbrl_dropped_same_day_filed_rows": int(dropped_same_day_filed.sum()),
+    }
+
+
+def merge_sec_xbrl_features(features: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    facts = _read_sec_companyfacts(config)
+    out = features.copy()
+    if facts.empty:
+        out["xbrl_available"] = False
+        out["xbrl_fact_coverage_count"] = 0
+        out["xbrl_dropped_same_day_filed_rows"] = 0
+        return out
+    records = [_latest_xbrl_values_for_event(facts, row) for _, row in out.iterrows()]
+    xbrl = pd.DataFrame(records, index=out.index)
+    if xbrl.empty:
+        out["xbrl_available"] = False
+        out["xbrl_fact_coverage_count"] = 0
+        out["xbrl_dropped_same_day_filed_rows"] = 0
+        return out
+    for column in xbrl.columns:
+        out[column] = xbrl[column]
+    out["xbrl_available"] = out["xbrl_available"].fillna(False).astype(bool)
+    out["xbrl_fact_coverage_count"] = pd.to_numeric(
+        out["xbrl_fact_coverage_count"], errors="coerce"
+    ).fillna(0)
+    if "xbrl_dropped_same_day_filed_rows" not in out.columns:
+        out["xbrl_dropped_same_day_filed_rows"] = 0
+    out["xbrl_dropped_same_day_filed_rows"] = pd.to_numeric(
+        out["xbrl_dropped_same_day_filed_rows"], errors="coerce"
+    ).fillna(0)
+    return out
+
+
+def build_runup_surface_proxy_features(long_rows: pd.DataFrame) -> pd.DataFrame:
+    if long_rows.empty or "event_id" not in long_rows:
+        return pd.DataFrame(columns=["event_id"])
+    base_features = [
+        "atm_iv_proxy",
+        "event_ivar_proxy",
+        "iv_skew_proxy",
+        "iv_butterfly_proxy",
+        "straddle_premium_to_spot",
+        "option_volume_sum",
+        "option_transactions_sum",
+        "surface_missing_rate",
+    ]
+    rows: list[dict[str, object]] = []
+
+    def _latest_numeric(frame: pd.DataFrame, column: str) -> float:
+        if column not in frame.columns:
+            return np.nan
+        values = pd.to_numeric(frame[column], errors="coerce")
+        return float(values.iloc[0]) if len(values) else np.nan
+
+    for event_id, group in long_rows.sort_values("seq_index").groupby("event_id", dropna=False):
+        record: dict[str, object] = {"event_id": event_id}
+        ordered = group.sort_values("seq_index")
+        for window in (1, 3, 5, 10):
+            tail = ordered.tail(window)
+            prior = ordered.iloc[: max(0, len(ordered) - window)]
+            for feature in base_features:
+                if feature not in tail:
+                    continue
+                values = pd.to_numeric(tail[feature], errors="coerce").dropna()
+                prefix = f"runup_{window}d_{feature}"
+                record[f"{prefix}_mean_proxy"] = float(values.mean()) if len(values) else np.nan
+                record[f"{prefix}_delta_proxy"] = (
+                    float(values.iloc[-1] - values.iloc[0]) if len(values) > 1 else np.nan
+                )
+                if len(values) > 1:
+                    record[f"{prefix}_slope_proxy"] = float(
+                        np.polyfit(np.arange(len(values), dtype=float), values.to_numpy(), deg=1)[0]
+                    )
+                else:
+                    record[f"{prefix}_slope_proxy"] = np.nan
+                if feature in {"option_volume_sum", "option_transactions_sum"} and not prior.empty:
+                    prior_values = pd.to_numeric(prior[feature], errors="coerce").dropna()
+                    prior_mean = float(prior_values.mean()) if len(prior_values) else np.nan
+                    record[f"{prefix}_abnormal_proxy"] = (
+                        float(values.mean() / prior_mean - 1.0)
+                        if len(values) and np.isfinite(prior_mean) and abs(prior_mean) > 1e-12
+                        else np.nan
+                    )
+        latest = ordered.tail(1)
+        if not latest.empty:
+            atm = _latest_numeric(latest, "atm_iv_proxy")
+            skew = _latest_numeric(latest, "iv_skew_proxy")
+            butterfly = _latest_numeric(latest, "iv_butterfly_proxy")
+            missing = _latest_numeric(latest, "surface_missing_rate")
+            denom = max(abs(atm), FORECAST_FLOOR) if np.isfinite(atm) else np.nan
+            record["delta_grid_proxy_coverage"] = (
+                float(1.0 - missing) if np.isfinite(missing) else np.nan
+            )
+            record["delta_grid_proxy_left_right_slope"] = skew
+            record["delta_grid_proxy_curvature"] = butterfly
+            record["rnd_proxy_tail_asymmetry"] = (
+                float(skew / denom) if np.isfinite(skew) and np.isfinite(denom) else np.nan
+            )
+            record["rnd_proxy_concavity"] = (
+                float(butterfly / denom)
+                if np.isfinite(butterfly) and np.isfinite(denom)
+                else np.nan
+            )
+        rows.append(record)
+    return pd.DataFrame(rows)
+
+
 def run_research_sequence_audit(config: ProjectConfig) -> ProxyResearchResult:
     paths = research_paths(config)
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -5869,7 +5888,9 @@ def run_research_features(
     *,
     split_design: str = "chronological_proxy_70_15_15",
     split_date: str | None = None,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
 ) -> ProxyResearchResult:
+    feature_schema_version = validate_feature_schema_version(feature_schema_version)
     paths = research_paths(config)
     base = build_base_feature_matrix(config)
     long_rows, by_event, report = build_option_surface_sequence_long(base, config=config)
@@ -5887,6 +5908,9 @@ def run_research_features(
         split_design=split_design,
         split_date=split_date,
     )
+    runup = build_runup_surface_proxy_features(long_rows)
+    if not runup.empty:
+        features = features.merge(runup, on="event_id", how="left")
     features["hybrid_sequence_too_sparse"] = bool(hybrid_report.get("hybrid_sequence_too_sparse"))
     market_covariates = _read_market_covariates(config)
     if not market_covariates.empty and "entry_date" in features.columns:
@@ -5903,6 +5927,7 @@ def run_research_features(
         features = features.drop(
             columns=[column for column in _vix_columns_for_merge() if column in features.columns]
         ).merge(vix_features[merge_columns], on="event_id", how="left")
+    features = merge_sec_xbrl_features(features, config)
     market_second = _read_market_second_covariates(config)
     market_second_columns = 0
     if not market_second.empty and "event_id" in market_second.columns:
@@ -5926,11 +5951,49 @@ def run_research_features(
             labels=["high", "mid", "low"],
             duplicates="drop",
         ).astype(str)
+    features["feature_schema_version"] = feature_schema_version
+    normalized_columns = [
+        column for column in NORMALIZED_FEATURE_BASE_COLUMNS if column in features.columns
+    ]
+    if feature_schema_version == FEATURE_SCHEMA_V2_SEC_XBRL:
+        features, transform_params = add_train_fit_normalized_features(
+            features,
+            columns=normalized_columns,
+            feature_schema_version=feature_schema_version,
+            fit_split="train",
+        )
+        transform_params["validation_tuning"] = {
+            "fit_split": "train",
+            "materialized": True,
+            "columns": transform_params.get("columns", {}),
+        }
+        transform_params["locked_test_refit"] = normalization_params_only(
+            features,
+            columns=normalized_columns,
+            feature_schema_version=feature_schema_version,
+            fit_split="train_validation",
+        )
+    else:
+        transform_params = {
+            "feature_schema_version": feature_schema_version,
+            "fit_split": "none",
+            "columns": {},
+            "test_distribution_used": False,
+        }
+    feature_schema_report = build_feature_schema_report(
+        features,
+        feature_schema_version=feature_schema_version,
+    )
     paths.sequence_long_path.parent.mkdir(parents=True, exist_ok=True)
     paths.feature_matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
     long_rows.to_parquet(paths.sequence_long_path, index=False)
     hybrid_long.to_parquet(paths.hybrid_sequence_long_path, index=False)
     features.to_parquet(paths.feature_matrix_path, index=False)
+    feature_schema_report_path = paths.modeling_artifacts_dir / "feature_schema_report.csv"
+    feature_transform_params_path = paths.modeling_artifacts_dir / "feature_transform_params.json"
+    feature_schema_report.to_csv(feature_schema_report_path, index=False)
+    write_json(feature_transform_params_path, transform_params)
     tensor_report = build_sequence_tensor(long_rows, features, out_path=paths.sequence_tensor_path)
     hybrid_tensor_report = build_sequence_tensor(
         hybrid_long,
@@ -5974,6 +6037,8 @@ def run_research_features(
             "hybrid_sequence_tensor": str(paths.hybrid_sequence_tensor_path),
             "hybrid_sequence_tensor_v2": str(paths.hybrid_sequence_tensor_v2_path),
             "feature_matrix": str(paths.feature_matrix_path),
+            "feature_schema_report": str(feature_schema_report_path),
+            "feature_transform_params": str(feature_transform_params_path),
             "sequence_v2_quality": str(sequence_quality_path),
             "sequence_coverage_by_event": str(
                 paths.modeling_artifacts_dir / "sequence_coverage_by_event.csv"
@@ -5999,6 +6064,8 @@ def run_research_features(
             "hybrid_tensor": hybrid_tensor_report,
             "hybrid_tensor_v2": hybrid_tensor_v2_report,
             "feature_rows": int(len(features)),
+            "feature_schema_version": feature_schema_version,
+            "model_feature_count": int(feature_schema_report["model_feature"].sum()),
             "market_second_covariate_columns": int(market_second_columns),
         },
     )
@@ -6007,31 +6074,28 @@ def run_research_features(
 def _model_ids_for_sequence_suite(
     sequence_suite: str,
     *,
-    tuning_profile: TuningProfile = "untuned",
+    tuning_profile: TuningProfile = "tuned_phase1",
 ) -> list[str]:
     if sequence_suite == "none":
         model_ids = [model_id for model_id in MODEL_IDS if model_id not in SEQUENCE_MODEL_IDS]
-    elif sequence_suite == "phase1":
+    elif sequence_suite == "all":
         model_ids = MODEL_IDS.copy()
-    elif sequence_suite == "phase2":
-        model_ids = [*MODEL_IDS, *PHASE2_SEQUENCE_MODEL_IDS]
     else:
         raise ValueError(f"unsupported sequence_suite: {sequence_suite}")
-    if tuning_profile == "tuned_phase1":
-        model_ids = [*model_ids, *TUNED_TABULAR_MODEL_IDS]
-        if sequence_suite != "none":
-            model_ids = [*model_ids, *SEQUENCE_ENSEMBLE_MODEL_IDS]
+    _ = tuning_profile
     return model_ids
 
 
 def _target_ids_for_sequence_suite(sequence_suite: str) -> list[str]:
-    return PHASE2_TARGET_IDS if sequence_suite == "phase2" else PHASE1_TARGET_IDS
+    _ = sequence_suite
+    return TARGET_IDS.copy()
 
 
 def _write_tuning_artifacts(
     out_dir: Path,
     *,
     tuning_state: TuningState,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
 ) -> dict[str, str]:
     trials_path = out_dir / "tuning_trials.csv"
     selected_path = out_dir / "tuning_selected_params.json"
@@ -6049,12 +6113,16 @@ def _write_tuning_artifacts(
         "validation_top_decile_precision",
         "objective_value",
     ]
-    pd.DataFrame(tuning_state.trials, columns=trial_columns).to_csv(trials_path, index=False)
+    trials = pd.DataFrame(tuning_state.trials, columns=trial_columns)
+    trials.insert(0, "feature_schema_version", feature_schema_version)
+    trials.insert(1, "tuning_profile", tuning_state.profile)
+    trials.to_csv(trials_path, index=False)
     write_json(
         selected_path,
         {
             "tuning_profile": tuning_state.profile,
             "tuning_seed": tuning_state.seed,
+            "feature_schema_version": feature_schema_version,
             "selection_target_id": TUNING_SELECTION_TARGET_ID,
             "test_metrics_used_for_selection": False,
             "selected_params": tuning_state.selected,
@@ -6069,16 +6137,47 @@ def _write_tuning_artifacts(
 def run_research_models(
     config: ProjectConfig,
     *,
-    sequence_suite: str = "phase1",
+    sequence_suite: str = "all",
     mamba_backend: str = "mamba_ssm",
     mamba_seeds: Sequence[int] = (17,),
     bootstrap_iter: int = 200,
-    tuning_profile: TuningProfile = "untuned",
+    tuning_profile: TuningProfile = "tuned_phase1",
     tuning_seed: int = 17,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
 ) -> ProxyResearchResult:
+    feature_schema_version = validate_feature_schema_version(feature_schema_version)
     paths = research_paths(config)
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
     features = read_table(paths.feature_matrix_path)
+    schema_path = paths.modeling_artifacts_dir / "feature_schema_report.csv"
+    if schema_path.exists():
+        schema_report = pd.read_csv(schema_path)
+        if "feature_schema_version" in schema_report:
+            schema_report = schema_report.loc[
+                schema_report["feature_schema_version"].astype(str).eq(feature_schema_version)
+            ].copy()
+        if schema_report.empty:
+            schema_report = build_feature_schema_report(
+                features,
+                feature_schema_version=feature_schema_version,
+            )
+            schema_report.to_csv(schema_path, index=False)
+    else:
+        schema_report = build_feature_schema_report(
+            features,
+            feature_schema_version=feature_schema_version,
+        )
+        schema_report.to_csv(schema_path, index=False)
+    tree_features = feature_columns_from_schema_report(
+        schema_report,
+        frame=features,
+        include_sequence_aggregates=True,
+    )
+    event_features = feature_columns_from_schema_report(
+        schema_report,
+        frame=features,
+        include_sequence_aggregates=False,
+    )
     prediction_frames: list[pd.DataFrame] = []
     diagnostic_frames: list[pd.DataFrame] = []
     available_targets = available_target_columns(features)
@@ -6097,13 +6196,17 @@ def run_research_models(
             tensor_path=paths.sequence_tensor_path,
             hybrid_tensor_path=paths.hybrid_sequence_tensor_v2_path,
             model_ids=model_ids,
+            event_features=event_features,
+            tree_features=tree_features,
             mamba_backend=mamba_backend,
             mamba_seeds=mamba_seeds,
             tuning_state=tuning_state,
             target_id=target_id,
         )
         predictions_one["target_id"] = target_id
+        predictions_one["feature_schema_version"] = feature_schema_version
         diagnostics_one["target_id"] = target_id
+        diagnostics_one["feature_schema_version"] = feature_schema_version
         prediction_frames.append(predictions_one)
         diagnostic_frames.append(diagnostics_one)
     if not prediction_frames:
@@ -6119,13 +6222,28 @@ def run_research_models(
         "model_fit_diagnostics": str(diagnostics_path),
         "retired_model_ids": str(write_retired_model_manifest(paths.modeling_artifacts_dir)),
     }
-    outputs.update(_write_tuning_artifacts(paths.modeling_artifacts_dir, tuning_state=tuning_state))
-    outputs.update(build_metric_tables(predictions, out_dir=paths.modeling_artifacts_dir))
+    outputs.update(
+        _write_tuning_artifacts(
+            paths.modeling_artifacts_dir,
+            tuning_state=tuning_state,
+            feature_schema_version=feature_schema_version,
+        )
+    )
+    outputs.update(
+        build_metric_tables(
+            predictions,
+            out_dir=paths.modeling_artifacts_dir,
+            feature_schema_version=feature_schema_version,
+            tuning_profile=tuning_profile,
+        )
+    )
     outputs.update(
         build_common_row_diagnostics(
             predictions,
             out_dir=paths.modeling_artifacts_dir,
             bootstrap_iter=bootstrap_iter,
+            feature_schema_version=feature_schema_version,
+            tuning_profile=tuning_profile,
         )
     )
     return ProxyResearchResult(
@@ -6143,6 +6261,9 @@ def run_research_models(
             "bootstrap_iter": bootstrap_iter,
             "tuning_profile": tuning_profile,
             "tuning_seed": tuning_seed,
+            "feature_schema_version": feature_schema_version,
+            "event_model_feature_count": len(event_features),
+            "tree_model_feature_count": len(tree_features),
         },
     )
 
@@ -6173,16 +6294,18 @@ def run_proxy_research_package(
     split_design: str = "chronological_proxy_70_15_15",
     split_date: str | None = None,
     allow_high_sequence_risk: bool = False,
-    sequence_suite: str = "phase1",
+    sequence_suite: str = "all",
     mamba_backend: str = "mamba_ssm",
     mamba_seeds: Sequence[int] = (17,),
     bootstrap_iter: int = 200,
-    tuning_profile: TuningProfile = "untuned",
+    tuning_profile: TuningProfile = "tuned_phase1",
     tuning_seed: int = 17,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
 ) -> dict[str, object]:
+    feature_schema_version = validate_feature_schema_version(feature_schema_version)
     if stage not in {"all", "sequence-audit", "features", "models", "report"}:
         raise ValueError(f"unsupported research stage: {stage}")
-    if sequence_suite not in {"none", "phase1", "phase2"}:
+    if sequence_suite not in {"none", "all"}:
         raise ValueError(f"unsupported sequence_suite: {sequence_suite}")
     if mamba_backend != "mamba_ssm":
         raise ValueError(f"unsupported mamba_backend: {mamba_backend}")
@@ -6214,7 +6337,12 @@ def run_proxy_research_package(
                 )
                 break
         elif step == "features":
-            result = run_research_features(config, split_design=split_design, split_date=split_date)
+            result = run_research_features(
+                config,
+                split_design=split_design,
+                split_date=split_date,
+                feature_schema_version=feature_schema_version,
+            )
         elif step == "models":
             result = run_research_models(
                 config,
@@ -6224,6 +6352,7 @@ def run_proxy_research_package(
                 bootstrap_iter=bootstrap_iter,
                 tuning_profile=tuning_profile,
                 tuning_seed=tuning_seed,
+                feature_schema_version=feature_schema_version,
             )
         else:
             result = run_research_report(config)
@@ -6241,6 +6370,7 @@ def run_proxy_research_package(
         "bootstrap_iter": bootstrap_iter,
         "tuning_profile": tuning_profile,
         "tuning_seed": tuning_seed,
+        "feature_schema_version": feature_schema_version,
         "steps": steps,
     }
     paths = research_paths(config)

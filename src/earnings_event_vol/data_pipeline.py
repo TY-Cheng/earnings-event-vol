@@ -23,7 +23,11 @@ from earnings_event_vol.contract_reference import (
     fetch_massive_option_contract_reference,
 )
 from earnings_event_vol.data_audit import audit_data_fields
-from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
+from earnings_event_vol.earnings_calendar import (
+    build_earnings_calendar_candidates,
+    fetch_sec_submission_payloads,
+    fetch_sec_ticker_map,
+)
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
 from earnings_event_vol.event_window_panel import build_event_window_panel
 from earnings_event_vol.market_covariates import (
@@ -97,6 +101,7 @@ SUPPORTED_DATA_STAGES = {
     "options-day-aggs-bulk",
     "market-covariates",
     "market-second-covariates",
+    "sec-companyfacts",
     "universe",
     "dynamic-calendar",
     "event-window-panel",
@@ -335,6 +340,263 @@ def _market_covariates_step(
             "vix_rows": int(pd.to_numeric(silver["vix_close"], errors="coerce").notna().sum()),
             "missing_rows": int(silver["is_holiday_or_missing"].sum()),
         },
+    )
+
+
+XBRL_CONCEPTS = {
+    "Assets": "assets",
+    "Liabilities": "liabilities",
+    "CashAndCashEquivalentsAtCarryingValue": "cash",
+    "CashAndCashEquivalentsAndShortTermInvestments": "cash",
+    "CurrentAssets": "current_assets",
+    "AssetsCurrent": "current_assets",
+    "CurrentLiabilities": "current_liabilities",
+    "LiabilitiesCurrent": "current_liabilities",
+    "Revenues": "revenue",
+    "RevenueFromContractWithCustomerExcludingAssessedTax": "revenue",
+    "SalesRevenueNet": "revenue",
+    "NetIncomeLoss": "net_income",
+    "OperatingIncomeLoss": "operating_income",
+}
+
+
+def _submission_acceptance_lookup(payload: Mapping[str, object]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    filings = payload.get("filings") if isinstance(payload.get("filings"), dict) else {}
+    blocks: list[Mapping[str, object]] = []
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if isinstance(recent, Mapping):
+        blocks.append(recent)
+    archives = payload.get("archive_payloads")
+    if isinstance(archives, list):
+        blocks.extend(archive for archive in archives if isinstance(archive, Mapping))
+    for block in blocks:
+        accns = block.get("accessionNumber")
+        acceptances = block.get("acceptanceDateTime")
+        if not isinstance(accns, list) or not isinstance(acceptances, list):
+            continue
+        for accn, acceptance in zip(accns, acceptances, strict=False):
+            if accn and acceptance:
+                out[str(accn)] = str(acceptance)
+    return out
+
+
+def _normalize_companyfacts_payload(
+    *,
+    ticker: str,
+    cik: int,
+    payload: Mapping[str, object],
+    acceptance_lookup: Mapping[str, str],
+) -> pd.DataFrame:
+    facts = payload.get("facts") if isinstance(payload.get("facts"), Mapping) else {}
+    us_gaap = facts.get("us-gaap") if isinstance(facts, Mapping) else {}
+    rows: list[dict[str, object]] = []
+    if not isinstance(us_gaap, Mapping):
+        return pd.DataFrame()
+    for sec_concept, feature_concept in XBRL_CONCEPTS.items():
+        concept_payload = us_gaap.get(sec_concept)
+        if not isinstance(concept_payload, Mapping):
+            continue
+        units = concept_payload.get("units")
+        if not isinstance(units, Mapping):
+            continue
+        for unit, entries in units.items():
+            if str(unit).upper() != "USD" or not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                accn = str(entry.get("accn") or "")
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "cik": int(cik),
+                        "sec_concept": sec_concept,
+                        "feature_concept": feature_concept,
+                        "unit": unit,
+                        "val": entry.get("val"),
+                        "start": entry.get("start"),
+                        "end": entry.get("end"),
+                        "fy": entry.get("fy"),
+                        "fp": entry.get("fp"),
+                        "form": entry.get("form"),
+                        "filed": entry.get("filed"),
+                        "frame": entry.get("frame"),
+                        "accn": accn,
+                        "acceptance_datetime": acceptance_lookup.get(accn),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _sec_companyfacts_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+) -> DataPipelineStep:
+    calendar_path = out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
+    out = out_root / "sec_companyfacts"
+    raw_dir = config.bronze_data_dir / "sec" / "companyfacts"
+    silver_path = config.silver_data_dir / "sec" / "companyfacts.parquet"
+    diagnostics_path = out / "sec_companyfacts_diagnostics.csv"
+    manifest_path = out / "sec_companyfacts_manifest.json"
+    outputs = (silver_path, diagnostics_path, manifest_path)
+    if not calendar_path.exists():
+        return DataPipelineStep(
+            "sec-companyfacts",
+            "blocked",
+            outputs,
+            reason="requires dynamic-calendar earnings_calendar_candidates.csv",
+        )
+    calendar = pd.read_csv(calendar_path)
+    tickers = sorted({str(ticker).upper() for ticker in calendar.get("ticker", []) if ticker})
+    params = {
+        "stage": "sec-companyfacts",
+        "calendar": _path_signature(calendar_path),
+        "endpoint": config.sec_companyfacts_url_template,
+        "request_interval_seconds": 0.125,
+    }
+    if not force and _complete_with_params(
+        outputs,
+        params_path=manifest_path,
+        expected_params=params,
+    ):
+        return DataPipelineStep(
+            "sec-companyfacts",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    out.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[pd.DataFrame] = []
+    diagnostics: list[dict[str, object]] = []
+    try:
+        with httpx.Client(timeout=config.massive_request_timeout_seconds) as client:
+            ticker_map = fetch_sec_ticker_map(client, config)
+            submissions = fetch_sec_submission_payloads(
+                tickers=tickers,
+                config=config,
+                client=client,
+                archive_cache_dir=config.bronze_data_dir / "sec" / "submissions",
+                fail_on_missing_tickers=False,
+                request_interval_seconds=0.125,
+            )
+            last_request_at = 0.0
+            for ticker in tickers:
+                cik = ticker_map.get(ticker)
+                if cik is None:
+                    diagnostics.append({"ticker": ticker, "status": "missing_cik"})
+                    continue
+                cache_path = raw_dir / f"CIK{int(cik):010d}.json"
+                status = "cache_hit"
+                if force or not cache_path.exists() or cache_path.stat().st_size <= 0:
+                    elapsed = time.perf_counter() - last_request_at
+                    if elapsed < 0.125:
+                        time.sleep(0.125 - elapsed)
+                    response = client.get(
+                        config.sec_companyfacts_url_template.format(cik=int(cik)),
+                        headers={"User-Agent": config.sec_user_agent},
+                    )
+                    last_request_at = time.perf_counter()
+                    response.raise_for_status()
+                    payload = response.json()
+                    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    status = "fetched"
+                else:
+                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                acceptance_lookup = _submission_acceptance_lookup(submissions.get(ticker, {}))
+                normalized = _normalize_companyfacts_payload(
+                    ticker=ticker,
+                    cik=int(cik),
+                    payload=payload,
+                    acceptance_lookup=acceptance_lookup,
+                )
+                if not normalized.empty:
+                    rows.append(normalized)
+                diagnostics.append(
+                    {
+                        "ticker": ticker,
+                        "cik": int(cik),
+                        "status": status,
+                        "fact_rows": int(len(normalized)),
+                        "mapped_acceptance_rows": int(
+                            normalized["acceptance_datetime"].notna().sum()
+                        )
+                        if not normalized.empty
+                        else 0,
+                        "fallback_filed_rows": int(normalized["acceptance_datetime"].isna().sum())
+                        if not normalized.empty
+                        else 0,
+                    }
+                )
+    except Exception as exc:
+        _write_parquet(silver_path, pd.DataFrame(columns=["ticker", "cik", "feature_concept"]))
+        pd.DataFrame([{"status": "http_or_parse_degraded", "error": str(exc)}]).to_csv(
+            diagnostics_path, index=False
+        )
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": params,
+                    "status": "degraded",
+                    "reason": "sec_companyfacts_failed_graceful_degradation",
+                    "error": str(exc),
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        return DataPipelineStep(
+            "sec-companyfacts",
+            "ran",
+            outputs,
+            reason="sec_companyfacts_failed_graceful_degradation",
+            metadata={"error": str(exc)},
+        )
+
+    facts = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not facts.empty:
+        facts["val"] = pd.to_numeric(facts["val"], errors="coerce")
+        facts["fy"] = pd.to_numeric(facts["fy"], errors="coerce")
+        _write_parquet(silver_path, facts)
+    else:
+        _write_parquet(silver_path, pd.DataFrame(columns=["ticker", "cik", "feature_concept"]))
+    diag = pd.DataFrame(diagnostics)
+    diag.to_csv(diagnostics_path, index=False)
+    mapped_rows = (
+        int(facts["acceptance_datetime"].notna().sum()) if "acceptance_datetime" in facts else 0
+    )
+    fallback_rows = (
+        int(facts["acceptance_datetime"].isna().sum()) if "acceptance_datetime" in facts else 0
+    )
+    payload = {
+        "pipeline_params": params,
+        "status": "ran",
+        "tickers": int(len(tickers)),
+        "fact_rows": int(len(facts)),
+        "mapped_acceptance_rows": mapped_rows,
+        "mapped_acceptance_share": float(mapped_rows / max(1, len(facts))),
+        "fallback_filed_rows": fallback_rows,
+        "fallback_filed_share": float(fallback_rows / max(1, len(facts))),
+        "missing_cik_share": float(
+            diag["status"].eq("missing_cik").mean() if "status" in diag else 0.0
+        ),
+        "request_interval_seconds": 0.125,
+        "outputs": {
+            "companyfacts": str(silver_path),
+            "diagnostics": str(diagnostics_path),
+        },
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return DataPipelineStep(
+        "sec-companyfacts",
+        "ran",
+        outputs,
+        metadata={"fact_rows": int(len(facts)), "tickers": int(len(tickers))},
     )
 
 
@@ -2523,6 +2785,7 @@ def run_data_pipeline(
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
+            "sec-companyfacts",
             "contracts",
             "panel",
             "event-window-panel",
@@ -2533,6 +2796,7 @@ def run_data_pipeline(
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
+            "sec-companyfacts",
             "event-window-panel",
             "contract-reference-validation",
             "trade-proxy-panel",
@@ -2607,6 +2871,9 @@ def run_data_pipeline(
                 validate_with_massive=validate_with_massive,
                 force=stage_force,
             )
+        ],
+        "sec-companyfacts": lambda: [
+            _sec_companyfacts_step(config, out_root=out_root, force=stage_force)
         ],
         "contracts": lambda: [
             _contracts_step(

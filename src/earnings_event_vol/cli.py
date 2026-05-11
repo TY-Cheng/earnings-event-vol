@@ -23,7 +23,11 @@ from earnings_event_vol.data_pipeline import (
 from earnings_event_vol.earnings_calendar import build_earnings_calendar_candidates
 from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
 from earnings_event_vol.events import align_event_window, validate_calendar_frame
-from earnings_event_vol.features import build_model_feature_matrix
+from earnings_event_vol.features import (
+    DEFAULT_FEATURE_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSIONS,
+    build_model_feature_matrix,
+)
 from earnings_event_vol.leakage_audit import audit_feature_leakage
 from earnings_event_vol.massive import (
     build_massive_day_agg_sample,
@@ -438,10 +442,6 @@ def _model_ids_from_args(values: list[str]) -> list[str]:
             "last_four_rvar",
             "last_four_ivar",
             "goyal_saretto_rv_iv_spread",
-            "linear_elastic_net",
-            "lightgbm",
-            "xgboost",
-            "ft_transformer",
         ]
     parsed: list[str] = []
     for value in values:
@@ -573,6 +573,7 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
         bootstrap_iter=args.bootstrap_iter,
         tuning_profile=args.tuning_profile,
         tuning_seed=args.tuning_seed,
+        feature_schema_version=args.feature_schema_version,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -755,6 +756,7 @@ def build_parser() -> argparse.ArgumentParser:
             "massive-probe",
             "market-covariates",
             "market-second-covariates",
+            "sec-companyfacts",
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
@@ -861,20 +863,26 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--allow-high-sequence-risk", action="store_true")
     research.add_argument(
         "--sequence-suite",
-        choices=["none", "phase1", "phase2"],
-        default="phase1",
-        help="Sequence model suite to run; phase1 is the diagnostic default.",
+        choices=["none", "all"],
+        default="all",
+        help="Sequence diagnostics to run; use none to skip sequence models.",
     )
     research.add_argument("--mamba-backend", choices=["mamba_ssm"], default="mamba_ssm")
     research.add_argument("--mamba-seeds", default="17")
     research.add_argument("--bootstrap-iter", type=int, default=200)
     research.add_argument(
         "--tuning-profile",
-        choices=["untuned", "tuned_phase1"],
-        default="untuned",
-        help="Optional model tuning protocol; untuned preserves the canonical proxy run.",
+        choices=["tuned_phase1"],
+        default="tuned_phase1",
+        help=argparse.SUPPRESS,
     )
     research.add_argument("--tuning-seed", type=int, default=17)
+    research.add_argument(
+        "--feature-schema-version",
+        choices=list(FEATURE_SCHEMA_VERSIONS),
+        default=DEFAULT_FEATURE_SCHEMA_VERSION,
+        help="Feature schema/allowlist version; defaults to the current FE V2 schema.",
+    )
 
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")
     leakage_audit.add_argument("--features", type=Path, required=True)

@@ -61,8 +61,14 @@ Sequence route:
   coverage, model rows, and paper-grade flag.
 - Keep stale-result checks for `tuning_trials.csv`,
   `tuning_selected_params.json`, and FT finite-prediction diagnostics so the
-  curated snapshot cannot silently mix old untuned results into the current
-  `tuned_phase1` story.
+  curated snapshot cannot silently reintroduce old original-model rows into the
+  current canonical tuned story.
+- Keep the same-code `fe_v1_legacy` versus `fe_v2_sec_xbrl` ablation table
+  current. The 2026-05-12 run is negative for FE V2, so future FE V2 changes
+  should be reported as diagnostics unless they improve locked-test ranking and
+  economics without touching test-driven selection.
+- Track SEC CompanyFacts coverage, CIK misses, acceptance-time mapping, and
+  fallback-filed usage as first-class data-quality diagnostics.
 - Keep generated data under the external `DATA_DIR`, and keep reports and
   figures under ignored `artifacts/`, `reports/`, or `site/`.
 
