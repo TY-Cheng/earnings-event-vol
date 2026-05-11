@@ -922,7 +922,13 @@ def build_trade_proxy_panel(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out-root", type=Path, default=Path("artifacts/data_pipeline"))
+    parser.add_argument(
+        "--out-dir",
+        "--out-root",
+        dest="out_dir",
+        type=Path,
+        default=Path("artifacts/data_pipeline"),
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-events", type=int)
     parser.add_argument("--max-contracts", type=int)
@@ -952,7 +958,7 @@ def main() -> int:
     config = load_project_config()
     report = build_trade_proxy_panel(
         config=config,
-        out_root=args.out_root,
+        out_root=args.out_dir,
         force=args.force,
         max_events=args.max_events,
         max_contracts=args.max_contracts,

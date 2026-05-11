@@ -17,6 +17,7 @@ reports/
 site/
 
 # Licensed or bulky research data should stay local unless explicitly curated.
+data
 data/_tmp/
 data/bronze/
 data/silver/

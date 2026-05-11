@@ -166,11 +166,11 @@ Data pipeline:
 - `artifacts/data_pipeline/universe/universe_manifest.json`
 - `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json`
 - `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json`
-- `data/gold/event_panel/trade_proxy_event_panel.parquet`
+- `$GOLD_DATA_DIR/event_panel/trade_proxy_event_panel.parquet`
 
 Research package:
 
-- `data/gold/modeling/feature_matrix.parquet`
+- `$GOLD_DATA_DIR/modeling/feature_matrix.parquet`
 - `artifacts/modeling/forecast_metrics.csv`
 - `artifacts/modeling/ranking_metrics.csv`
 - `artifacts/modeling/strategy_metrics.csv`

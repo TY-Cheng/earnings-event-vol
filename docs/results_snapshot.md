@@ -8,7 +8,8 @@ hide:
 This page is the paper-facing results snapshot for the current local proxy run.
 It summarizes the data, model comparison, sequence diagnostics, robustness
 checks, figures, and claim boundaries. Raw generated outputs remain under
-ignored `artifacts/`, `data/`, and `reports/` paths; selected figures are
+ignored `artifacts/` and `reports/` paths plus the external `DATA_DIR`;
+selected figures are
 copied into `docs/assets/images/modeling/`.
 
 ## Research Question
@@ -556,10 +557,10 @@ liquidity robustness, and clustered or bootstrap inference.
 | Data pipeline manifest | `artifacts/data_pipeline/data_pipeline_manifest.json` |
 | Dynamic calendar report | `artifacts/data_pipeline/dynamic_calendar/earnings_calendar_report.json` |
 | Trade-proxy panel report | `artifacts/data_pipeline/trade_proxy_panel/trade_proxy_panel_report.json` |
-| Feature matrix | `data/gold/modeling/feature_matrix.parquet` |
-| Daily sequence tensor | `data/gold/modeling/sequence_tensor.npz` |
-| Hybrid sequence tensor V1 | `data/gold/modeling/hybrid_sequence_tensor.npz` |
-| Hybrid sequence tensor V2 | `data/gold/modeling/hybrid_sequence_tensor_v2.npz` |
+| Feature matrix | `$GOLD_DATA_DIR/modeling/feature_matrix.parquet` |
+| Daily sequence tensor | `$GOLD_DATA_DIR/modeling/sequence_tensor.npz` |
+| Hybrid sequence tensor V1 | `$GOLD_DATA_DIR/modeling/hybrid_sequence_tensor.npz` |
+| Hybrid sequence tensor V2 | `$GOLD_DATA_DIR/modeling/hybrid_sequence_tensor_v2.npz` |
 | Forecast metrics | `artifacts/modeling/forecast_metrics.csv` |
 | Ranking metrics | `artifacts/modeling/ranking_metrics.csv` |
 | Strategy metrics | `artifacts/modeling/strategy_metrics.csv` |

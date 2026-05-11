@@ -6,19 +6,42 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+EXTERNAL_VOLUME_ROOT = Path("/Volumes/ExternalSSD")
+EXTERNAL_DATA_DIR = EXTERNAL_VOLUME_ROOT / "data" / "earnings-event-vol"
+
+
+def _expanded_path(value: str | Path) -> Path:
+    return Path(os.path.expandvars(str(value))).expanduser().resolve()
+
+
+def _repo_is_cloud_synced() -> bool:
+    parts = set(REPO_ROOT.parts)
+    return "CloudStorage" in parts or any(
+        part.startswith(("OneDrive-", "GoogleDrive-", "Dropbox")) for part in parts
+    )
+
+
+def _default_data_dir() -> Path:
+    if EXTERNAL_VOLUME_ROOT.exists():
+        return EXTERNAL_DATA_DIR
+    if _repo_is_cloud_synced():
+        raise RuntimeError(
+            "DATA_DIR is unset and /Volumes/ExternalSSD is not mounted; set DATA_DIR "
+            "to an external path instead of creating repo-local data."
+        )
+    return REPO_ROOT / "data"
 
 
 def _path_from_env(name: str, default: str | Path) -> Path:
     raw = os.getenv(name)
-    value = Path(raw) if raw else Path(default)
-    return value.expanduser().resolve()
+    return _expanded_path(raw if raw else default)
 
 
 def _optional_path_from_env(name: str) -> Path | None:
     raw = os.getenv(name)
     if not raw:
         return None
-    return Path(raw).expanduser().resolve()
+    return _expanded_path(raw)
 
 
 @dataclass(frozen=True)
@@ -83,7 +106,7 @@ def _optional_int_env(name: str) -> int | None:
 
 
 def load_project_config() -> ProjectConfig:
-    data_dir = _path_from_env("DATA_DIR", REPO_ROOT / "data")
+    data_dir = _path_from_env("DATA_DIR", _default_data_dir())
     return ProjectConfig(
         project_name=os.getenv("PROJECT_NAME", "earnings-event-vol"),
         repo_root=_path_from_env("PROJECT_ROOT", REPO_ROOT),

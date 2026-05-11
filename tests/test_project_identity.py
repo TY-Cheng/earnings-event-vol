@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import earnings_event_vol.config as config_module
 from earnings_event_vol.cli import main
 from earnings_event_vol.config import load_project_config
 
@@ -73,6 +74,55 @@ def test_config_loads_project_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.project_name == "earnings-event-vol"
     assert config.massive_requests_per_minute == 3000
     assert config.as_dict()["project_name"] == "earnings-event-vol"
+
+
+def test_config_expands_path_environment_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DATA_ROOT_FOR_TEST", str(tmp_path))
+    monkeypatch.setenv("DATA_DIR", "$DATA_ROOT_FOR_TEST/data")
+    monkeypatch.setenv("BRONZE_DATA_DIR", "")
+    monkeypatch.setenv("SILVER_DATA_DIR", "")
+    monkeypatch.setenv("GOLD_DATA_DIR", "")
+    monkeypatch.delenv("ARTIFACTS_DIR", raising=False)
+    monkeypatch.delenv("REPORTS_DIR", raising=False)
+
+    config = load_project_config()
+
+    assert config.data_dir == (tmp_path / "data").resolve()
+    assert config.gold_data_dir == (tmp_path / "data" / "gold").resolve()
+    assert config.artifacts_dir == (config_module.REPO_ROOT / "artifacts").resolve()
+    assert config.reports_dir == (config_module.REPO_ROOT / "reports").resolve()
+
+
+def test_default_data_dir_prefers_external_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external = tmp_path / "ExternalSSD"
+    external.mkdir()
+    monkeypatch.setattr(config_module, "EXTERNAL_VOLUME_ROOT", external)
+    monkeypatch.setattr(
+        config_module,
+        "EXTERNAL_DATA_DIR",
+        external / "data" / "earnings-event-vol",
+    )
+    monkeypatch.setattr(config_module, "REPO_ROOT", tmp_path / "repo")
+
+    assert config_module._default_data_dir() == external / "data" / "earnings-event-vol"
+
+
+def test_default_data_dir_blocks_cloud_checkout_without_external_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_module, "EXTERNAL_VOLUME_ROOT", tmp_path / "missing")
+    monkeypatch.setattr(
+        config_module,
+        "REPO_ROOT",
+        Path("/Users/test/Library/CloudStorage/OneDrive-NUS/earnings-event-vol"),
+    )
+
+    with pytest.raises(RuntimeError, match="DATA_DIR is unset"):
+        config_module._default_data_dir()
 
 
 def test_cli_status_reports_project_without_secret_values(

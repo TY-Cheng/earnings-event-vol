@@ -58,8 +58,8 @@ Sequence route:
   machine-readable artifacts.
 - Add a small command that prints the current sample window, event count, IVAR
   coverage, model rows, and paper-grade flag.
-- Keep generated data, reports, and figures under ignored `data/`, `artifacts/`,
-  `reports/`, or `site/`.
+- Keep generated data under the external `DATA_DIR`, and keep reports and
+  figures under ignored `artifacts/`, `reports/`, or `site/`.
 
 ## Deferred Extensions
 

@@ -364,10 +364,11 @@ def _build_event_panel(args: argparse.Namespace) -> int:
 
 
 def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
+    out_dir = args.out_dir or config.artifacts_dir / "data_pipeline"
     payload = run_data_pipeline(
         config,
         stage=args.stage,
-        out_root=args.out_root,
+        out_root=out_dir,
         force=args.force,
         jobs=args.jobs,
         tickers=parse_text_list(args.tickers) or list(DEFAULT_STATIC_TICKERS),
@@ -399,16 +400,27 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
     return 0 if bool(payload["ok"]) else 1
 
 
-def _build_feature_matrix(args: argparse.Namespace) -> int:
-    panel = _read_table(args.panel)
-    straddles = _read_table(args.straddles) if args.straddles and args.straddles.exists() else None
+def _build_feature_matrix(args: argparse.Namespace, config: ProjectConfig) -> int:
+    panel_path = (
+        args.panel or config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet"
+    )
+    straddles_path = (
+        args.straddles
+        or config.artifacts_dir
+        / "data_pipeline"
+        / "trade_proxy_panel"
+        / "trade_proxy_straddle_diagnostics.csv"
+    )
+    out_path = args.out or config.gold_data_dir / "modeling" / "feature_matrix.parquet"
+    panel = _read_table(panel_path)
+    straddles = _read_table(straddles_path) if straddles_path.exists() else None
     features = build_model_feature_matrix(panel, straddle_diagnostics=straddles)
     features = add_benchmark_predictions(features)
-    _write_table(args.out, features)
+    _write_table(out_path, features)
     payload = {
         "rows": int(len(features)),
         "columns": int(len(features.columns)),
-        "out": str(args.out),
+        "out": str(out_path),
         "target": "rvar_event",
         "market_baseline": "ivar_event",
         "prediction_columns": [
@@ -440,15 +452,16 @@ def _model_ids_from_args(values: list[str]) -> list[str]:
     return parsed
 
 
-def _train_models(args: argparse.Namespace) -> int:
-    features = _read_table(args.features)
+def _train_models(args: argparse.Namespace, config: ProjectConfig) -> int:
+    features_path = args.features or config.gold_data_dir / "modeling" / "feature_matrix.parquet"
+    features = _read_table(features_path)
     model_ids = _model_ids_from_args(args.models)
     predictions, fit_results = run_model_suite(
         features,
         model_ids=model_ids,
         split_date=args.split_date,
     )
-    out = args.out
+    out = args.out or config.artifacts_dir / "modeling"
     out.mkdir(parents=True, exist_ok=True)
     remove_model_level_csv_artifacts(out)
     predictions_path = out / "model_predictions.parquet"
@@ -530,7 +543,7 @@ def _train_models(args: argparse.Namespace) -> int:
         )
     payload = {
         "ok": True,
-        "features": str(args.features),
+        "features": str(features_path),
         "out": str(out),
         "models": model_ids,
         "prediction_rows": int(len(predictions)),
@@ -751,7 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
         ],
         default="proxy-all",
     )
-    data.add_argument("--out-root", type=Path, default=Path("artifacts/data_pipeline"))
+    data.add_argument("--out-dir", "--out-root", dest="out_dir", type=Path)
     data.add_argument("--force", action="store_true")
     data.add_argument("--jobs", type=int, default=1)
     data.add_argument(
@@ -806,19 +819,14 @@ def build_parser() -> argparse.ArgumentParser:
     build_features.add_argument(
         "--panel",
         type=Path,
-        default=Path("data/gold/event_panel/trade_proxy_event_panel.parquet"),
     )
     build_features.add_argument(
         "--straddles",
         type=Path,
-        default=Path(
-            "artifacts/data_pipeline/trade_proxy_panel/trade_proxy_straddle_diagnostics.csv"
-        ),
     )
     build_features.add_argument(
         "--out",
         type=Path,
-        default=Path("data/gold/modeling/feature_matrix.parquet"),
     )
 
     train_models = subparsers.add_parser(
@@ -827,9 +835,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_models.add_argument(
         "--features",
         type=Path,
-        default=Path("data/gold/modeling/feature_matrix.parquet"),
     )
-    train_models.add_argument("--out", type=Path, default=Path("artifacts/modeling"))
+    train_models.add_argument("--out", type=Path)
     train_models.add_argument("--models", nargs="*", default=["all"])
     train_models.add_argument("--split-date", default=None)
     train_models.add_argument("--min-edge-var", type=float, default=0.0)
@@ -902,9 +909,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "data":
         return _data(args, config)
     if args.command == "build-feature-matrix":
-        return _build_feature_matrix(args)
+        return _build_feature_matrix(args, config)
     if args.command == "train-models":
-        return _train_models(args)
+        return _train_models(args, config)
     if args.command == "research":
         return _research(args, config)
     if args.command == "leakage-audit":

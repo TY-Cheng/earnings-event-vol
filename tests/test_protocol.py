@@ -5815,7 +5815,7 @@ def test_portfolio_caps_handle_zero_scaled_trade_on_second_cap_pass() -> None:
     assert sum(trade.max_theoretical_loss_usd for trade in capped) <= 25
 
 
-def test_cli_smoke_commands(tmp_path: Path) -> None:
+def test_cli_smoke_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     audit_out = tmp_path / "audit"
     assert (
         main(
@@ -5842,13 +5842,19 @@ def test_cli_smoke_commands(tmp_path: Path) -> None:
                 "data",
                 "--stage",
                 "fixture-audit",
-                "--out-root",
+                "--out-dir",
                 str(data_out),
             ]
         )
         == 0
     )
     assert (data_out / "data_pipeline_manifest.json").exists()
+
+    monkeypatch.setenv("ARTIFACTS_DIR", str(tmp_path / "configured_artifacts"))
+    assert main(["data", "--stage", "fixture-audit"]) == 0
+    assert (
+        tmp_path / "configured_artifacts" / "data_pipeline" / "data_pipeline_manifest.json"
+    ).exists()
 
     calendar_out = tmp_path / "calendar.csv"
     assert (

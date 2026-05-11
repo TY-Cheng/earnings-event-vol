@@ -790,7 +790,7 @@ def _market_second_covariates_step(
             "market-second-covariates",
             "blocked",
             outputs,
-            reason="requires data/gold/event_panel/trade_proxy_event_panel.parquet",
+            reason=f"requires configured event panel at {panel_path}",
         )
     if (
         not force
@@ -2323,7 +2323,7 @@ def _trade_proxy_panel_step(
     command = [
         sys.executable,
         str(config.repo_root / "scripts" / "build_trade_proxy_panel.py"),
-        "--out-root",
+        "--out-dir",
         str(out_root),
         "--jobs",
         str(jobs),
@@ -2409,7 +2409,7 @@ def _dry_run_estimate(
         "ok": True,
         "dry_run": True,
         "stage": stage,
-        "out_root": str(out_root),
+        "out_dir": str(out_root),
         "date_range": {"start": start_date.isoformat(), "end": end_date.isoformat()},
         "bulk_day_aggs_date_range": {
             "start": lookback_start.isoformat(),
@@ -2692,6 +2692,6 @@ def run_data_pipeline(
     _progress(f"manifest written: {out_root / 'data_pipeline_manifest.json'}")
     return {
         "ok": all(step.status in {"ran", "skipped"} for step in steps),
-        "out_root": str(out_root),
+        "out_dir": str(out_root),
         "steps": [step.as_dict() for step in steps],
     }
