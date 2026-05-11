@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 docs = ["mkdocs>=1.6.1", "mkdocs-material>=9.6.0"]
-ml = ["lightgbm>=4.5.0", "scikit-learn>=1.5.0", "xgboost>=2.1.0"]
+ml = ["lightgbm>=4.5.0", "optuna>=4.0.0", "scikit-learn>=1.5.0", "xgboost>=2.1.0"]
 
 [tool.uv]
 package = false
@@ -52,7 +52,7 @@ warn_redundant_casts = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["pandas.*", "scipy.*", "lightgbm", "xgboost"]
+module = ["pandas.*", "scipy.*", "lightgbm", "optuna.*", "sklearn.*", "xgboost"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

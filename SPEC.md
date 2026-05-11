@@ -211,3 +211,7 @@ does not estimate a rolling cutpoint.
   paper-grade deep-model tuning claims in this pass. The proxy research layer
   may train the registered benchmark/model suite for diagnostics, but outputs
   remain `no_nbbo_trade_proxy` until quote/NBBO ingestion exists.
+- The explicit `tuned_phase1` research profile is a fairness and robustness
+  extension, not the default protocol. Hyperparameter selection may use only
+  train and locked-validation rows, with locked test rows excluded from tuning
+  artifacts and evaluated once after train+validation refit.

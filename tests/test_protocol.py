@@ -32,7 +32,7 @@ from earnings_event_vol.backtest import (
     market_entry_cost_usd,
     premium_space_signal,
 )
-from earnings_event_vol.cli import _parse_comma_ints, main
+from earnings_event_vol.cli import _parse_comma_ints, build_parser, main
 from earnings_event_vol.config import load_project_config
 from earnings_event_vol.contract_reference import apply_contract_reference_validation
 from earnings_event_vol.data_audit import audit_data_fields, vendor_local_iv_comparison
@@ -169,6 +169,10 @@ from earnings_event_vol.research import (
     HYBRID_STEPS,
     PHASE1_TARGET_IDS,
     SEQUENCE_FEATURE_NAMES,
+    TuningState,
+    _model_ids_for_sequence_suite,
+    _train_sequence_seed_ensemble,
+    _write_tuning_artifacts,
     aggregate_sequence_features,
     assign_event_splits,
     build_common_row_diagnostics,
@@ -4614,7 +4618,9 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     for sequence_id in [
         "ridge_flat_aggregates_sequence",
         "bigru_sequence",
+        "bigru_sequence_5seed",
         "mamba_ssm_sequence",
+        "mamba_ssm_sequence_5seed",
         "mask_only_sequence",
         "time_shuffle_sequence",
     ]:
@@ -4631,6 +4637,172 @@ def test_patell_wolfson_registry_text() -> None:
     assert "diagnostic features" in spec.justification
     assert "pre-event implied-volatility behavior" in spec.justification
     assert "prior event variance history" in spec.justification
+
+
+def _synthetic_tuning_frame() -> pd.DataFrame:
+    n_rows = 40
+    idx = np.arange(n_rows, dtype=float)
+    signal = np.sin(idx)
+    ivar = 0.02 + 0.001 * (idx % 5)
+    rvar = np.maximum(ivar + 0.004 * signal, 0.001)
+    return pd.DataFrame(
+        {
+            "event_id": [f"EV_{idx_int:02d}" for idx_int in range(n_rows)],
+            "ticker": ["AAA" if idx_int % 2 == 0 else "BBB" for idx_int in range(n_rows)],
+            "announcement_date": pd.date_range("2024-01-01", periods=n_rows, freq="7D"),
+            "event_date": pd.date_range("2024-01-02", periods=n_rows, freq="7D"),
+            "split": ["train"] * 28 + ["validation"] * 6 + ["test"] * 6,
+            "ivar_event": ivar,
+            "rvar_event": rvar,
+            "edge_var_realized": rvar - ivar,
+            "feature_signal": signal,
+            "feature_trend": idx / n_rows,
+            "feature_cycle": idx % 3,
+        }
+    )
+
+
+def test_research_tuning_cli_and_model_ids() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["research", "--tuning-profile", "tuned_phase1", "--tuning-seed", "123"]
+    )
+
+    assert args.tuning_profile == "tuned_phase1"
+    assert args.tuning_seed == 123
+    with pytest.raises(SystemExit):
+        parser.parse_args(["research", "--tuning-profile", "bad_profile"])
+
+    default_ids = _model_ids_for_sequence_suite("phase1")
+    tuned_ids = _model_ids_for_sequence_suite("phase1", tuning_profile="tuned_phase1")
+    tuned_no_sequence_ids = _model_ids_for_sequence_suite("none", tuning_profile="tuned_phase1")
+
+    assert "linear_elastic_net_tuned" not in default_ids
+    assert "linear_elastic_net_tuned" in tuned_ids
+    assert "lightgbm_tuned" in tuned_ids
+    assert "xgboost_tuned" in tuned_ids
+    assert "ft_transformer_tuned" in tuned_ids
+    assert "bigru_sequence_5seed" in tuned_ids
+    assert "mamba_ssm_sequence_5seed" in tuned_ids
+    assert "bigru_sequence_5seed" not in tuned_no_sequence_ids
+
+
+def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn")
+    frame = _synthetic_tuning_frame()
+    tuning_state = TuningState(profile="tuned_phase1", seed=17)
+
+    predictions, diagnostics = run_proxy_model_suite(
+        frame,
+        tensor_path=tmp_path / "unused_sequence_tensor.npz",
+        model_ids=["linear_elastic_net", "linear_elastic_net_tuned"],
+        tuning_state=tuning_state,
+        target_id="jump_c2o",
+    )
+    outputs = _write_tuning_artifacts(tmp_path, tuning_state=tuning_state)
+    selected_payload = json.loads(Path(outputs["tuning_selected_params"]).read_text())
+    trials = pd.read_csv(outputs["tuning_trials"])
+
+    assert "forecast_linear_elastic_net" in predictions
+    assert "forecast_linear_elastic_net_tuned" in predictions
+    assert (
+        predictions.loc[predictions["split"].eq("test"), "forecast_linear_elastic_net_tuned"]
+        .notna()
+        .all()
+    )
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("linear_elastic_net_tuned"), "status"].iloc[0]
+        == "trained"
+    )
+    assert selected_payload["test_metrics_used_for_selection"] is False
+    selected = selected_payload["selected_params"]["linear_elastic_net_tuned"]
+    assert selected["selection_protocol"] == "train_validation_only"
+    assert selected["refit_protocol"] == "train_plus_validation"
+    assert set(selected["params"]) >= {"alpha", "l1_ratio"}
+    assert not any(key.startswith("test") for key in selected["validation_metrics"])
+    assert not any(column.startswith("test") for column in trials.columns)
+    assert {"validation_auc", "validation_top_decile_precision", "validation_rmse"}.issubset(
+        trials.columns
+    )
+
+
+def test_trained_model_with_no_usable_predictions_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    frame = _synthetic_tuning_frame()
+
+    def fake_train_ft_transformer(
+        frame: pd.DataFrame,
+        *,
+        features: Sequence[str],
+    ) -> tuple[pd.Series, dict[str, object], object | None]:
+        _ = features
+        return (
+            pd.Series(np.nan, index=frame.index),
+            {"status": "trained", "train_rows": 28, "validation_rows": 6, "test_rows": 6},
+            None,
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.research._train_ft_transformer",
+        fake_train_ft_transformer,
+    )
+
+    predictions, diagnostics = run_proxy_model_suite(
+        frame,
+        tensor_path=tmp_path / "unused_sequence_tensor.npz",
+        model_ids=["ft_transformer"],
+    )
+
+    assert predictions["forecast_ft_transformer"].isna().all()
+    row = diagnostics.loc[diagnostics["model_id"].eq("ft_transformer")].iloc[0]
+    assert row["status"] == "invalid_no_usable_predictions"
+    assert row["raw_status"] == "trained"
+    assert row["validation_prediction_finite_rows"] == 0
+    assert row["test_prediction_finite_rows"] == 0
+
+
+def test_sequence_seed_ensemble_records_fixed_seed_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    frame = _synthetic_tuning_frame()
+    calls: list[int] = []
+
+    def fake_train_sequence_model(
+        frame: pd.DataFrame,
+        *,
+        tensor_path: Path,
+        model_id: str,
+        seed: int = 17,
+        **unused: object,
+    ) -> tuple[pd.Series, dict[str, object], object | None]:
+        _ = tensor_path, model_id, unused
+        calls.append(seed)
+        return (
+            pd.Series(float(seed), index=frame.index),
+            {"status": "trained", "seed": seed},
+            None,
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.research._train_sequence_model",
+        fake_train_sequence_model,
+    )
+    pred, diag, model = _train_sequence_seed_ensemble(
+        frame,
+        tensor_path=tmp_path / "sequence_tensor.npz",
+        model_id="bigru_sequence_5seed",
+        base_model_id="bigru_sequence",
+        seeds=(17, 42, 123, 456, 789),
+    )
+
+    assert model is None
+    assert calls == [17, 42, 123, 456, 789]
+    assert diag["seed_list"] == "17,42,123,456,789"
+    assert diag["trained_seed_count"] == 5
+    assert pred.mean() == pytest.approx(np.mean(calls))
 
 
 def test_feature_matrix_benchmarks_models_and_metrics() -> None:
@@ -4794,6 +4966,7 @@ def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPat
     assert tensor.shape == (2, 2, 3)
     mask = torch.tensor([[True, False], [True, True]])
     ft = FTTransformerRegressor(n_features=3)
+    ft_dropout = FTTransformerRegressor(n_features=3, dropout=0.2)
     attention = AttentionPoolingSequenceEncoder(n_features=3, hidden_size=4, n_heads=2)
     bigru = BiGRUSequenceEncoder(n_features=3, hidden_size=4, n_layers=2, dropout=0.0)
     cnn = DilatedCNNSequenceEncoder(
@@ -4803,6 +4976,7 @@ def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPat
         dropout=0.0,
     )
     assert ft(tensor[:, 0, :]).shape == (2,)
+    assert ft_dropout(tensor[:, 0, :]).shape == (2,)
     assert attention(tensor, mask).shape == (2,)
     assert attention.last_attention_weights is not None
     assert attention.last_attention_weights.shape == (2, 1, 2)
@@ -5636,6 +5810,10 @@ def test_research_model_suite_and_error_paths() -> None:
         "seq_t01_volume",
     ]
     assert prediction_column_for_model("linear_elastic_net") == "forecast_linear_elastic_net"
+    assert (
+        prediction_column_for_model("linear_elastic_net_tuned")
+        == "forecast_linear_elastic_net_tuned"
+    )
     with pytest.raises(ValueError, match="unknown model_id"):
         run_model_suite(feature_frame, model_ids=["not_a_model"])
     with pytest.raises(ValueError, match="not a trainable"):

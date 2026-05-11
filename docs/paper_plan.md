@@ -31,20 +31,24 @@ earnings jump variance (`jump_c2o`); the V1 proxy-PnL headline is
 close-to-close event variance (`day_c2c`); post-open digestion (`reaction_o2c`)
 is diagnostic.
 
-In the current proxy run, the LightGBM/XGBoost rank-average ensemble has the
-strongest `jump_c2o` ranking result with AUC 0.788 and edge-decile Spearman
-1.000. The same ensemble produces the strongest `day_c2c` net proxy PnL, about
-72,155 USD. `reaction_o2c` is now modeled as a diagnostic target, but its
-post-open realized variance is compared to full-event `IVAR_event`, so it is not
-a calibrated O2C mispricing or headline strategy result. The legacy in-repo
-proxy-Mamba rows are retired because they used a gated recurrent encoder rather
-than official `mamba-ssm`. The new sequence suite is a diagnostic-grade test of
-whether ordered pre-event proxy-surface paths add incremental information
-beyond tabular aggregates. The defensible conclusion is that nonlinear tabular
-models show preliminary cross-sectional ranking signal for earnings
-event-variance mispricing in a no-NBBO proxy sample. Paper-grade claims require
-historical quote/NBBO or equivalent data,
-quote-based IVAR, and leg-level execution with realistic bid/ask crossing.
+In the current 2026-05-11 `tuned_phase1` proxy run, the LightGBM/XGBoost
+rank-average ensemble has the strongest `jump_c2o` ranking result with AUC
+0.788 and edge-decile Spearman 1.000. The same ensemble produces the strongest
+`day_c2c` net proxy PnL, about 72,155 USD. Tuned rows are included as fairness
+checks and do not replace the untuned rows. The untuned FT-Transformer row is
+invalid because it produced no finite validation/test predictions; the tuned
+FT-Transformer trains but is not competitive. `reaction_o2c` is modeled as a
+diagnostic target, but its post-open realized variance is compared to
+full-event `IVAR_event`, so it is not a calibrated O2C mispricing or headline
+strategy result. The legacy in-repo proxy-Mamba rows are retired because they
+used a gated recurrent encoder rather than official `mamba-ssm`. The new
+sequence suite is a diagnostic-grade test of whether ordered pre-event
+proxy-surface paths add incremental information beyond tabular aggregates. The
+defensible conclusion is that nonlinear tabular models show preliminary
+cross-sectional ranking signal for earnings event-variance mispricing in a
+no-NBBO proxy sample. Paper-grade claims require historical quote/NBBO or
+equivalent data, quote-based IVAR, and leg-level execution with realistic
+bid/ask crossing.
 
 ## 1. Introduction
 
@@ -276,10 +280,20 @@ Sequence coverage is 678 eligible events out of 810. The default drop rate is
 | Market benchmark | Market-implied IVAR | Central level and no-edge baseline. |
 | Historical baselines | Last-four RVAR, last-four IVAR | Tests whether simple earnings history is enough. |
 | Classical mispricing benchmark | Goyal-Saretto-style RV-IV spread | Required option-return predictability comparator. |
-| Linear tabular | Elastic Net | Sparse linear event-level benchmark. |
-| Nonlinear tabular | LightGBM, XGBoost | Main current contenders. |
-| Neural tabular | FT-Transformer | Deep tabular comparator. |
-| Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU, official bidirectional `mamba-ssm`, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
+| Linear tabular | Elastic Net, Elastic Net tuned | Sparse linear event-level benchmark and sklearn `ElasticNetCV` fairness row. |
+| Nonlinear tabular | LightGBM, LightGBM tuned, XGBoost, XGBoost tuned | Main current contenders plus validation-only tuning rows. |
+| Neural tabular | FT-Transformer, FT-Transformer tuned | Deep tabular comparator; untuned FT is invalid/no usable predictions in the current run. |
+| Sequence diagnostics | Ridge-flat sequence aggregates, BiGRU, BiGRU 5-seed, official bidirectional `mamba-ssm`, official `mamba-ssm` 5-seed, mask-only and time-shuffle controls | Tests whether ordered pre-event paths add value. |
+
+The default protocol remains untuned and keeps the current model ids. The
+explicit `tuned_phase1` extension appends `linear_elastic_net_tuned`,
+`lightgbm_tuned`, `xgboost_tuned`, `ft_transformer_tuned`,
+`bigru_sequence_5seed`, and `mamba_ssm_sequence_5seed` rows. Tuning uses only
+train and locked-validation rows, selects on validation `jump_c2o` predicted-
+edge AUC with top-decile precision and RMSE tie-breakers, then refits on
+train+validation before a single locked-test evaluation. Untuned Elastic Net is
+the repo's custom coordinate-descent model; tuned Elastic Net uses sklearn
+`ElasticNetCV`.
 
 The sequence suite is diagnostic-grade in the current sample. Phase 1 now runs
 `jump_c2o`, `day_c2c`, and `reaction_o2c`; Phase 2 expands only to attention
@@ -325,16 +339,22 @@ only V1 proxy-PnL headline.
 | Market IVAR | 0.0097 | 0.0145 | 0.000 | 0.000 | 0.500 | n/a |
 | Goyal-Saretto spread | 0.0076 | 0.0134 | 0.141 | 0.300 | 0.602 | -461 |
 | Elastic Net | 0.0095 | 0.0213 | 0.323 | 0.500 | 0.629 | 47,938 |
+| Elastic Net tuned | 0.0086 | 0.0200 | 0.372 | 0.600 | 0.644 | 48,770 |
 | LightGBM | 0.0077 | 0.0192 | 0.355 | 0.500 | 0.745 | 69,908 |
+| LightGBM tuned | 0.0085 | 0.0197 | 0.321 | 0.500 | 0.666 | 50,370 |
 | XGBoost | 0.0074 | 0.0191 | 0.380 | 0.500 | 0.781 | 68,344 |
+| XGBoost tuned | 0.0079 | 0.0191 | 0.415 | 0.500 | 0.714 | 59,497 |
 | LightGBM/XGBoost ensemble | 0.0074 | 0.0191 | 0.397 | 0.500 | 0.788 | 72,155 |
-| FT-Transformer | 0.0374 | 0.0396 | -5.487 | 0.200 | 0.525 | -4,793 |
-| Official `mamba-ssm` sequence | 0.0087 | 0.0237 | 0.042 | 0.200 | 0.495 | -4,178 |
+| FT-Transformer | n/a | n/a | n/a | n/a | n/a | n/a |
+| FT-Transformer tuned | 0.2111 | 0.2122 | -214.079 | 0.200 | 0.490 | -5,934 |
+| Official `mamba-ssm` sequence | 0.0087 | 0.0238 | 0.044 | 0.200 | 0.510 | -2,692 |
+| Official `mamba-ssm` 5-seed | 0.0088 | 0.0239 | 0.024 | 0.200 | 0.501 | -1,793 |
 
 The central result is not that the lowest MAE model wins economically. The
 LightGBM/XGBoost ensemble has the strongest current combination of `jump_c2o`
-ranking and `day_c2c` premium-space proxy economics. Retired in-repo fake-Mamba
-rows are excluded from the paper table.
+ranking and `day_c2c` premium-space proxy economics. The tuned rows are
+important fairness checks, but they do not overturn the ensemble headline.
+Retired in-repo fake-Mamba rows are excluded from the paper table.
 
 ### 4.2 Results Order for the Manuscript
 
@@ -382,8 +402,9 @@ The current proxy-stage evidence supports a disciplined, limited conclusion.
 Nonlinear tabular models improve the ranking of earnings event-variance
 mispricing relative to market IVAR and simple historical benchmarks, and the
 best tabular models map this ranking signal into positive `day_c2c`
-premium-space proxy economics. XGBoost leads `jump_c2o` ranking quality, while
-LightGBM leads the current `day_c2c` proxy strategy screen.
+premium-space proxy economics. The LightGBM/XGBoost rank-average ensemble leads
+both `jump_c2o` ranking quality and the current `day_c2c` proxy strategy
+screen.
 
 The result is not a final execution claim. It is a credible signal-screening
 result that justifies either a paper-grade quote/NBBO extension or a conservative

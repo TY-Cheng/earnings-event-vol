@@ -571,6 +571,8 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
         mamba_backend=args.mamba_backend,
         mamba_seeds=_parse_comma_ints(args.mamba_seeds),
         bootstrap_iter=args.bootstrap_iter,
+        tuning_profile=args.tuning_profile,
+        tuning_seed=args.tuning_seed,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -866,6 +868,13 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--mamba-backend", choices=["mamba_ssm"], default="mamba_ssm")
     research.add_argument("--mamba-seeds", default="17")
     research.add_argument("--bootstrap-iter", type=int, default=200)
+    research.add_argument(
+        "--tuning-profile",
+        choices=["untuned", "tuned_phase1"],
+        default="untuned",
+        help="Optional model tuning protocol; untuned preserves the canonical proxy run.",
+    )
+    research.add_argument("--tuning-seed", type=int, default=17)
 
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")
     leakage_audit.add_argument("--features", type=Path, required=True)

@@ -46,8 +46,9 @@ Sequence route:
   claim.
 - Report sequence coverage, drop rate, and missingness by year and ticker.
 - Keep mask-only and deterministic time-shuffle controls.
-- Compare official `mamba-ssm` only after LightGBM/XGBoost, FT-Transformer, and
-  simple sequence baselines are tuned and reported.
+- Keep official `mamba-ssm` framed as a diagnostic unless a future run beats
+  mask-only/time-shuffle controls and tabular tuned rows on the common-row
+  bootstrap gate.
 
 ## Near-Term Engineering
 
@@ -58,6 +59,10 @@ Sequence route:
   machine-readable artifacts.
 - Add a small command that prints the current sample window, event count, IVAR
   coverage, model rows, and paper-grade flag.
+- Keep stale-result checks for `tuning_trials.csv`,
+  `tuning_selected_params.json`, and FT finite-prediction diagnostics so the
+  curated snapshot cannot silently mix old untuned results into the current
+  `tuned_phase1` story.
 - Keep generated data under the external `DATA_DIR`, and keep reports and
   figures under ignored `artifacts/`, `reports/`, or `site/`.
 

@@ -113,12 +113,28 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Transparent semi-structural tabular benchmark.",
         risk="Limited nonlinear interaction capacity.",
     ),
+    "linear_elastic_net_tuned": ModelSpec(
+        model_id="linear_elastic_net_tuned",
+        role="model_tuned",
+        implemented=True,
+        justification="Sklearn ElasticNetCV tuned on train/validation in tuned_phase1.",
+        risk=(
+            "Available through the research tuned_phase1 protocol, not the legacy train-models CLI."
+        ),
+    ),
     "lightgbm": ModelSpec(
         model_id="lightgbm",
         role="model",
         implemented=True,
         justification="Strong tabular ML baseline before deep models.",
         risk="Depends on optional LightGBM package availability.",
+    ),
+    "lightgbm_tuned": ModelSpec(
+        model_id="lightgbm_tuned",
+        role="model_tuned",
+        implemented=True,
+        justification="LightGBM with validation-only Optuna tuning and early stopping.",
+        risk="Depends on optional LightGBM, scikit-learn, and Optuna package availability.",
     ),
     "xgboost": ModelSpec(
         model_id="xgboost",
@@ -127,12 +143,26 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Strong tree-boosting benchmark paired with LightGBM.",
         risk="Depends on optional XGBoost package availability.",
     ),
+    "xgboost_tuned": ModelSpec(
+        model_id="xgboost_tuned",
+        role="model_tuned",
+        implemented=True,
+        justification="XGBoost with validation-only Optuna tuning and early stopping.",
+        risk="Depends on optional XGBoost, scikit-learn, and Optuna package availability.",
+    ),
     "ft_transformer": ModelSpec(
         model_id="ft_transformer",
         role="deep_model",
         implemented=True,
         justification="Deep tabular architecture for mixed event features.",
         risk="May not beat GBDT on small tabular panels.",
+    ),
+    "ft_transformer_tuned": ModelSpec(
+        model_id="ft_transformer_tuned",
+        role="deep_model_tuned",
+        implemented=True,
+        justification="FT-Transformer architecture/dropout/lr tuning in tuned_phase1.",
+        risk="May overfit small event panels despite validation-only selection.",
     ),
     "lightgbm_xgboost_mean_ensemble": ModelSpec(
         model_id="lightgbm_xgboost_mean_ensemble",
@@ -165,6 +195,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="LayerNorm BiGRU baseline for ordered pre-entry proxy-surface paths.",
         risk="Diagnostic; sequence sample has selection risk.",
     ),
+    "bigru_sequence_5seed": ModelSpec(
+        model_id="bigru_sequence_5seed",
+        role="sequence_baseline_tuned",
+        implemented=True,
+        justification="Five-seed BiGRU ensemble diagnostic for tuned_phase1.",
+        risk="Diagnostic only unless it clears mask-only/time-shuffle/common-row gates.",
+    ),
     "dilated_cnn_sequence": ModelSpec(
         model_id="dilated_cnn_sequence",
         role="sequence_baseline",
@@ -180,6 +217,13 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
             "Official mamba-ssm selective state-space block used as a diagnostic challenger."
         ),
         risk="Requires Linux/NVIDIA/CUDA; skipped when mamba-ssm is unavailable.",
+    ),
+    "mamba_ssm_sequence_5seed": ModelSpec(
+        model_id="mamba_ssm_sequence_5seed",
+        role="sequence_challenger_tuned",
+        implemented=True,
+        justification="Five-seed official mamba-ssm ensemble diagnostic for tuned_phase1.",
+        risk="Requires Linux/NVIDIA/CUDA; diagnostic only unless it clears sequence controls.",
     ),
     "mask_only_sequence": ModelSpec(
         model_id="mask_only_sequence",
@@ -505,7 +549,15 @@ def fit_xgboost(
 
 
 class FTTransformerRegressor(nn.Module):
-    def __init__(self, *, n_features: int, d_token: int = 32, n_heads: int = 4, n_layers: int = 2):
+    def __init__(
+        self,
+        *,
+        n_features: int,
+        d_token: int = 32,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.feature_projection = nn.Linear(1, d_token)
         self.feature_embedding = nn.Parameter(torch.zeros(n_features, d_token))
@@ -514,11 +566,17 @@ class FTTransformerRegressor(nn.Module):
             d_model=d_token,
             nhead=n_heads,
             dim_feedforward=d_token * 4,
+            dropout=dropout,
             batch_first=True,
             activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.head = nn.Sequential(nn.LayerNorm(d_token), nn.Linear(d_token, 1), nn.Softplus())
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_token),
+            nn.Dropout(dropout),
+            nn.Linear(d_token, 1),
+            nn.Softplus(),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.feature_projection(x.unsqueeze(-1)) + self.feature_embedding.unsqueeze(0)
@@ -785,15 +843,21 @@ def prediction_column_for_model(model_id: str) -> str:
         "last_four_ivar": "forecast_last_four_ivar",
         "goyal_saretto_rv_iv_spread": "forecast_goyal_saretto_rv_iv_spread",
         "linear_elastic_net": "forecast_linear_elastic_net",
+        "linear_elastic_net_tuned": "forecast_linear_elastic_net_tuned",
         "lightgbm": "forecast_lightgbm",
+        "lightgbm_tuned": "forecast_lightgbm_tuned",
         "xgboost": "forecast_xgboost",
+        "xgboost_tuned": "forecast_xgboost_tuned",
         "ft_transformer": "forecast_ft_transformer",
+        "ft_transformer_tuned": "forecast_ft_transformer_tuned",
         "lightgbm_xgboost_mean_ensemble": "forecast_lightgbm_xgboost_mean_ensemble",
         "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence",
         "attention_pooling_sequence": "forecast_attention_pooling_sequence",
         "bigru_sequence": "forecast_bigru_sequence",
+        "bigru_sequence_5seed": "forecast_bigru_sequence_5seed",
         "dilated_cnn_sequence": "forecast_dilated_cnn_sequence",
         "mamba_ssm_sequence": "forecast_mamba_ssm_sequence",
+        "mamba_ssm_sequence_5seed": "forecast_mamba_ssm_sequence_5seed",
         "mask_only_sequence": "forecast_mask_only_sequence",
         "time_shuffle_sequence": "forecast_time_shuffle_sequence",
         "lightgbm_with_hybrid_aggregates": "forecast_lightgbm_with_hybrid_aggregates",

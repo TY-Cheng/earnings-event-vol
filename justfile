@@ -1,6 +1,6 @@
 set dotenv-load := true
 set shell := ["bash", "-cu"]
-export PATH := "/home/tycheng/.local/bin:" + env_var_or_default("PATH", "")
+export PATH := env_var_or_default("HOME", "") + "/.local/bin:" + env_var_or_default("PATH", "")
 
 cli := "PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli"
 active_src := "src/earnings_event_vol"
