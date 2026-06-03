@@ -23,6 +23,11 @@ CALENDAR_COLUMNS = [
     "source",
     "source_timestamp",
     "source_id",
+    "filing_date",
+    "acceptance_local_date",
+    "acceptance_inferred_timing",
+    "announcement_date_source",
+    "filing_acceptance_date_mismatch",
     "cik",
     "form_type",
     "sec_items",
@@ -40,7 +45,7 @@ CALENDAR_COLUMNS = [
     "is_main_sample_candidate",
 ]
 
-_SEC_FORMS = {"8-K", "8-K/A"}
+_SEC_FORMS = {"8-K"}
 _BMO_CUTOFF = time(9, 30)
 _AMC_CUTOFF = time(16, 0)
 _EARNINGS_MARKERS = (
@@ -70,6 +75,7 @@ _SEC_ARCHIVE_URL_TEMPLATE = "https://data.sec.gov/submissions/{name}"
 _SEC_PRIMARY_DOCUMENT_URL_TEMPLATE = (
     "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{primary_document}"
 )
+_SECRET_QUERY_PATTERN = re.compile(r"(?i)((?:apiKey|api_key)=)[^&\s)]+")
 
 
 def _parse_date(value: object) -> date | None:
@@ -111,6 +117,13 @@ def infer_timing_from_acceptance_timestamp(value: object) -> AnnouncementTiming:
     return AnnouncementTiming.DMH
 
 
+def _acceptance_local_date(value: object) -> date | None:
+    timestamp = parse_aware_timestamp(value)
+    if timestamp is None:
+        return None
+    return timestamp.astimezone(NEW_YORK_TZ).date()
+
+
 def classify_8k_text(items_text: str | None) -> tuple[str, str]:
     if not items_text:
         return "missing_text", "Filing text was not available for this accession."
@@ -119,11 +132,23 @@ def classify_8k_text(items_text: str | None) -> tuple[str, str]:
         return "not_item_2_02_text", "The filing text does not contain Item 2.02."
     has_earnings_marker = any(marker in text for marker in _EARNINGS_MARKERS)
     has_non_earnings_marker = any(marker in text for marker in _NON_EARNINGS_MARKERS)
-    if has_earnings_marker:
-        return "validated_earnings_release", "Item 2.02 text describes quarterly results."
     if has_non_earnings_marker:
         return "non_earnings_item_2_02", "Item 2.02 text appears unrelated to quarterly earnings."
+    if has_earnings_marker:
+        return "validated_earnings_release", "Item 2.02 text describes quarterly results."
     return "ambiguous_item_2_02_text", "Item 2.02 is present but earnings-release wording is weak."
+
+
+def _safe_exception_text(exc: Exception, *, max_chars: int = 300) -> str:
+    text = str(exc)
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = " ".join(exc.response.text.strip().split())
+        text = (
+            f"HTTP {exc.response.status_code}: {body[:200]}"
+            if body
+            else f"HTTP {exc.response.status_code}"
+        )
+    return _SECRET_QUERY_PATTERN.sub(r"\1<redacted>", text)[:max_chars]
 
 
 def _recent_value(recent: Mapping[str, Any], key: str, index: int) -> object:
@@ -155,31 +180,53 @@ def _normalize_sec_submission_block(
         if "2.02" not in items:
             continue
         filing_date = _parse_date(_recent_value(block, "filingDate", index))
-        if filing_date is None or filing_date < start_date or filing_date > end_date:
-            continue
         acceptance = _recent_value(block, "acceptanceDateTime", index)
-        timing = infer_timing_from_acceptance_timestamp(acceptance)
+        acceptance_local_date = _acceptance_local_date(acceptance)
+        announcement_date = acceptance_local_date or filing_date
+        if (
+            announcement_date is None
+            or announcement_date < start_date
+            or announcement_date > end_date
+        ):
+            continue
+        inferred_timing = infer_timing_from_acceptance_timestamp(acceptance)
+        timing = AnnouncementTiming.UNKNOWN
         rows.append(
             {
                 "ticker": ticker.upper(),
-                "announcement_date": filing_date.isoformat(),
+                "announcement_date": announcement_date.isoformat(),
                 "announcement_timing": timing.value,
                 "source": source,
                 "source_timestamp": acceptance,
                 "source_id": _recent_value(block, "accessionNumber", index),
+                "filing_date": filing_date.isoformat() if filing_date is not None else "",
+                "acceptance_local_date": (
+                    acceptance_local_date.isoformat() if acceptance_local_date is not None else ""
+                ),
+                "acceptance_inferred_timing": inferred_timing.value,
+                "announcement_date_source": (
+                    "sec_acceptance_local_date_proxy"
+                    if acceptance_local_date is not None
+                    else "sec_filing_date"
+                ),
+                "filing_acceptance_date_mismatch": bool(
+                    filing_date is not None
+                    and acceptance_local_date is not None
+                    and filing_date != acceptance_local_date
+                ),
                 "cik": cik,
                 "form_type": form,
                 "sec_items": items,
                 "report_date": _recent_value(block, "reportDate", index),
                 "primary_document": _recent_value(block, "primaryDocument", index),
                 "primary_doc_description": _recent_value(block, "primaryDocDescription", index),
-                "timing_source": "sec_acceptance_timestamp",
-                "timing_confidence": "proxy",
+                "timing_source": "sec_acceptance_timestamp_proxy_not_main_sample",
+                "timing_confidence": "proxy_inconclusive",
                 "text_validation_status": "pending_text_validation",
                 "text_validation_reason": "",
                 "text_validation_source": "",
                 "text_validation_aux_status": "",
-                "is_main_sample_timing": timing in {AnnouncementTiming.BMO, AnnouncementTiming.AMC},
+                "is_main_sample_timing": False,
                 "is_validated_earnings_event": False,
                 "is_main_sample_candidate": False,
             }
@@ -467,7 +514,7 @@ def fetch_massive_8k_text_payloads(
                             "fetch_failure": "massive_8k_text_http_retry_exhausted",
                             "ticker": ticker.upper(),
                             "form_type": form_type,
-                            "error": str(exc),
+                            "error": _safe_exception_text(exc),
                         }
                     )
                     break
@@ -477,7 +524,7 @@ def fetch_massive_8k_text_payloads(
                             "fetch_failure": "massive_8k_text_transport_retry_exhausted",
                             "ticker": ticker.upper(),
                             "form_type": form_type,
-                            "error": str(exc),
+                            "error": _safe_exception_text(exc),
                         }
                     )
                     break
@@ -777,8 +824,12 @@ def build_earnings_calendar_report(
         else 0,
         "rows_by_ticker": _value_counts(frame, "ticker"),
         "timing_counts": _value_counts(frame, "announcement_timing"),
+        "acceptance_inferred_timing_counts": _value_counts(frame, "acceptance_inferred_timing"),
         "text_validation_counts": _value_counts(frame, "text_validation_status"),
         "text_validation_source_counts": _value_counts(frame, "text_validation_source"),
+        "filing_acceptance_date_mismatch_rows": int(frame["filing_acceptance_date_mismatch"].sum())
+        if "filing_acceptance_date_mismatch" in frame
+        else 0,
         "limitations": [
             (
                 "SEC acceptance time is a regulatory timestamp, not guaranteed first public "

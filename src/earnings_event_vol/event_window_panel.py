@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -9,8 +10,14 @@ import pandas as pd
 import polars as pl
 
 from earnings_event_vol.config import ProjectConfig
+from earnings_event_vol.earnings_calendar import infer_timing_from_acceptance_timestamp
 from earnings_event_vol.event_targets import add_event_return_targets
-from earnings_event_vol.events import regular_close_timestamp
+from earnings_event_vol.events import (
+    is_us_equity_trading_day,
+    market_close_timestamp,
+    next_us_equity_trading_day,
+    previous_us_equity_trading_day,
+)
 from earnings_event_vol.massive import (
     _run_head_object_command,
     build_download_file_command,
@@ -154,13 +161,22 @@ def _find_trading_day(
     include_target: bool,
     max_calendar_days: int = 10,
 ) -> date | None:
-    offset = 0 if include_target else direction
-    for _ in range(max_calendar_days + 1):
-        candidate = target + timedelta(days=offset)
-        if _ensure_underlying_file(config, candidate):
-            return candidate
-        offset += direction
-    return None
+    del config, max_calendar_days
+    if direction < 0:
+        return previous_us_equity_trading_day(target, include_target=include_target)
+    if direction > 0:
+        return next_us_equity_trading_day(target, include_target=include_target)
+    return target if include_target and is_us_equity_trading_day(target) else None
+
+
+def _source_timestamp_timing(row: dict[str, object]) -> AnnouncementTiming:
+    raw_inferred = row.get("acceptance_inferred_timing")
+    if raw_inferred is not None and not pd.isna(raw_inferred):
+        try:
+            return AnnouncementTiming(str(raw_inferred))
+        except ValueError:
+            pass
+    return infer_timing_from_acceptance_timestamp(row.get("source_timestamp"))
 
 
 def _load_underlying_bars(path: Path, tickers: set[str], day: date) -> list[dict[str, object]]:
@@ -195,24 +211,28 @@ def _load_option_day_contracts(
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     ticker = str(event["ticker"]).upper()
-    prefix = f"O:{ticker}"
+    option_ticker_pattern = rf"^O:{re.escape(ticker)}\d{{6}}[CP]\d{{8}}$"
     entry_date = pd.Timestamp(event["entry_date"]).date()
     exit_date = pd.Timestamp(event["exit_date"]).date()
     spot = float(event["s_before"])
     frame = pl.read_parquet(path)
     if "transactions" not in frame.columns:
         frame = frame.with_columns(pl.lit(0).alias("transactions"))
-    frame = frame.filter(pl.col("ticker").str.starts_with(prefix))
+    frame = frame.filter(pl.col("ticker").str.contains(option_ticker_pattern))
     for row in frame.iter_rows(named=True):
         option_symbol = str(row["ticker"])
         try:
             parsed = parse_massive_option_ticker(option_symbol)
         except ValueError:
             continue
+        if str(parsed["ticker"]).upper() != ticker:
+            continue
         expiration = parsed["expiration"]
         assert isinstance(expiration, date)
         dte = (expiration - entry_date).days
-        if dte < dte_min or dte > dte_max or expiration < exit_date:
+        requested_dte_min = int(event.get("requested_dte_min", dte_min))
+        requested_dte_max = int(event.get("requested_dte_max", dte_max))
+        if dte < 0 or dte > dte_max or expiration < exit_date:
             continue
         close_value = cast(Any, row["close"])
         volume_value = cast(Any, row["volume"])
@@ -221,7 +241,7 @@ def _load_option_day_contracts(
         if close <= 0 or volume <= 0:
             continue
         strike = float(cast(Any, parsed["strike"]))
-        in_requested_dte = dte <= int(event.get("requested_dte_max", dte_max))
+        in_requested_dte = requested_dte_min <= dte <= requested_dte_max
         rows.append(
             {
                 "event_id": event["event_id"],
@@ -260,8 +280,15 @@ def _select_near_atm_contracts(
 ) -> pd.DataFrame:
     selected: list[pd.DataFrame] = []
     for (_event_id, _expiration), group in contracts.groupby(["event_id", "expiration"]):
+        pair_counts = group.groupby("strike")["right"].nunique()
+        paired_strikes = pair_counts.loc[pair_counts.ge(2)].index
+        candidate_group = (
+            group.loc[group["strike"].isin(paired_strikes)].copy()
+            if len(paired_strikes) > 0
+            else group
+        )
         strikes = (
-            group[["strike", "moneyness_abs"]]
+            candidate_group[["strike", "moneyness_abs"]]
             .drop_duplicates()
             .sort_values(["moneyness_abs", "strike"])
             .head(strikes_per_expiry)["strike"]
@@ -297,15 +324,24 @@ def build_event_window_panel(
     audit_dir = out_root / "calendar_audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     _write_parquet(silver_calendar_dir / "main_sample.parquet", main)
-    local_ts = pd.to_datetime(main["source_timestamp"], utc=True, errors="coerce").dt.tz_convert(
+    source_timestamp = main.get(
+        "source_timestamp",
+        pd.Series([pd.NaT] * len(main), index=main.index, dtype=object),
+    )
+    local_ts = pd.to_datetime(source_timestamp, utc=True, errors="coerce").dt.tz_convert(
         "America/New_York"
+    )
+    timing_confidence = (
+        main["timing_confidence"].astype(str)
+        if "timing_confidence" in main.columns
+        else pd.Series([], dtype=str)
     )
     audit_report = {
         "candidate_rows": int(len(calendar)),
         "main_sample_rows": int(len(main)),
         "main_timing_counts": main["announcement_timing"].value_counts().to_dict(),
         "main_text_validation_counts": main["text_validation_status"].value_counts().to_dict(),
-        "proxy_timing_rows": int(main["timing_confidence"].eq("proxy").sum()),
+        "proxy_timing_rows": int(timing_confidence.str.startswith("proxy").sum()),
         "accepted_local_date_mismatch_rows": int(
             (local_ts.dt.date != main["announcement_date"]).sum()
         ),
@@ -320,7 +356,21 @@ def build_event_window_panel(
     for row in main.to_dict("records"):
         announcement_date = row["announcement_date"]
         timing = AnnouncementTiming(str(row["announcement_timing"]))
-        if timing == AnnouncementTiming.AMC:
+        source_timing = _source_timestamp_timing(row)
+        exclusion_reason = None
+        if source_timing == AnnouncementTiming.DMH or (
+            source_timing in {AnnouncementTiming.BMO, AnnouncementTiming.AMC}
+            and timing in {AnnouncementTiming.BMO, AnnouncementTiming.AMC}
+            and source_timing != timing
+        ):
+            entry_date = None
+            exit_date = None
+            exclusion_reason = "source_timestamp_timing_mismatch"
+        elif not is_us_equity_trading_day(announcement_date):
+            entry_date = None
+            exit_date = None
+            exclusion_reason = "announcement_date_not_trading_day"
+        elif timing == AnnouncementTiming.AMC:
             entry_date = _find_trading_day(
                 config, announcement_date, direction=-1, include_target=True
             )
@@ -337,7 +387,8 @@ def build_event_window_panel(
         else:
             entry_date = None
             exit_date = None
-        exclusion_reason = None if entry_date and exit_date else "missing_entry_or_exit_date"
+        if exclusion_reason is None and (not entry_date or not exit_date):
+            exclusion_reason = "missing_entry_or_exit_date"
         window_rows.append(
             {
                 **row,
@@ -347,13 +398,24 @@ def build_event_window_panel(
                 "requested_dte_min": dte_min,
                 "requested_dte_max": dte_max,
                 "ivar_support_dte_max": second_expiry_dte_max,
-                "event_entry_timestamp": regular_close_timestamp(entry_date).isoformat()
+                "event_entry_timestamp": market_close_timestamp(entry_date).isoformat()
                 if entry_date
                 else None,
                 "exclusion_reason": exclusion_reason,
             }
         )
-    windows = pd.DataFrame(window_rows)
+    window_columns = [
+        *main.columns,
+        "entry_date",
+        "exit_date",
+        "feature_cutoff_date",
+        "requested_dte_min",
+        "requested_dte_max",
+        "ivar_support_dte_max",
+        "event_entry_timestamp",
+        "exclusion_reason",
+    ]
+    windows = pd.DataFrame(window_rows, columns=window_columns)
     _write_parquet(silver_windows_dir / "event_windows.parquet", windows)
 
     tickers = set(windows["ticker"].astype(str).str.upper())
@@ -369,6 +431,13 @@ def build_event_window_panel(
     bars = pd.DataFrame(bar_rows)
     _write_parquet(silver_windows_dir / "underlying_event_bars.parquet", bars)
     windows = add_event_return_targets(windows, bars)
+    for column in ("s_before", "s_after"):
+        if column not in windows.columns:
+            windows[column] = pd.NA
+    missing_underlying = windows["exclusion_reason"].isna() & (
+        windows["s_before"].isna() | windows["s_after"].isna()
+    )
+    windows.loc[missing_underlying, "exclusion_reason"] = "missing_underlying_entry_or_exit_bar"
     _write_parquet(silver_windows_dir / "event_windows.parquet", windows)
 
     contract_rows: list[dict[str, object]] = []
@@ -389,7 +458,33 @@ def build_event_window_panel(
                     dte_max=second_expiry_dte_max,
                 )
             )
-    contracts = pd.DataFrame(contract_rows)
+    contract_columns = [
+        "event_id",
+        "ticker",
+        "entry_date",
+        "exit_date",
+        "expiration",
+        "strike",
+        "right",
+        "options_ticker",
+        "option_close",
+        "volume",
+        "transactions",
+        "dte",
+        "moneyness_abs",
+        "covers_event_window",
+        "option_multiplier",
+        "contract_size",
+        "deliverable_status",
+        "corporate_action_flag",
+        "contract_discovery_status",
+        "eligible_for_quote_pool",
+        "is_main_dte_5_14",
+        "is_robustness_dte_3_21",
+        "is_ivar_support_only",
+        "quote_route",
+    ]
+    contracts = pd.DataFrame(contract_rows, columns=contract_columns)
     if not contracts.empty:
         contracts = _select_near_atm_contracts(contracts, strikes_per_expiry=strikes_per_expiry)
     _write_parquet(silver_contracts_dir / "event_contract_candidates.parquet", contracts)

@@ -94,8 +94,8 @@ Evaluation:
 
 - Forecast metrics include MAE, RMSE, QLIKE, and OOS R2 versus market-implied
   IVAR.
-- Ranking metrics include AUC, Brier score, calibration, and top-decile
-  precision.
+- Ranking metrics include AUC, rank-probability Brier diagnostics, calibration
+  diagnostics, and top-decile precision.
 - Strategy metrics include net proxy PnL, return on premium or capital, Sharpe,
   Sortino, drawdown, hit rate, tail loss, turnover, and cost sensitivity.
 - Inference does not rely on naive t-stats only; event-date, ticker, two-way

@@ -120,10 +120,15 @@ just research-report
 just docs
 ```
 
-`just check` formats, fixes lint, runs mypy, pytest, MkDocs strict build,
-status, and source probes.
+`just status` is a lightweight environment diagnostic. It checks the resolved
+repo, `DATA_DIR`, report/artifact roots, and configured secret-file paths
+without downloading data, rebuilding artifacts, or training models.
 
-`just data` runs the active proxy-all DAG:
+`just check` is the full handoff gate. It formats, fixes lint, runs mypy,
+pytest with the 95% coverage threshold, MkDocs strict build, docs-figure sync
+checks, `status`, and source probes.
+
+`just data` runs the active `all` data DAG:
 
 ```text
 options-day-aggs-bulk -> universe -> dynamic-calendar -> sec-companyfacts

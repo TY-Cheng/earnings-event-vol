@@ -26,7 +26,9 @@ Project identity and workflow:
 - `justfile` calls `python -m earnings_event_vol.cli`.
 - Public command surface stays small: `status`, `audit`, `data`, `research`,
   `docs`, and `check`.
-- `just check` remains the handoff gate.
+- `just status` is a lightweight environment diagnostic for resolved local
+  paths and secret-file configuration; it is not a data/research rebuild.
+- `just check` remains the full handoff gate.
 - The test gate enforces at least 95% coverage.
 
 Credential safety:

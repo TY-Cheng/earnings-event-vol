@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 class AnnouncementTiming(StrEnum):
@@ -73,6 +74,12 @@ class OptionQuote(BaseModel):
     vega: float | None = None
     quote_source: QuoteSource = QuoteSource.UNKNOWN
     option_multiplier: int = Field(default=100, gt=0)
+
+    @model_validator(mode="after")
+    def validate_quote_order(self) -> Self:
+        if self.ask < self.bid:
+            raise ValueError("ask must be greater than or equal to bid")
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -165,6 +172,12 @@ class FeatureRow(BaseModel):
     feature_asof_timestamp: datetime
     event_entry_timestamp: datetime
 
+    @model_validator(mode="after")
+    def validate_asof_not_after_entry(self) -> Self:
+        if self.feature_asof_timestamp > self.event_entry_timestamp:
+            raise ValueError("feature_asof_timestamp must be <= event_entry_timestamp")
+        return self
+
 
 class SignalRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -180,6 +193,19 @@ class SignalRecord(BaseModel):
     expected_strategy_edge_usd: float
     estimated_transaction_cost_usd: float = Field(ge=0)
     threshold_multiplier: float = Field(default=1.5, gt=0)
+
+    @model_validator(mode="after")
+    def validate_edge_identities(self) -> Self:
+        tolerance = 1e-9
+        if abs(self.edge_var - (self.forecast_rvar_event - self.ivar_event)) > tolerance:
+            raise ValueError("edge_var must equal forecast_rvar_event - ivar_event")
+        premium_edge = self.expected_strategy_value_usd - self.market_entry_cost_usd
+        if abs(self.expected_strategy_edge_usd - premium_edge) > tolerance:
+            raise ValueError(
+                "expected_strategy_edge_usd must equal expected_strategy_value_usd "
+                "- market_entry_cost_usd"
+            )
+        return self
 
     @computed_field  # type: ignore[prop-decorator]
     @property

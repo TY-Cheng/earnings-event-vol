@@ -1,0 +1,127 @@
+# Current State and Caveats
+
+Updated for `/home/tycheng/projects/earnings-event-vol` on 2026-05-12 after
+the canonical FE V2 tuned run and same-code FE V1 versus FE V2 ablation.
+
+## Local Execution Status
+
+- Run commands through WSL, for example:
+  `wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol -- bash -lc "just check"`.
+- `.env` is machine-local and ignored. It should set
+  `UV_PROJECT_ENVIRONMENT=/home/tycheng/.venvs/earnings-event-vol` and a
+  device-specific absolute `DATA_DIR` outside the repo.
+- Current local `DATA_DIR` is `/home/tycheng/data/earnings-event-vol`.
+- Current canonical command:
+  `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1 --feature-schema-version fe_v2_sec_xbrl"`.
+- Active `artifacts/modeling/research_manifest.json` reports `ok=true`,
+  `stage=all`, `sequence_suite=all`, `bootstrap_iter=1000`,
+  `tuning_profile=tuned_phase1`, `feature_schema_version=fe_v2_sec_xbrl`, and
+  `tuning_seed=17`.
+- The active FE V2 run produced 2,430 prediction rows and 33 trained
+  model-target fits. Event-level model features: 243. Tree model features: 397.
+- Tuning artifacts exist at `artifacts/modeling/tuning_trials.csv` and
+  `artifacts/modeling/tuning_selected_params.json`; both carry
+  `feature_schema_version` and `tuning_profile`, and selected params record
+  `test_metrics_used_for_selection=false`.
+- FE ablation snapshots are saved locally under
+  `artifacts/modeling_ablations/fe_v2_sec_xbrl/` and
+  `artifacts/modeling_ablations/fe_v1_legacy/`. Active artifacts were restored
+  to FE V2 after the FE V1 run.
+- `just mamba-doctor` has passed locally under WSL2 with CUDA and official
+  `mamba-ssm`; sequence rows remain diagnostic without the bootstrap gate.
+
+## Research Question and Scope
+
+The paper-facing question is whether models improve trading decisions around
+option-implied earnings event variance mispricing. This is not generic implied
+volatility forecasting. Forecasting is evaluated alongside ranking quality and
+premium-space proxy economics after costs.
+
+## Current Data and Execution Grade
+
+- Current proxy window: 2022-12-01 through 2025-12-31.
+- Dynamic calendar rows: 1,054.
+- BMO/AMC main-sample events: 810.
+- Trade-proxy event-panel rows: 810.
+- Events with C2C `rvar_event` alias: 801.
+- Events with trade-proxy `IVAR_event`: 693.
+- Proxy contracts: 12,038.
+- Usable pre-cutoff proxy contract prices: 10,165.
+- Contracts with local IV proxy: 10,138.
+- Proxy straddle diagnostic rows: 779.
+- Panel grade: `no_nbbo_trade_proxy`.
+- `paper_grade=false`; no bid/ask, OPRA, or NBBO execution claim.
+
+## Target System
+
+- `jump_c2o`: primary scientific target, close-to-open earnings jump variance.
+- `day_c2c`: literature-compatible target and the only V1 proxy-PnL headline.
+- `reaction_o2c`: post-open digestion diagnostic.
+
+## Model and Feature Status
+
+- Default feature schema is `fe_v2_sec_xbrl`; `fe_v1_legacy` is retained for
+  same-code ablation.
+- The resolved `feature_schema_report.csv` allowlist controls model features.
+  Raw IDs, raw year/month, exit/outcome/PnL fields, and post-event labels are
+  excluded from model inputs.
+- `tuned_phase1` is the canonical tuned protocol. It uses train and
+  locked-validation rows for selection, then refits on train+validation and
+  evaluates locked test once.
+- Current model rows include market IVAR, last-four RVAR, last-four IVAR,
+  Goyal-Saretto spread, Elastic Net, LightGBM, XGBoost, LightGBM/XGBoost
+  rank-average ensemble, FT-Transformer, ridge-flat sequence aggregates,
+  BiGRU 5-seed, official `mamba-ssm` 5-seed, attention pooling, dilated CNN,
+  mask-only, and time-shuffle.
+
+## Sequence Status
+
+- Active hybrid sequence tensor: `31 x 21`, with 19 prior daily steps plus
+  12 entry-day five-minute trade-aggregate proxy bins.
+- Sequence eligible events: 678 out of 810.
+- Drop rate: 16.3%; `high_sequence_selection_risk=true`.
+- Hybrid sequence is not sparse: 682 events have at least eight valid intraday
+  bins; median hybrid feature-mask density is 0.7419.
+- Legacy fake Mamba ids (`daily_mamba_20step`, `hybrid_mamba_31step`,
+  `intraday_only_mamba_12step`, `mask_only_hybrid_mamba`) are retired because
+  they were in-repo gated-RNN variants, not official `mamba-ssm`.
+- The full sequence suite did not pass the diagnostic gate. Do not sell Mamba
+  or any sequence model as the contribution under current evidence.
+
+## Current Result Summary
+
+Active FE V2 canonical run:
+
+- Best `jump_c2o` AUC: Goyal-Saretto spread, about 0.602.
+- Best `jump_c2o` OOS R2 versus IVAR: LightGBM, about 0.203.
+- Best `day_c2c` headline proxy PnL: ridge-flat sequence aggregates, about
+  19,918 USD, but this remains diagnostic because the sequence gate fails.
+- Tuned LightGBM/XGBoost FE V2 rows have weak `jump_c2o` AUC and negative
+  `day_c2c` headline proxy PnL.
+
+Same-code FE V1 ablation:
+
+- `jump_c2o`: LightGBM has best AUC, about 0.677; XGBoost has best OOS R2
+  versus IVAR, about 0.375.
+- `day_c2c`: LightGBM leads the headline proxy strategy, about 53,664 USD net
+  PnL; XGBoost has best OOS R2 versus IVAR, about 0.574.
+- `reaction_o2c`: ridge-flat sequence leads AUC at about 0.799 and XGBoost has
+  best OOS R2, about 0.949; O2C remains diagnostic.
+
+Current sell:
+
+- The defensible signal-screening claim is a parsimonious FE V1 tabular signal
+  in a no-NBBO proxy sample.
+- FE V2 is a negative diagnostic result, not a headline improvement.
+- Sequence rows, including official `mamba-ssm`, remain diagnostic.
+
+## Caveats
+
+- Trade aggregates are OHLCV trade bars, not quotes, bid/ask, or NBBO.
+- IV and surface language must say close-trade-implied or trade-aggregate
+  proxy.
+- C2C proxy PnL is economic screening evidence only.
+- C2O and O2C proxy PnL are diagnostic decompositions only.
+- Paper-grade claims require historical bid/ask or NBBO-equivalent data,
+  quote-based IVAR, leg-level execution with bid/ask crossing, and robust
+  inference.

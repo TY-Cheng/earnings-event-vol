@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -13,11 +15,13 @@ import pandas as pd
 
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.event_panel import CONTRACT_STATUS_NON_STANDARD_EXCLUDED
-from earnings_event_vol.massive import read_secret_file
+from earnings_event_vol.massive import parse_massive_option_ticker, read_secret_file
 
 CONTRACT_REFERENCE_SCHEMA_VERSION = "v1"
 CONTRACT_REFERENCE_SOURCE_DATASET = "massive_reference_options_contracts"
+CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED = "contract_reference_unvalidated_excluded"
 QueryParamValue = str | int | float | bool | None
+_SECRET_QUERY_PATTERN = re.compile(r"(?i)((?:apiKey|api_key)=)[^&\s)]+")
 
 REFERENCE_STATUS_VALIDATED = "validated"
 REFERENCE_STATUS_FETCH_FAILED = "fetch_failed"
@@ -74,6 +78,18 @@ def _load_cached_payload(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _redact_secret_query_params(text: str) -> str:
+    return _SECRET_QUERY_PATTERN.sub(r"\1<redacted>", text)
+
+
+def _safe_exception_text(exc: Exception, *, max_chars: int = 300) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = _redact_secret_query_params(" ".join(exc.response.text.strip().split()))
+        suffix = f": {body[:200]}" if body else ""
+        return _redact_secret_query_params(f"HTTP {exc.response.status_code}{suffix}")[:max_chars]
+    return _redact_secret_query_params(str(exc))[:max_chars]
+
+
 def _extract_result(payload: dict[str, Any] | None, options_ticker: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -87,11 +103,18 @@ def _extract_result(payload: dict[str, Any] | None, options_ticker: str) -> dict
         for item in result:
             if isinstance(item, dict) and str(item.get("ticker", "")).upper() == upper_ticker:
                 return item
-        first = result[0]
-        return first if isinstance(first, dict) else None
+        return None
     if any(key in payload for key in ("shares_per_contract", "additional_underlyings", "ticker")):
         return payload
     return None
+
+
+def _expiration_from_options_ticker(options_ticker: str) -> date | None:
+    try:
+        expiration = parse_massive_option_ticker(options_ticker)["expiration"]
+    except ValueError:
+        return None
+    return expiration if isinstance(expiration, date) else None
 
 
 def _additional_underlyings_count(value: Any) -> int:
@@ -183,7 +206,15 @@ def fetch_massive_option_contract_reference(
         f"{base}/v3/reference/options/contracts/{encoded}",
         f"{base}/v3/reference/options/contracts",
     ]
-    fallback_params: dict[str, QueryParamValue] = {"apiKey": api_key, "ticker": ticker, "limit": 1}
+    fallback_params: dict[str, QueryParamValue] = {
+        "apiKey": api_key,
+        "ticker": ticker,
+        "expired": "true",
+        "limit": 1,
+    }
+    expiration = _expiration_from_options_ticker(ticker)
+    if expiration is not None:
+        fallback_params["as_of"] = expiration.isoformat()
     last_error: str | None = None
     for index, url in enumerate(urls):
         try:
@@ -210,12 +241,12 @@ def fetch_massive_option_contract_reference(
             )
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code
-            last_error = f"HTTP {status_code}: {exc.response.text[:200]}"
+            last_error = _safe_exception_text(exc)
             if status_code in {400, 404} and index == 0:
                 continue
             break
         except Exception as exc:  # pragma: no cover - network defensive path
-            last_error = str(exc)
+            last_error = _safe_exception_text(exc)
             break
 
     return ContractReferenceFetchResult(
@@ -268,6 +299,16 @@ def apply_contract_reference_validation(
         out["contract_reference_status"] = REFERENCE_STATUS_NOT_REQUESTED
         out["contract_reference_validated"] = False
         out["contract_reference_source_dataset"] = CONTRACT_REFERENCE_SOURCE_DATASET
+        if "eligible_for_quote_pool" in out.columns:
+            out.loc[:, "eligible_for_quote_pool"] = False
+        if "is_main_dte_5_14" in out.columns:
+            out.loc[:, "is_main_dte_5_14"] = False
+        if "is_robustness_dte_3_21" in out.columns:
+            out.loc[:, "is_robustness_dte_3_21"] = False
+        out.loc[
+            out["contract_discovery_status"].astype(str).eq("ok"),
+            "contract_discovery_status",
+        ] = CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED
         return out
 
     required = {"options_ticker", "contract_reference_status"}
@@ -299,7 +340,12 @@ def apply_contract_reference_validation(
     )
     out["contract_reference_source_dataset"] = CONTRACT_REFERENCE_SOURCE_DATASET
 
-    shares = pd.to_numeric(out.get("contract_reference_shares_per_contract"), errors="coerce")
+    raw_shares = (
+        out["contract_reference_shares_per_contract"]
+        if "contract_reference_shares_per_contract" in out
+        else pd.Series(pd.NA, index=out.index, dtype="Float64")
+    )
+    shares = pd.to_numeric(raw_shares, errors="coerce")
     validated = out["contract_reference_validated"].astype(bool)
     out["option_multiplier"] = pd.to_numeric(out.get("option_multiplier"), errors="coerce")
     out["contract_size"] = pd.to_numeric(out.get("contract_size"), errors="coerce")
@@ -310,6 +356,7 @@ def apply_contract_reference_validation(
     adjusted = out.get("contract_reference_has_adjusted_deliverable", False)
     adjusted = pd.Series(adjusted, index=out.index).fillna(False).astype(bool)
     non_standard = validated & (shares.ne(100) | adjusted)
+    unvalidated = ~validated
     if "deliverable_status" not in out.columns:
         out["deliverable_status"] = "standard"
     out.loc[validated & ~non_standard, "deliverable_status"] = "standard"
@@ -322,9 +369,13 @@ def apply_contract_reference_validation(
 
     out.loc[non_standard, "contract_discovery_status"] = CONTRACT_STATUS_NON_STANDARD_EXCLUDED
     if "eligible_for_quote_pool" in out.columns:
-        out.loc[non_standard, "eligible_for_quote_pool"] = False
+        out.loc[non_standard | unvalidated, "eligible_for_quote_pool"] = False
     if "is_main_dte_5_14" in out.columns:
-        out.loc[non_standard, "is_main_dte_5_14"] = False
+        out.loc[non_standard | unvalidated, "is_main_dte_5_14"] = False
     if "is_robustness_dte_3_21" in out.columns:
-        out.loc[non_standard, "is_robustness_dte_3_21"] = False
+        out.loc[non_standard | unvalidated, "is_robustness_dte_3_21"] = False
+    out.loc[
+        unvalidated & out["contract_discovery_status"].astype(str).eq("ok"),
+        "contract_discovery_status",
+    ] = CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED
     return out

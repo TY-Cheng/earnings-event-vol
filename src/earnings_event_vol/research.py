@@ -59,7 +59,8 @@ from earnings_event_vol.models import (
 from earnings_event_vol.schemas import OptionRight
 
 FORECAST_FLOOR = 1e-6
-DEFAULT_HAIRCUT_BPS = 0.005
+DEFAULT_PROXY_COST_FRACTION = 0.005
+DEFAULT_HAIRCUT_BPS = DEFAULT_PROXY_COST_FRACTION
 DEFAULT_OPTION_MULTIPLIER = 100.0
 DEFAULT_CONTRACTS = 1.0
 LOOKBACK_DAYS = 20
@@ -290,6 +291,13 @@ def write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
 
+def read_json(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object at {path}")
+    return payload
+
+
 def read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
@@ -302,6 +310,86 @@ def write_table(path: Path, frame: pd.DataFrame) -> None:
         frame.to_parquet(path, index=False)
     else:
         frame.to_csv(path, index=False)
+
+
+def feature_matrix_manifest_path(paths: ResearchPaths) -> Path:
+    return paths.modeling_artifacts_dir / "feature_matrix_manifest.json"
+
+
+def write_feature_matrix_manifest(
+    paths: ResearchPaths,
+    *,
+    feature_schema_version: str,
+    split_design: str,
+    split_date: str | None,
+    row_count: int,
+    market_covariate_columns: int,
+    market_second_columns: int,
+) -> Path:
+    manifest_path = feature_matrix_manifest_path(paths)
+    write_json(
+        manifest_path,
+        {
+            "feature_matrix": str(paths.feature_matrix_path),
+            "feature_schema_version": feature_schema_version,
+            "split_design": split_design,
+            "split_date": split_date,
+            "row_count": int(row_count),
+            "market_covariate_columns": int(market_covariate_columns),
+            "market_second_columns": int(market_second_columns),
+        },
+    )
+    return manifest_path
+
+
+def validate_feature_matrix_manifest(
+    paths: ResearchPaths,
+    *,
+    feature_schema_version: str,
+) -> dict[str, object]:
+    manifest_path = feature_matrix_manifest_path(paths)
+    if not manifest_path.exists():
+        raise ValueError(
+            "feature_matrix_manifest.json is missing; rerun `just research --stage features` "
+            "or `just research` before `--stage models`."
+        )
+    manifest = read_json(manifest_path)
+    actual = str(manifest.get("feature_schema_version", ""))
+    if actual != feature_schema_version:
+        raise ValueError(
+            "cached feature matrix schema mismatch: "
+            f"manifest has {actual!r}, requested {feature_schema_version!r}"
+        )
+    return manifest
+
+
+REQUIRED_REPORT_ARTIFACTS = (
+    "forecast_metrics.csv",
+    "ranking_metrics.csv",
+    "strategy_metrics.csv",
+    "model_fit_diagnostics.csv",
+    "model_predictions.parquet",
+)
+
+
+def missing_report_artifacts(paths: ResearchPaths) -> list[str]:
+    missing: list[str] = []
+    for name in REQUIRED_REPORT_ARTIFACTS:
+        path = (
+            paths.predictions_path
+            if name == "model_predictions.parquet"
+            else paths.modeling_artifacts_dir / name
+        )
+        if not path.exists() or path.stat().st_size <= 0:
+            missing.append(name)
+            continue
+        if path.suffix == ".csv":
+            try:
+                if pd.read_csv(path, nrows=1).empty:
+                    missing.append(name)
+            except pd.errors.EmptyDataError:
+                missing.append(name)
+    return missing
 
 
 def ensure_event_id(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1667,10 +1755,10 @@ def build_sequence_tensor(
 def proxy_transaction_cost(
     entry_premium_usd: Sequence[float],
     *,
-    haircut_bps: float = DEFAULT_HAIRCUT_BPS,
+    cost_fraction: float = DEFAULT_PROXY_COST_FRACTION,
 ) -> np.ndarray:
     premium = np.asarray(entry_premium_usd, dtype=float)
-    return haircut_bps * premium
+    return cost_fraction * premium
 
 
 def enrich_feature_matrix_for_research(
@@ -1735,6 +1823,7 @@ def enrich_feature_matrix_for_research(
         else:
             out[cost_col] = np.nan
     out["cost_model"] = "proxy_haircut"
+    out["proxy_cost_fraction"] = DEFAULT_PROXY_COST_FRACTION
     out["haircut_bps"] = DEFAULT_HAIRCUT_BPS
     out["bid_ask_costs_unavailable"] = True
     out = assign_event_splits(out, split_design=split_design, split_date=split_date)
@@ -3176,7 +3265,7 @@ def _train_model_dispatch(
             tensor_path=hybrid_tensor_path,
             model_id=model_id,
             base_model_id="bigru_encoder",
-            seeds=TUNING_SEQUENCE_ENSEMBLE_SEEDS,
+            seeds=mamba_seeds,
         )
     if model_id == "mamba_ssm_sequence_5seed":
         _ = mamba_backend
@@ -3185,7 +3274,7 @@ def _train_model_dispatch(
             tensor_path=hybrid_tensor_path,
             model_id=model_id,
             base_model_id="mamba_ssm_encoder",
-            seeds=TUNING_SEQUENCE_ENSEMBLE_SEEDS,
+            seeds=mamba_seeds,
         )
     if model_id in {
         "attention_pooling_sequence",
@@ -4115,7 +4204,12 @@ def build_metric_tables(
                         "liquidity_bucket",
                     ):
                         if breakdown in trades.columns and not trades.empty:
-                            table = breakdown_metrics(trades, by=[breakdown], forecast_col=column)
+                            table = breakdown_metrics(
+                                trades,
+                                by=[breakdown],
+                                forecast_col=column,
+                                gross_pnl_col="gross_strategy_pnl_usd",
+                            )
                             table.insert(0, "feature_schema_version", feature_schema_version)
                             table.insert(1, "tuning_profile", tuning_profile)
                             table.insert(2, "target_id", target_id)
@@ -4959,6 +5053,7 @@ def write_proxy_research_report(
         )
         keep = [
             "strategy_proxy_kind",
+            "pnl_headline_eligible",
             "model_id",
             "n",
             "net_pnl_usd",
@@ -5138,7 +5233,8 @@ def write_proxy_research_report(
         ),
         "- Data coverage and selection-risk diagnostics are summarized in Appendix A.",
         "- Cost model: `cost_model=proxy_haircut`, "
-        f"`haircut_bps={DEFAULT_HAIRCUT_BPS}`, `bid_ask_costs_unavailable=true`. "
+        f"`proxy_cost_fraction={DEFAULT_PROXY_COST_FRACTION}`, "
+        "`bid_ask_costs_unavailable=true`. "
         "Multiplier 0 is a sensitivity anchor, not a realistic execution-cost assumption.",
         "",
         "## Methods: Models and Configuration",
@@ -5458,7 +5554,7 @@ def write_proxy_research_report(
         bullets=[
             (
                 "The default cost model is a proxy haircut: "
-                "`proxy_cost_usd = 0.005 * entry_premium_usd`."
+                f"`proxy_cost_usd = {DEFAULT_PROXY_COST_FRACTION:.3f} * entry_premium_usd`."
             ),
             (
                 "Multiplier 0 is shown only as an anchor; multiplier 1 is the default proxy "
@@ -5532,12 +5628,12 @@ def write_proxy_research_report(
             "## Interpretation",
             "",
             (
-                "The current proxy evidence supports a simple interpretation: tabular nonlinear "
-                "models are useful for sorting earnings events by realized mispricing and proxy "
-                "economic edge. The result is economically meaningful in this proxy setting "
-                "because the strongest models also improve the cost-aware strategy layer. "
-                "The sequence suite is a diagnostic test of whether ordered pre-event "
-                "proxy-surface paths add information beyond tabular aggregates."
+                "Interpretation is intentionally model-by-model: the forecast, ranking, and "
+                "strategy tables above determine whether a model improves mispricing sorting "
+                "and cost-aware proxy economics in this run. Positive RMSE or ranking results "
+                "alone are not treated as economic evidence. The sequence suite remains a "
+                "diagnostic test of whether ordered pre-event proxy-surface paths add "
+                "information beyond tabular aggregates."
             ),
             "",
             "## Appendix",
@@ -5579,10 +5675,10 @@ def write_proxy_research_report(
             ),
             "- There are no quote or NBBO data. The results are not execution-grade.",
             (
-                "- The sequence sample has selection risk because 16.3% of events fail the "
-                "V1 sequence coverage rule."
+                f"- The sequence sample has selection risk because {sequence_drop_rate:.1%} of "
+                "events fail the V1 sequence coverage rule."
             ),
-            "- VIX regime features are unavailable in the current run.",
+            f"- `vix_regime_unavailable={sequence_report.get('vix_regime_unavailable', 'NA')}`.",
             "- The report is suitable for internal research discussion, not final paper claims.",
             "",
             "Next steps:",
@@ -5913,6 +6009,7 @@ def run_research_features(
         features = features.merge(runup, on="event_id", how="left")
     features["hybrid_sequence_too_sparse"] = bool(hybrid_report.get("hybrid_sequence_too_sparse"))
     market_covariates = _read_market_covariates(config)
+    market_covariate_columns = 0
     if not market_covariates.empty and "entry_date" in features.columns:
         vix_input_columns = ["event_id", "entry_date"]
         if "announcement_timing" in features.columns:
@@ -5924,6 +6021,7 @@ def run_research_features(
             alignment=VIX_ALIGNMENT_PRIOR_CLOSE,
         )
         merge_columns = ["event_id", *_vix_columns_for_merge()]
+        market_covariate_columns = len(merge_columns) - 1
         features = features.drop(
             columns=[column for column in _vix_columns_for_merge() if column in features.columns]
         ).merge(vix_features[merge_columns], on="event_id", how="left")
@@ -5994,6 +6092,15 @@ def run_research_features(
     feature_transform_params_path = paths.modeling_artifacts_dir / "feature_transform_params.json"
     feature_schema_report.to_csv(feature_schema_report_path, index=False)
     write_json(feature_transform_params_path, transform_params)
+    feature_manifest_path = write_feature_matrix_manifest(
+        paths,
+        feature_schema_version=feature_schema_version,
+        split_design=split_design,
+        split_date=split_date,
+        row_count=len(features),
+        market_covariate_columns=market_covariate_columns,
+        market_second_columns=market_second_columns,
+    )
     tensor_report = build_sequence_tensor(long_rows, features, out_path=paths.sequence_tensor_path)
     hybrid_tensor_report = build_sequence_tensor(
         hybrid_long,
@@ -6039,6 +6146,7 @@ def run_research_features(
             "feature_matrix": str(paths.feature_matrix_path),
             "feature_schema_report": str(feature_schema_report_path),
             "feature_transform_params": str(feature_transform_params_path),
+            "feature_matrix_manifest": str(feature_manifest_path),
             "sequence_v2_quality": str(sequence_quality_path),
             "sequence_coverage_by_event": str(
                 paths.modeling_artifacts_dir / "sequence_coverage_by_event.csv"
@@ -6148,7 +6256,18 @@ def run_research_models(
     feature_schema_version = validate_feature_schema_version(feature_schema_version)
     paths = research_paths(config)
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    feature_manifest = validate_feature_matrix_manifest(
+        paths,
+        feature_schema_version=feature_schema_version,
+    )
     features = read_table(paths.feature_matrix_path)
+    if "feature_schema_version" in features.columns:
+        observed_versions = set(features["feature_schema_version"].dropna().astype(str).unique())
+        if observed_versions and observed_versions != {feature_schema_version}:
+            raise ValueError(
+                "cached feature matrix column schema mismatch: "
+                f"found {sorted(observed_versions)}, requested {feature_schema_version!r}"
+            )
     schema_path = paths.modeling_artifacts_dir / "feature_schema_report.csv"
     if schema_path.exists():
         schema_report = pd.read_csv(schema_path)
@@ -6262,6 +6381,7 @@ def run_research_models(
             "tuning_profile": tuning_profile,
             "tuning_seed": tuning_seed,
             "feature_schema_version": feature_schema_version,
+            "feature_matrix_manifest": feature_manifest,
             "event_model_feature_count": len(event_features),
             "tree_model_feature_count": len(tree_features),
         },
@@ -6270,6 +6390,17 @@ def run_research_models(
 
 def run_research_report(config: ProjectConfig) -> ProxyResearchResult:
     paths = research_paths(config)
+    missing = missing_report_artifacts(paths)
+    if missing:
+        return ProxyResearchResult(
+            ok=False,
+            stage="report",
+            outputs={},
+            diagnostics={
+                "missing_required_artifacts": missing,
+                "reason": "missing_modeling_artifacts",
+            },
+        )
     figure_paths = write_research_figures(
         artifacts_dir=paths.modeling_artifacts_dir,
         reports_dir=paths.modeling_reports_dir,
@@ -6357,6 +6488,7 @@ def run_proxy_research_package(
         else:
             result = run_research_report(config)
         steps.append({**result.__dict__, "status": "ran", "reason": None})
+        ok = ok and result.ok
         print(f"[research] stage end: {step}", flush=True)
     payload = {
         "ok": ok,
@@ -6374,5 +6506,8 @@ def run_proxy_research_package(
         "steps": steps,
     }
     paths = research_paths(config)
-    write_json(paths.modeling_artifacts_dir / "research_manifest.json", payload)
+    manifest_name = (
+        "research_report_manifest.json" if stage == "report" else "research_manifest.json"
+    )
+    write_json(paths.modeling_artifacts_dir / manifest_name, payload)
     return payload

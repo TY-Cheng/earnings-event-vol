@@ -14,6 +14,7 @@ import pandas as pd
 import polars as pl
 
 from earnings_event_vol.config import ProjectConfig, load_project_config
+from earnings_event_vol.events import market_close_timestamp
 from earnings_event_vol.trade_proxy import (
     POST_OPEN_OPTION_VWAP_WINDOWS,
     TRADE_PROXY_PANEL_GRADE,
@@ -29,6 +30,7 @@ from earnings_event_vol.trade_proxy import (
     fetch_massive_option_second_aggregates,
     filter_pre_cutoff_buffer,
     normalize_second_aggregates,
+    safe_exception_text,
     summarize_trade_proxy_panel,
 )
 
@@ -184,7 +186,7 @@ def _fetch_one_contract(
                 "status": TRADE_PROXY_STATUS_FETCH_FAILED,
                 "rows": 0,
                 "entry_date": entry_date.date(),
-                "error": str(exc)[:300],
+                "error": safe_exception_text(exc),
             },
         )
 
@@ -198,7 +200,12 @@ def _fetch_or_load_one_contract(
     limit: int,
     buffer_minutes: int,
     force: bool,
-) -> tuple[str, pd.DataFrame, dict[str, object]]:
+) -> tuple[tuple[str, date, str], pd.DataFrame, dict[str, object]]:
+    key = (
+        option_ticker,
+        entry_date.date(),
+        cutoff_timestamp.tz_convert("America/New_York").isoformat(),
+    )
     bronze_path = _second_agg_bronze_path(
         config,
         option_ticker=option_ticker,
@@ -213,7 +220,7 @@ def _fetch_or_load_one_contract(
     ):
         cached = _read_parquet(bronze_path)
         return (
-            option_ticker,
+            key,
             cached,
             {
                 "options_ticker": option_ticker,
@@ -252,7 +259,7 @@ def _fetch_or_load_one_contract(
         report["cache_status"] = "repaired" if repaired else "written"
     else:
         report["cache_status"] = "repair_failed" if repaired else "miss"
-    return option_ticker, buffered, report
+    return key, buffered, report
 
 
 def _filter_post_open_window(
@@ -286,7 +293,7 @@ def _filter_exit_preclose_window(
     if frame["timestamp_et"].dt.tz is None:
         raise ValueError("timestamp_et must be timezone-aware")
     frame["timestamp_et"] = frame["timestamp_et"].dt.tz_convert("America/New_York")
-    close_ts = pd.Timestamp(f"{exit_date.date().isoformat()} 16:00:00", tz="America/New_York")
+    close_ts = pd.Timestamp(market_close_timestamp(exit_date.date()))
     start = close_ts - pd.Timedelta(seconds=lookback_seconds)
     return frame.loc[frame["timestamp_et"].between(start, close_ts, inclusive="both")].copy()
 
@@ -425,14 +432,14 @@ def _fetch_second_aggregate_bars(
     limit: int,
     buffer_minutes: int,
     force: bool,
-) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+) -> tuple[dict[tuple[str, date, str], pd.DataFrame], pd.DataFrame]:
     requests = (
         contracts[["options_ticker", "entry_date", "event_entry_timestamp"]]
         .dropna()
         .drop_duplicates()
         .sort_values(["entry_date", "event_entry_timestamp", "options_ticker"])
     )
-    bar_frames: dict[str, pd.DataFrame] = {}
+    bar_frames: dict[tuple[str, date, str], pd.DataFrame] = {}
     reports: list[dict[str, object]] = []
     report_columns = [
         "options_ticker",
@@ -444,6 +451,7 @@ def _fetch_second_aggregate_bars(
         "buffer_minutes",
         "raw_rows",
         "cache_status",
+        "error",
         "failure_reason",
     ]
     total = int(len(requests))
@@ -470,7 +478,7 @@ def _fetch_second_aggregate_bars(
 
     if jobs <= 1:
         for completed, row in enumerate(requests.to_dict("records"), start=1):
-            option_ticker, frame, report = _fetch_or_load_one_contract(
+            key, frame, report = _fetch_or_load_one_contract(
                 config,
                 option_ticker=str(row["options_ticker"]),
                 entry_date=pd.Timestamp(row["entry_date"]),
@@ -479,7 +487,8 @@ def _fetch_second_aggregate_bars(
                 buffer_minutes=buffer_minutes,
                 force=force,
             )
-            bar_frames[option_ticker] = frame
+            option_ticker = key[0]
+            bar_frames[key] = frame
             reports.append(report)
             note_progress(completed, option_ticker, report)
         return (
@@ -504,8 +513,9 @@ def _fetch_second_aggregate_bars(
             for row in requests.to_dict("records")
         ]
         for completed, future in enumerate(as_completed(futures), start=1):
-            option_ticker, frame, report = future.result()
-            bar_frames[option_ticker] = frame
+            key, frame, report = future.result()
+            option_ticker = key[0]
+            bar_frames[key] = frame
             reports.append(report)
             note_progress(completed, option_ticker, report)
     return (
@@ -532,6 +542,7 @@ def _fetch_post_open_second_aggregate_bars(
         "window_minutes",
         "raw_rows",
         "cache_status",
+        "error",
         "failure_reason",
     ]
     if selected_straddles.empty:
@@ -629,6 +640,7 @@ def _fetch_exit_preclose_second_aggregate_bars(
         "lookback_seconds",
         "raw_rows",
         "cache_status",
+        "error",
         "failure_reason",
     ]
     if selected_straddles.empty:
@@ -747,11 +759,18 @@ def build_trade_proxy_panel(
         "lookback_seconds": lookback_seconds,
         "second_agg_buffer_minutes": second_agg_buffer_minutes,
         "price_field": price_field,
+        "rest_limit": rest_limit,
+        "haircut_fraction": haircut_fraction,
         "entry_price_method": "preclose_15m_option_second_agg_vwap",
         "c2c_exit_price_method": "exit_preclose_15m_option_second_agg_vwap",
         "post_open_option_vwap_windows": [window[0] for window in POST_OPEN_OPTION_VWAP_WINDOWS],
     }
-    if not force and panel_path.exists() and _json_params_match(diagnostics_path, params):
+    if (
+        not force
+        and not refresh_bronze
+        and panel_path.exists()
+        and _json_params_match(diagnostics_path, params)
+    ):
         return {
             "status": "skipped",
             "reason": "outputs_exist_params_match",
@@ -764,11 +783,25 @@ def build_trade_proxy_panel(
 
     windows = _read_parquet(windows_path)
     contracts = _read_parquet(contracts_path)
+    if "contract_reference_validated" not in contracts.columns:
+        raise ValueError(
+            "trade-proxy-panel requires contract-reference-validation output with "
+            "contract_reference_validated."
+        )
     if max_events is not None:
         keep_events = windows["event_id"].head(max_events).tolist()
         windows = windows.loc[windows["event_id"].isin(keep_events)].copy()
         contracts = contracts.loc[contracts["event_id"].isin(keep_events)].copy()
-    contracts = contracts.loc[contracts["eligible_for_quote_pool"].astype(bool)].copy()
+    eligible_for_quote_pool = contracts["eligible_for_quote_pool"].astype(bool)
+    ivar_support_only = (
+        contracts["is_ivar_support_only"].astype(bool)
+        if "is_ivar_support_only" in contracts
+        else pd.Series(False, index=contracts.index)
+    )
+    contracts = contracts.loc[
+        (eligible_for_quote_pool | ivar_support_only)
+        & contracts["contract_reference_validated"].astype(bool)
+    ].copy()
     contracts = contracts.merge(
         windows[["event_id", "event_entry_timestamp", "s_before", "s_after", "rvar_event"]],
         on="event_id",
@@ -794,8 +827,11 @@ def build_trade_proxy_panel(
     iv_estimates = attach_trade_proxy_local_iv(proxy_prices, windows)
     ivar_inputs = build_trade_proxy_ivar_inputs(iv_estimates, windows)
     panel = extract_trade_proxy_event_panel(ivar_inputs, windows)
+    trade_iv_estimates = iv_estimates.loc[
+        iv_estimates["eligible_for_quote_pool"].astype(bool)
+    ].copy()
     selected_straddles = build_proxy_straddle_diagnostics(
-        iv_estimates,
+        trade_iv_estimates,
         windows,
         haircut_fraction=haircut_fraction,
     )
@@ -830,7 +866,7 @@ def build_trade_proxy_panel(
         price_field=price_field,
     )
     straddle_diagnostics = build_proxy_straddle_diagnostics(
-        iv_estimates,
+        trade_iv_estimates,
         windows,
         exit_preclose_option_prices=exit_preclose_prices,
         post_open_option_prices=post_open_exit_prices,

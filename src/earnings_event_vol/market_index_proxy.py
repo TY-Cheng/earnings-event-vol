@@ -17,7 +17,9 @@ from earnings_event_vol.massive import parse_massive_option_ticker, read_secret_
 from earnings_event_vol.schemas import OptionRight
 from earnings_event_vol.trade_proxy import (
     TRADE_PROXY_PANEL_GRADE,
+    _get_json_with_retries,
     filter_pre_cutoff_buffer,
+    safe_exception_text,
     select_preclose_entry_proxy_price,
 )
 
@@ -125,10 +127,19 @@ def fetch_massive_underlying_second_aggregates(
         "limit": limit,
         "apiKey": _api_key(config),
     }
-    with httpx.Client(timeout=timeout_seconds or config.massive_request_timeout_seconds) as client:
-        response = client.get(url, params=params)
-        response.raise_for_status()
-        payload = response.json()
+    try:
+        with httpx.Client(
+            timeout=timeout_seconds or config.massive_request_timeout_seconds
+        ) as client:
+            payload = _get_json_with_retries(
+                client,
+                url,
+                params=params,
+                max_retries=config.massive_max_retries,
+                backoff_seconds=config.massive_retry_backoff_seconds,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(safe_exception_text(exc)) from None
     return pd.DataFrame(payload.get("results", []))
 
 

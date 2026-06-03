@@ -35,6 +35,34 @@ def _date(value: object) -> date | None:
     return cast(date, pd.Timestamp(value).date())
 
 
+def _excluded_target_row() -> dict[str, object]:
+    return {
+        "close_before": None,
+        "open_after": None,
+        "close_after": None,
+        "s_before": None,
+        "s_after": None,
+        "r_event_jump_c2o": None,
+        "RVAR_event_jump_c2o": None,
+        "r_event_day_c2c": None,
+        "RVAR_event_day_c2c": None,
+        "r_event_reaction_o2c": None,
+        "RVAR_event_reaction_o2c": None,
+        "return_decomposition_residual": None,
+        "RVAR_cross_term": None,
+        "RVAR_day_reconstructed": None,
+        "cross_term_share_raw": None,
+        "cross_term_share_floored": None,
+        "rvar_event": None,
+        "primary_target_id": "jump_c2o",
+        "open_after_status": OPEN_STATUS_UNAVAILABLE,
+        "open_after_source": None,
+        "open_after_is_regular_session": None,
+        "open_after_is_adjusted": None,
+        "open_after_volume_available": False,
+    }
+
+
 def add_event_return_targets(
     windows: pd.DataFrame,
     bars: pd.DataFrame,
@@ -58,6 +86,10 @@ def add_event_return_targets(
 
     rows: list[dict[str, object]] = []
     for record in out.to_dict("records"):
+        exclusion_reason = record.get("exclusion_reason")
+        if exclusion_reason is not None and not pd.isna(exclusion_reason) and str(exclusion_reason):
+            rows.append(_excluded_target_row())
+            continue
         ticker = str(record.get("ticker", "")).upper()
         entry_date = _date(record.get("entry_date"))
         exit_date = _date(record.get("exit_date"))

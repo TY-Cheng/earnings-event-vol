@@ -212,7 +212,7 @@ def unimplemented_model_message(model_id: str) -> str:
 
 
 def _event_date_column(frame: pd.DataFrame) -> str:
-    for column in ("announcement_date", "event_date", "entry_date"):
+    for column in ("event_entry_timestamp", "announcement_date", "event_date", "entry_date"):
         if column in frame.columns:
             return column
     raise ValueError("frame requires announcement_date, event_date, or entry_date")
@@ -221,8 +221,32 @@ def _event_date_column(frame: pd.DataFrame) -> str:
 def _sorted_events(frame: pd.DataFrame) -> pd.DataFrame:
     date_col = _event_date_column(frame)
     out = frame.copy()
-    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
-    return out.sort_values([date_col, "ticker"] if "ticker" in out.columns else [date_col]).copy()
+    out["_event_order_ts"] = pd.to_datetime(out[date_col], errors="coerce", utc=True)
+    sort_columns = ["_event_order_ts", "ticker"] if "ticker" in out.columns else ["_event_order_ts"]
+    return out.sort_values(sort_columns).copy()
+
+
+def _strict_prior_rolling_mean(
+    ordered: pd.DataFrame,
+    values: pd.Series,
+    *,
+    window: int,
+    group_col: str | None,
+) -> pd.Series:
+    result = pd.Series(np.nan, index=ordered.index, dtype=float)
+    groups = (
+        ordered.groupby(group_col, sort=False, dropna=False)
+        if group_col is not None and group_col in ordered.columns
+        else [(None, ordered)]
+    )
+    for _, group in groups:
+        history: list[float] = []
+        for _, same_time in group.groupby("_event_order_ts", sort=True, dropna=False):
+            finite_history = [value for value in history if np.isfinite(value)]
+            prior = float(np.mean(finite_history[-window:])) if finite_history else np.nan
+            result.loc[same_time.index] = prior
+            history.extend(values.loc[same_time.index].dropna().astype(float).tolist())
+    return result
 
 
 def _prior_rolling_mean(
@@ -230,24 +254,28 @@ def _prior_rolling_mean(
     column: str,
     *,
     window: int = 4,
-    fallback_col: str = MARKET_BASELINE_COL,
+    fallback_col: str | None = MARKET_BASELINE_COL,
+    fallback_value: float | None = None,
 ) -> pd.Series:
     if column not in frame.columns:
         raise ValueError(f"frame must include {column}")
     out = _sorted_events(frame)
     values = pd.to_numeric(out[column], errors="coerce")
-    by_ticker = (
-        values.groupby(out["ticker"].astype(str)).transform(
-            lambda series: series.shift(1).rolling(window, min_periods=1).mean()
-        )
-        if "ticker" in out.columns
-        else values.shift(1).rolling(window, min_periods=1).mean()
+    by_ticker = _strict_prior_rolling_mean(
+        out,
+        values,
+        window=window,
+        group_col="ticker" if "ticker" in out.columns else None,
     )
-    global_prior = values.shift(1).expanding(min_periods=1).mean()
+    global_prior = _strict_prior_rolling_mean(out, values, window=len(out), group_col=None)
     fallback = (
-        pd.to_numeric(out[fallback_col], errors="coerce") if fallback_col in out else global_prior
+        pd.to_numeric(out[fallback_col], errors="coerce")
+        if fallback_col is not None and fallback_col in out
+        else pd.Series(fallback_value, index=out.index, dtype=float)
+        if fallback_value is not None
+        else global_prior
     )
-    result = by_ticker.fillna(global_prior).fillna(fallback).fillna(values)
+    result = by_ticker.fillna(global_prior).fillna(fallback)
     return result.reindex(frame.index)
 
 
@@ -263,7 +291,8 @@ def add_benchmark_predictions(frame: pd.DataFrame) -> pd.DataFrame:
     trailing_spread = _prior_rolling_mean(
         out.assign(_rv_iv_spread=pd.to_numeric(out[TARGET_COL], errors="coerce") - market),
         "_rv_iv_spread",
-        fallback_col=MARKET_BASELINE_COL,
+        fallback_col=None,
+        fallback_value=0.0,
     ).fillna(0.0)
     out["forecast_market_implied_event_variance"] = market
     out["forecast_last_four_rvar"] = rvar_last4
@@ -446,7 +475,8 @@ def _masked_max(sequence: torch.Tensor, mask: torch.Tensor | None) -> torch.Tens
         return torch.max(sequence, dim=1).values
     masked = sequence.masked_fill(~mask.unsqueeze(-1), -1e9)
     values = torch.max(masked, dim=1).values
-    return torch.where(torch.isfinite(values), values, torch.zeros_like(values))
+    valid_rows = mask.any(dim=1).unsqueeze(-1)
+    return torch.where(valid_rows, values, torch.zeros_like(values))
 
 
 class AttentionPoolingSequenceEncoder(nn.Module):
@@ -691,6 +721,12 @@ def run_model_suite(
     split_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, list[ModelFitResult]]:
     base = add_benchmark_predictions(frame)
+    if split_date is not None:
+        date_col = _event_date_column(base)
+        cutoff = pd.Timestamp(split_date)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        order_ts = pd.to_datetime(base[date_col], errors="coerce", utc=True)
+        base["split"] = np.where(order_ts < cutoff, "train", "test")
     results: list[ModelFitResult] = []
     predictions = base.copy()
     for model_id in model_ids:

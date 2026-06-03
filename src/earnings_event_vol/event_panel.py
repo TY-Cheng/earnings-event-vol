@@ -6,6 +6,7 @@ from datetime import date
 from math import isfinite
 from typing import cast
 
+import numpy as np
 import pandas as pd
 
 from earnings_event_vol.events import has_ex_dividend_between
@@ -80,7 +81,13 @@ def _boolean_flag(value: object) -> bool:
 
 def _default_event_ids(events: pd.DataFrame) -> pd.Series:
     if "event_id" in events.columns:
-        return events["event_id"].astype(str)
+        ids = events["event_id"]
+        if ids.isna().any() or ids.astype(str).str.strip().eq("").any():
+            raise ValueError("event_id values must be non-null and non-empty.")
+        if ids.astype(str).duplicated().any():
+            duplicate_ids = sorted(ids.astype(str).loc[ids.astype(str).duplicated()].unique())
+            raise ValueError(f"event_id values must be unique; duplicates: {duplicate_ids[:5]}")
+        return ids.astype(str)
     return events["ticker"].astype(str).str.upper() + "_" + events["entry_date"].astype(str)
 
 
@@ -111,12 +118,20 @@ def discover_option_contracts(
     else:
         event_frame["exit_date"] = _date_series(event_frame, "exit_date")
     event_frame["event_id"] = _default_event_ids(event_frame)
+    if event_frame["event_id"].astype(str).duplicated().any():
+        duplicate_ids = sorted(
+            event_frame.loc[event_frame["event_id"].astype(str).duplicated(), "event_id"]
+            .astype(str)
+            .unique()
+        )
+        raise ValueError(f"event_id values must be unique; duplicates: {duplicate_ids[:5]}")
 
     contract_frame = contracts.copy()
     contract_frame["ticker"] = contract_frame["ticker"].astype(str).str.upper()
     contract_frame["expiration"] = _date_series(contract_frame, "expiration")
     contract_frame["strike"] = pd.to_numeric(contract_frame["strike"], errors="coerce")
-    contract_frame["right"] = contract_frame["right"].astype(str).str.lower()
+    contract_frame["right"] = contract_frame["right"].where(contract_frame["right"].notna(), pd.NA)
+    contract_frame["right"] = contract_frame["right"].astype("string").str.lower()
     if "options_ticker" not in contract_frame.columns:
         if "option_symbol" in contract_frame.columns:
             contract_frame["options_ticker"] = contract_frame["option_symbol"]
@@ -144,7 +159,11 @@ def discover_option_contracts(
     ).dt.days
     out["covers_event_window"] = out["expiration"] >= out["exit_date"]
 
-    has_contract = out["expiration"].notna() & out["strike"].notna() & out["right"].notna()
+    has_contract = (
+        out["expiration"].notna()
+        & out["strike"].notna()
+        & out["right"].isin(["call", "put", "c", "p"])
+    )
     is_standard = (
         out["option_multiplier"].eq(100)
         & out["contract_size"].eq(100)
@@ -211,9 +230,24 @@ def _strict_quote_frame(
     out = quotes.copy()
     out["expiration"] = _date_series(out, "expiration")
     out["strike"] = pd.to_numeric(out["strike"], errors="coerce")
-    out["right"] = out["right"].astype(str).str.lower()
+    out["right"] = out["right"].where(out["right"].notna(), pd.NA)
+    out["right"] = out["right"].astype("string").str.lower()
     out["bid"] = pd.to_numeric(out["bid"], errors="coerce")
     out["ask"] = pd.to_numeric(out["ask"], errors="coerce")
+    asof_mask = pd.Series(True, index=out.index)
+    for column in ("feature_asof_timestamp", "quote_timestamp", "timestamp", "timestamp_et"):
+        if column in out.columns:
+            asof_ts = pd.to_datetime(out[column], errors="coerce", utc=True)
+            cutoff = pd.Timestamp(entry_date).tz_localize("UTC") + pd.Timedelta(days=1)
+            asof_mask &= asof_ts.notna() & asof_ts.lt(cutoff)
+            out["_quote_pair_timestamp"] = asof_ts.astype("string")
+            break
+    for column in ("quote_date", "date"):
+        if column in out.columns:
+            quote_date = pd.to_datetime(out[column], errors="coerce").dt.date
+            asof_mask &= quote_date.notna() & quote_date.le(entry_date)
+            out["_quote_pair_date"] = quote_date.astype("string")
+            break
     out["mid"] = (out["bid"] + out["ask"]) / 2.0
     if "spread_over_mid" in out.columns:
         out["spread_over_mid"] = pd.to_numeric(out["spread_over_mid"], errors="coerce")
@@ -223,6 +257,8 @@ def _strict_quote_frame(
     out["moneyness_abs"] = (out["strike"] / spot - 1.0).abs()
     return out.loc[
         (out["dte"].between(dte_min, dte_max, inclusive="both"))
+        & asof_mask
+        & out["right"].isin(["call", "put", "c", "p"])
         & out["bid"].gt(0)
         & out["ask"].gt(out["bid"])
         & out["mid"].gt(0)
@@ -249,7 +285,7 @@ def select_forward_and_atm(
     required pair is weak or the dividend window is dirty, v1 falls back to nearest spot ATM and
     records the fallback source.
     """
-    if spot <= 0:
+    if not isfinite(float(spot)) or spot <= 0:
         raise ValueError("spot must be positive.")
     if has_ex_dividend_between(ex_dividend_dates, start=entry_date, end=second_ivar_expiry):
         return ForwardSelection(
@@ -285,10 +321,15 @@ def select_forward_and_atm(
 
     calls = eligible.loc[eligible["right"].isin(["call", "c"])].copy()
     puts = eligible.loc[eligible["right"].isin(["put", "p"])].copy()
+    pair_keys = ["expiration", "strike"]
+    for optional_key in ("_quote_pair_timestamp", "_quote_pair_date"):
+        if optional_key in calls.columns and optional_key in puts.columns:
+            pair_keys.append(optional_key)
     pairs = calls.merge(
         puts,
-        on=["expiration", "strike"],
+        on=pair_keys,
         suffixes=("_call", "_put"),
+        validate="one_to_one",
     )
     if pairs.empty:
         return ForwardSelection(
@@ -400,6 +441,13 @@ def build_event_panel(
             out["spot"] = out["S_before"]
         else:
             raise ValueError("event frame missing spot or s_before column.")
+    if out["event_id"].astype(str).duplicated().any():
+        duplicate_ids = sorted(
+            out.loc[out["event_id"].astype(str).duplicated(), "event_id"].astype(str).unique()
+        )
+        raise ValueError(f"event_id values must be unique; duplicates: {duplicate_ids[:5]}")
+    if not np.isfinite(pd.to_numeric(out["spot"], errors="coerce")).all():
+        raise ValueError("spot values must be finite.")
 
     quote_frame = quotes.copy()
     if not quote_frame.empty and "ticker" in quote_frame.columns:

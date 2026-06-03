@@ -9,8 +9,8 @@ variance edge.
 ## Protocol Defaults
 
 - Final proxy data-engineering entrypoint:
-  - The public command remains `just data` / `proxy-all`.
-  - `proxy-all` runs `options-day-aggs-bulk -> universe ->
+  - The public command is `just data`, which defaults to `data --stage all`.
+  - `all` runs `options-day-aggs-bulk -> universe ->
     dynamic-calendar -> sec-companyfacts -> event-window-panel ->
     contract-reference-validation -> trade-proxy-panel`.
   - The runnable Massive-entitlement default is 2022-12-01 through
@@ -28,6 +28,10 @@ variance edge.
     invalidation diagnostics.
   - Legacy static calendar pilot/debug stages are removed from the public data
     DAG; use `dynamic-calendar` plus `event-window-panel` for active setup.
+  - Legacy CSV-backed `data --stage contracts` and `data --stage panel` are not
+    supported public data stages. The lower-level `discover-option-contracts`
+    and `build-event-panel` commands remain fixture/debug utilities, not the
+    active proxy DAG.
 - Event targets are decomposed:
   - Primary scientific target: `RVAR_event_jump_c2o`.
     - AMC: `close_d -> open_{d+1}`.

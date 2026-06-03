@@ -10,11 +10,26 @@ import pandas as pd
 
 DEFAULT_BLOCKED_PATTERNS = (
     re.compile(r"(^|_)s_after($|_)"),
+    re.compile(r"(^|_)close_after($|_)"),
+    re.compile(r"(^|_)open_after($|_)"),
     re.compile(r"(^|_)rvar_event($|_)"),
+    re.compile(r"rvar_"),
+    re.compile(r"(^|_)r_event_"),
+    re.compile(r"gross_.*proxy_pnl"),
+    re.compile(r"haircut_pnl"),
+    re.compile(r"net_proxy_pnl"),
+    re.compile(r"exit_option_value"),
+    re.compile(r"exit_intrinsic"),
+    re.compile(r"exit_option_vwap"),
+    re.compile(r"post_open_option_vwap"),
+    re.compile(r"c2o_"),
+    re.compile(r"reaction_o2c"),
     re.compile(r"(^|_)realized(_|$)"),
     re.compile(r"(^|_)post_event(_|$)"),
     re.compile(r"(^|_)future(_|$)"),
     re.compile(r"same_event_return"),
+    re.compile(r"preannouncement"),
+    re.compile(r"prior_guidance"),
 )
 DEFAULT_VENDOR_FORECAST_PATTERNS = (
     re.compile(r"vendor_.*forecast"),

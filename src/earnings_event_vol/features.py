@@ -8,6 +8,8 @@ from typing import cast
 import numpy as np
 import pandas as pd
 
+from earnings_event_vol.events import market_close_timestamp
+
 FEATURE_SCHEMA_V1_LEGACY = "fe_v1_legacy"
 FEATURE_SCHEMA_V2_SEC_XBRL = "fe_v2_sec_xbrl"
 DEFAULT_FEATURE_SCHEMA_VERSION = FEATURE_SCHEMA_V2_SEC_XBRL
@@ -52,6 +54,8 @@ V2_EXCLUDE_PATTERNS = (
     "r_event_",
     "edge_var_realized",
     "mispricing_realized",
+    "preannouncement",
+    "prior_guidance",
     "s_after",
     "close_after",
     "open_after",
@@ -84,6 +88,8 @@ LEGACY_EXCLUDE_PATTERNS = (
     "rvar_event",
     "rvar_",
     "r_event_",
+    "preannouncement",
+    "prior_guidance",
     "s_after",
     "close_after",
     "open_after",
@@ -184,6 +190,27 @@ def _timestamp_series(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
         return pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns, UTC]")
     return pd.to_datetime(frame[column], errors="coerce", utc=True)
+
+
+def _entry_timestamp_series(frame: pd.DataFrame) -> pd.Series:
+    if "event_entry_timestamp" in frame.columns:
+        entry_ts = pd.to_datetime(frame["event_entry_timestamp"], errors="coerce", utc=True)
+    elif "entry_date" in frame.columns:
+        entry_ts = pd.Series(
+            [
+                pd.Timestamp(market_close_timestamp(pd.Timestamp(value).date()))
+                if value is not None and not pd.isna(value)
+                else pd.NaT
+                for value in frame["entry_date"]
+            ],
+            index=frame.index,
+        )
+        entry_ts = pd.to_datetime(entry_ts, errors="coerce", utc=True)
+    else:
+        raise ValueError("event panel requires event_entry_timestamp or entry_date")
+    if entry_ts.isna().any():
+        raise ValueError("event panel has missing event_entry_timestamp values")
+    return entry_ts
 
 
 def _history_stats(values: pd.Series, *, prefix: str) -> dict[str, object]:
@@ -528,9 +555,10 @@ def build_model_feature_matrix(
         out["regime"] = out["event_year"].map(
             lambda year: "covid_shock" if year == 2020 else "steady_proxy"
         )
-    if "event_entry_timestamp" in out.columns:
-        out["signal_timestamp"] = out["event_entry_timestamp"]
-        out["feature_asof_timestamp"] = out["event_entry_timestamp"]
+    event_entry_timestamp = _entry_timestamp_series(out)
+    out["event_entry_timestamp"] = event_entry_timestamp
+    out["signal_timestamp"] = event_entry_timestamp
+    out["feature_asof_timestamp"] = event_entry_timestamp
     if straddle_diagnostics is not None and not straddle_diagnostics.empty:
         keep = [
             column
@@ -592,7 +620,15 @@ def build_model_feature_matrix(
             if column in straddle_diagnostics.columns
         ]
         if "event_id" in out.columns and "event_id" in keep:
-            out = out.merge(straddle_diagnostics[keep], on="event_id", how="left")
+            diagnostics = straddle_diagnostics[keep].copy()
+            duplicated = diagnostics["event_id"].duplicated(keep=False)
+            if duplicated.any():
+                duplicate_ids = sorted(diagnostics.loc[duplicated, "event_id"].astype(str).unique())
+                raise ValueError(
+                    "straddle diagnostics must contain at most one row per event_id: "
+                    + ", ".join(duplicate_ids[:5])
+                )
+            out = out.merge(diagnostics, on="event_id", how="left", validate="one_to_one")
             out["net_proxy_pnl_usd"] = _numeric_or_nan(out, "haircut_pnl_usd")
             out["estimated_transaction_cost_usd"] = (
                 _numeric_or_nan(out, "gross_proxy_pnl_usd")

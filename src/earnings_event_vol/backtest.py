@@ -164,14 +164,17 @@ def build_proxy_strategy_frame(
     entry_premium_col: str = "entry_premium_usd",
     cost_col: str = "estimated_transaction_cost_usd",
     min_edge_var: float = 0.0,
+    threshold_multiplier: float = 1.5,
 ) -> pd.DataFrame:
     """Evaluate cost-aware proxy straddle trades from event-level forecasts.
 
-    Positive forecast edge buys the proxy straddle; negative forecast edge sells it. The
-    premium-space expected edge is a transparent first-order mapping:
-    `forecast_edge_var / IVAR * entry_premium`. It is used only for trade selection and
-    diagnostics; realized PnL comes from the proxy entry/exit marks.
+    Positive forecast edge buys the proxy straddle only when the premium-space edge clears
+    the configured transaction-cost threshold. Negative variance-edge rows are kept as
+    diagnostics, but this proxy route does not open naked short straddles because their risk
+    is not defined by the observed entry premium.
     """
+    if threshold_multiplier <= 0:
+        raise ValueError("threshold_multiplier must be positive.")
     required = {forecast_col, ivar_col, realized_long_pnl_col, entry_premium_col}
     missing = sorted(required - set(frame.columns))
     if missing:
@@ -182,24 +185,37 @@ def build_proxy_strategy_frame(
     premium = pd.to_numeric(out[entry_premium_col], errors="coerce")
     long_pnl = pd.to_numeric(out[realized_long_pnl_col], errors="coerce")
     cost = (
-        pd.to_numeric(out[cost_col], errors="coerce").fillna(0.0)
+        pd.to_numeric(out[cost_col], errors="coerce")
         if cost_col in out.columns
         else (0.10 * premium).fillna(0.0)
     )
     edge_var = forecast - ivar
     expected_edge_usd = edge_var / ivar.replace(0.0, np.nan) * premium
-    direction = np.where(edge_var > min_edge_var, 1, np.where(edge_var < -min_edge_var, -1, 0))
+    threshold_usd = threshold_multiplier * cost
+    finite_signal = (
+        np.isfinite(forecast)
+        & np.isfinite(ivar)
+        & np.isfinite(premium)
+        & np.isfinite(cost)
+        & ivar.gt(0)
+        & premium.gt(0)
+    )
+    entry_signal = finite_signal & edge_var.gt(min_edge_var) & expected_edge_usd.gt(threshold_usd)
+    direction = np.where(entry_signal, 1, 0)
     out["forecast_edge_var"] = edge_var
     out["expected_strategy_edge_usd"] = expected_edge_usd
+    out["premium_space_threshold_usd"] = threshold_usd
+    out["threshold_multiplier"] = float(threshold_multiplier)
+    out["realized_pnl_available"] = np.isfinite(long_pnl)
     out["trade_direction"] = np.where(
-        direction > 0, "long_straddle", np.where(direction < 0, "short_straddle", "no_trade")
+        direction > 0, "long_straddle", np.where(edge_var < -min_edge_var, "no_trade", "no_trade")
     )
     out["estimated_transaction_cost_usd"] = cost
     out["gross_strategy_pnl_usd"] = direction * long_pnl
     out["net_proxy_pnl_usd"] = out["gross_strategy_pnl_usd"] - np.abs(direction) * cost
     out["capital_at_risk_usd"] = premium.abs()
     out["return_on_premium"] = out["net_proxy_pnl_usd"] / premium.abs().replace(0.0, np.nan)
-    out["should_trade"] = direction != 0
+    out["should_trade"] = entry_signal
     return out
 
 

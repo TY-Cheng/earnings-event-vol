@@ -28,7 +28,6 @@ from earnings_event_vol.earnings_calendar import (
     fetch_sec_submission_payloads,
     fetch_sec_ticker_map,
 )
-from earnings_event_vol.event_panel import build_event_panel, discover_option_contracts
 from earnings_event_vol.event_window_panel import build_event_window_panel
 from earnings_event_vol.market_covariates import (
     MARKET_COVARIATE_SCHEMA_VERSION,
@@ -55,9 +54,13 @@ from earnings_event_vol.massive import (
     underlying_flat_file_key,
 )
 from earnings_event_vol.trade_proxy import (
+    ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP,
+    EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+    POST_OPEN_OPTION_VWAP_WINDOWS,
     fetch_massive_option_second_aggregates,
     filter_pre_cutoff_buffer,
     normalize_second_aggregates,
+    safe_exception_text,
 )
 from earnings_event_vol.universe import (
     ELIGIBLE_EQUITY_RULE_VERSION,
@@ -92,10 +95,11 @@ DEFAULT_STATIC_TICKERS: tuple[str, ...] = (
     "BA",
     "CAT",
 )
+DEFAULT_TRADE_PROXY_REST_LIMIT = 50_000
+DEFAULT_TRADE_PROXY_HAIRCUT_FRACTION = 0.10
 
 SUPPORTED_DATA_STAGES = {
     "all",
-    "proxy-all",
     "fixture-audit",
     "massive-probe",
     "options-day-aggs-bulk",
@@ -105,11 +109,19 @@ SUPPORTED_DATA_STAGES = {
     "universe",
     "dynamic-calendar",
     "event-window-panel",
-    "contracts",
     "contract-reference-validation",
-    "panel",
     "trade-proxy-panel",
 }
+
+ACTIVE_PROXY_DATA_DAG = (
+    "options-day-aggs-bulk",
+    "universe",
+    "dynamic-calendar",
+    "sec-companyfacts",
+    "event-window-panel",
+    "contract-reference-validation",
+    "trade-proxy-panel",
+)
 
 
 @dataclass(frozen=True)
@@ -490,51 +502,64 @@ def _sec_companyfacts_step(
                 if cik is None:
                     diagnostics.append({"ticker": ticker, "status": "missing_cik"})
                     continue
-                cache_path = raw_dir / f"CIK{int(cik):010d}.json"
-                status = "cache_hit"
-                if force or not cache_path.exists() or cache_path.stat().st_size <= 0:
-                    elapsed = time.perf_counter() - last_request_at
-                    if elapsed < 0.125:
-                        time.sleep(0.125 - elapsed)
-                    response = client.get(
-                        config.sec_companyfacts_url_template.format(cik=int(cik)),
-                        headers={"User-Agent": config.sec_user_agent},
-                    )
-                    last_request_at = time.perf_counter()
-                    response.raise_for_status()
-                    payload = response.json()
-                    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                    status = "fetched"
-                else:
-                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                acceptance_lookup = _submission_acceptance_lookup(submissions.get(ticker, {}))
-                normalized = _normalize_companyfacts_payload(
-                    ticker=ticker,
-                    cik=int(cik),
-                    payload=payload,
-                    acceptance_lookup=acceptance_lookup,
-                )
-                if not normalized.empty:
-                    rows.append(normalized)
-                diagnostics.append(
-                    {
-                        "ticker": ticker,
-                        "cik": int(cik),
-                        "status": status,
-                        "fact_rows": int(len(normalized)),
-                        "mapped_acceptance_rows": int(
-                            normalized["acceptance_datetime"].notna().sum()
+                try:
+                    cache_path = raw_dir / f"CIK{int(cik):010d}.json"
+                    status = "cache_hit"
+                    if force or not cache_path.exists() or cache_path.stat().st_size <= 0:
+                        elapsed = time.perf_counter() - last_request_at
+                        if elapsed < 0.125:
+                            time.sleep(0.125 - elapsed)
+                        response = client.get(
+                            config.sec_companyfacts_url_template.format(cik=int(cik)),
+                            headers={"User-Agent": config.sec_user_agent},
                         )
-                        if not normalized.empty
-                        else 0,
-                        "fallback_filed_rows": int(normalized["acceptance_datetime"].isna().sum())
-                        if not normalized.empty
-                        else 0,
-                    }
-                )
+                        last_request_at = time.perf_counter()
+                        response.raise_for_status()
+                        payload = response.json()
+                        cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                        status = "fetched"
+                    else:
+                        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                    acceptance_lookup = _submission_acceptance_lookup(submissions.get(ticker, {}))
+                    normalized = _normalize_companyfacts_payload(
+                        ticker=ticker,
+                        cik=int(cik),
+                        payload=payload,
+                        acceptance_lookup=acceptance_lookup,
+                    )
+                    if not normalized.empty:
+                        rows.append(normalized)
+                    diagnostics.append(
+                        {
+                            "ticker": ticker,
+                            "cik": int(cik),
+                            "status": status,
+                            "fact_rows": int(len(normalized)),
+                            "mapped_acceptance_rows": int(
+                                normalized["acceptance_datetime"].notna().sum()
+                            )
+                            if not normalized.empty
+                            else 0,
+                            "fallback_filed_rows": int(
+                                normalized["acceptance_datetime"].isna().sum()
+                            )
+                            if not normalized.empty
+                            else 0,
+                        }
+                    )
+                except Exception as exc:
+                    diagnostics.append(
+                        {
+                            "ticker": ticker,
+                            "cik": int(cik),
+                            "status": "ticker_failed_graceful_degradation",
+                            "error": safe_exception_text(exc),
+                        }
+                    )
     except Exception as exc:
+        error = safe_exception_text(exc)
         _write_parquet(silver_path, pd.DataFrame(columns=["ticker", "cik", "feature_concept"]))
-        pd.DataFrame([{"status": "http_or_parse_degraded", "error": str(exc)}]).to_csv(
+        pd.DataFrame([{"status": "http_or_parse_degraded", "error": error}]).to_csv(
             diagnostics_path, index=False
         )
         manifest_path.write_text(
@@ -543,7 +568,7 @@ def _sec_companyfacts_step(
                     "pipeline_params": params,
                     "status": "degraded",
                     "reason": "sec_companyfacts_failed_graceful_degradation",
-                    "error": str(exc),
+                    "error": error,
                 },
                 indent=2,
                 default=str,
@@ -555,7 +580,7 @@ def _sec_companyfacts_step(
             "ran",
             outputs,
             reason="sec_companyfacts_failed_graceful_degradation",
-            metadata={"error": str(exc)},
+            metadata={"error": error},
         )
 
     facts = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -813,7 +838,7 @@ def _fetch_or_load_market_underlying_second_bars(
             "cache_status": "miss",
             "rows": 0,
             "bronze_path": str(path),
-            "error": str(exc)[:300],
+            "error": safe_exception_text(exc),
         }
 
 
@@ -888,7 +913,7 @@ def _fetch_or_load_market_option_second_bars(
                 "cache_status": "miss",
                 "rows": 0,
                 "bronze_path": str(path),
-                "error": str(exc)[:300],
+                "error": safe_exception_text(exc),
             },
         )
 
@@ -1374,10 +1399,8 @@ def _ensure_bulk_day_agg_partition(
             "path": str(destination),
         }
 
-    had_existing = destination.exists()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if had_existing:
-        destination.unlink()
+    had_existing = destination.exists()
 
     key = _day_agg_key(config, dataset=dataset, date_value=date_value)
     csv_path = destination.parent / "download.csv.gz"
@@ -2202,93 +2225,6 @@ def _dynamic_calendar_step(
     )
 
 
-def _contracts_step(
-    *,
-    out_root: Path,
-    events_path: Path | None,
-    contracts_path: Path | None,
-    dte_min: int,
-    dte_max: int,
-    force: bool,
-) -> DataPipelineStep:
-    out = out_root / "contracts"
-    outputs = (out / "event_contract_candidates.csv",)
-    if events_path is None or contracts_path is None:
-        return DataPipelineStep(
-            "contracts",
-            "blocked",
-            outputs,
-            reason="requires --events and --contracts",
-        )
-    if not force and _complete(outputs):
-        return DataPipelineStep("contracts", "skipped", outputs, reason="outputs_exist")
-
-    frame = discover_option_contracts(
-        pd.read_csv(events_path),
-        pd.read_csv(contracts_path),
-        dte_min=dte_min,
-        dte_max=dte_max,
-    )
-    out.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(outputs[0], index=False)
-    return DataPipelineStep(
-        "contracts",
-        "ran",
-        outputs,
-        metadata={
-            "rows": int(len(frame)),
-            "eligible_for_quote_pool": int(frame["eligible_for_quote_pool"].sum()),
-            "non_standard_excluded": int(
-                frame["contract_discovery_status"].eq("non_standard_excluded").sum()
-            ),
-        },
-    )
-
-
-def _panel_step(
-    *,
-    out_root: Path,
-    events_path: Path | None,
-    quotes_path: Path | None,
-    ex_dividends_path: Path | None,
-    dte_min: int,
-    dte_max: int,
-    force: bool,
-) -> DataPipelineStep:
-    out = out_root / "event_panel"
-    outputs = (out / "event_panel.csv",)
-    if events_path is None or quotes_path is None:
-        return DataPipelineStep(
-            "panel",
-            "blocked",
-            outputs,
-            reason="requires --events and --quotes",
-        )
-    if not force and _complete(outputs):
-        return DataPipelineStep("panel", "skipped", outputs, reason="outputs_exist")
-
-    ex_dividends = pd.read_csv(ex_dividends_path) if ex_dividends_path else None
-    frame = build_event_panel(
-        pd.read_csv(events_path),
-        pd.read_csv(quotes_path),
-        ex_dividends=ex_dividends,
-        dte_min=dte_min,
-        dte_max=dte_max,
-    )
-    out.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(outputs[0], index=False)
-    return DataPipelineStep(
-        "panel",
-        "ran",
-        outputs,
-        metadata={
-            "rows": int(len(frame)),
-            "spot_fallback_rows": int(frame["forward_source"].eq("spot_fallback").sum()),
-            "put_call_parity_rows": int(frame["forward_source"].eq("put_call_parity").sum()),
-        },
-    )
-
-
 def _event_window_panel_step(
     config: ProjectConfig,
     *,
@@ -2483,7 +2419,7 @@ def _contract_reference_validation_step(
                     "options_ticker": option_ticker,
                     "fetch_status": "failed",
                     "contract_reference_status": "fetch_failed",
-                    "contract_reference_error": str(exc),
+                    "contract_reference_error": safe_exception_text(exc),
                 }
             rows.append(row)
             completed += 1
@@ -2569,12 +2505,21 @@ def _trade_proxy_panel_step(
         "lookback_seconds": lookback_seconds,
         "second_agg_buffer_minutes": second_agg_buffer_minutes,
         "price_field": price_field,
+        "rest_limit": DEFAULT_TRADE_PROXY_REST_LIMIT,
+        "haircut_fraction": DEFAULT_TRADE_PROXY_HAIRCUT_FRACTION,
+        "entry_price_method": ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP,
+        "c2c_exit_price_method": EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+        "post_open_option_vwap_windows": [window[0] for window in POST_OPEN_OPTION_VWAP_WINDOWS],
     }
     outputs_complete = _complete(outputs)
-    if not force and _complete_with_params(
-        outputs,
-        params_path=outputs[1],
-        expected_params=params,
+    if (
+        not force
+        and not refresh_bronze
+        and _complete_with_params(
+            outputs,
+            params_path=outputs[1],
+            expected_params=params,
+        )
     ):
         return DataPipelineStep(
             "trade-proxy-panel",
@@ -2595,6 +2540,10 @@ def _trade_proxy_panel_step(
         str(second_agg_buffer_minutes),
         "--price-field",
         price_field,
+        "--rest-limit",
+        str(DEFAULT_TRADE_PROXY_REST_LIMIT),
+        "--haircut-fraction",
+        str(DEFAULT_TRADE_PROXY_HAIRCUT_FRACTION),
     ]
     if force or outputs_complete:
         command.append("--force")
@@ -2649,9 +2598,8 @@ def _dry_run_estimate(
     estimated_years = max(study_calendar_days / 365.25, 1 / 365.25)
     dynamic_ticker_months = month_count * universe_top_n
     estimated_unique_dynamic_tickers = max(universe_top_n, min(dynamic_ticker_months, 250))
-    ticker_count = (
-        estimated_unique_dynamic_tickers if stage == "proxy-all" else len(normalized_tickers)
-    )
+    active_proxy_dag = stage == "all"
+    ticker_count = estimated_unique_dynamic_tickers if active_proxy_dag else len(normalized_tickers)
     estimated_events = (
         max_events if max_events is not None else int(round(ticker_count * 4 * estimated_years))
     )
@@ -2677,28 +2625,19 @@ def _dry_run_estimate(
             "start": lookback_start.isoformat(),
             "end": end_date.isoformat(),
         },
-        "planned_stages": [
-            "options-day-aggs-bulk",
-            "universe",
-            "dynamic-calendar",
-            "event-window-panel",
-            "contract-reference-validation",
-            "trade-proxy-panel",
-        ]
-        if stage == "proxy-all"
-        else [stage],
+        "planned_stages": list(ACTIVE_PROXY_DATA_DAG) if active_proxy_dag else [stage],
         "estimated_counts": {
             "study_calendar_days": study_calendar_days,
             "bulk_calendar_days": bulk_calendar_days,
             "trading_days": estimated_trading_days,
             "months": month_count,
-            "universe_ticker_months": dynamic_ticker_months if stage == "proxy-all" else None,
+            "universe_ticker_months": dynamic_ticker_months if active_proxy_dag else None,
             "tickers": ticker_count,
             "events": estimated_events,
             "contracts": estimated_contracts,
             "contract_reference_rest_calls": estimated_contracts,
             "second_agg_rest_calls": estimated_contracts,
-            "bulk_day_agg_partitions": estimated_trading_days * 2 if stage == "proxy-all" else None,
+            "bulk_day_agg_partitions": estimated_trading_days * 2 if active_proxy_dag else None,
         },
         "parameters": {
             "dte_min": dte_min,
@@ -2726,11 +2665,7 @@ def run_data_pipeline(
     start_date: date = date(2013, 1, 1),
     end_date: date = date(2025, 12, 31),
     dates: Sequence[date] = (),
-    events_path: Path | None = None,
-    contracts_path: Path | None = None,
-    quotes_path: Path | None = None,
     options_day_aggs_path: Path | None = None,
-    ex_dividends_path: Path | None = None,
     sec_submissions_dir: Path | None = None,
     massive_8k_text_dir: Path | None = None,
     validate_with_massive: bool = True,
@@ -2778,31 +2713,8 @@ def run_data_pipeline(
             universe_trailing_months=universe_trailing_months,
         )
 
-    if normalized_stage == "all":
-        stages = [
-            "fixture-audit",
-            "massive-probe",
-            "options-day-aggs-bulk",
-            "universe",
-            "dynamic-calendar",
-            "sec-companyfacts",
-            "contracts",
-            "panel",
-            "event-window-panel",
-            "contract-reference-validation",
-        ]
-    elif normalized_stage == "proxy-all":
-        stages = [
-            "options-day-aggs-bulk",
-            "universe",
-            "dynamic-calendar",
-            "sec-companyfacts",
-            "event-window-panel",
-            "contract-reference-validation",
-            "trade-proxy-panel",
-        ]
-    else:
-        stages = [normalized_stage]
+    active_proxy_dag = normalized_stage == "all"
+    stages = list(ACTIVE_PROXY_DATA_DAG) if active_proxy_dag else [normalized_stage]
     normalized_tickers = sorted({ticker.upper() for ticker in tickers if ticker.strip()})
     if not normalized_tickers:
         normalized_tickers = list(DEFAULT_STATIC_TICKERS)
@@ -2875,27 +2787,6 @@ def run_data_pipeline(
         "sec-companyfacts": lambda: [
             _sec_companyfacts_step(config, out_root=out_root, force=stage_force)
         ],
-        "contracts": lambda: [
-            _contracts_step(
-                out_root=out_root,
-                events_path=events_path,
-                contracts_path=contracts_path,
-                dte_min=dte_min,
-                dte_max=dte_max,
-                force=stage_force,
-            )
-        ],
-        "panel": lambda: [
-            _panel_step(
-                out_root=out_root,
-                events_path=events_path,
-                quotes_path=quotes_path,
-                ex_dividends_path=ex_dividends_path,
-                dte_min=dte_min,
-                dte_max=dte_max,
-                force=stage_force,
-            )
-        ],
         "event-window-panel": lambda: [
             _event_window_panel_step(
                 config,
@@ -2906,7 +2797,7 @@ def run_data_pipeline(
                 max_events=max_events,
                 calendar_path=(
                     out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
-                    if normalized_stage in {"proxy-all", "event-window-panel"}
+                    if normalized_stage in {"all", "event-window-panel"}
                     else None
                 ),
             )

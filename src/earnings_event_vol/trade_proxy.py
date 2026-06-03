@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
+import time as time_module
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -13,6 +16,7 @@ from scipy.optimize import brentq
 
 from earnings_event_vol.backtest import black_scholes_price
 from earnings_event_vol.config import ProjectConfig
+from earnings_event_vol.events import market_close_timestamp
 from earnings_event_vol.massive import read_secret_file
 from earnings_event_vol.schemas import OptionRight
 from earnings_event_vol.variance import (
@@ -33,7 +37,7 @@ OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT = "expiration_at_exit_intrinsic"
 EXIT_PRECLOSE_OPTION_VWAP_SOURCE = "exit_preclose_15m_option_second_agg_vwap"
 EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK = "ok"
 EXIT_PRECLOSE_OPTION_VWAP_STATUS_MISSING_LEG = "missing_leg_vwap"
-C2O_PROXY_PNL_SOURCE_INTRINSIC_OPEN = "underlying_open_intrinsic_only"
+C2O_PROXY_PNL_SOURCE_INTRINSIC_OPEN = "underlying_open_intrinsic_diagnostic_not_option_vwap"
 C2O_PROXY_PNL_STATUS_OK = "vendor_open_intrinsic_proxy"
 C2O_PROXY_PNL_STATUS_MISSING_OPEN = "missing_open_after"
 ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP = "preclose_15m_option_second_agg_vwap"
@@ -47,6 +51,8 @@ POST_OPEN_OPTION_VWAP_WINDOWS: tuple[tuple[str, int, int], ...] = (
     ("0_5", 0, 5),
     ("5_15", 5, 15),
 )
+_SECRET_QUERY_PATTERN = re.compile(r"(?i)((?:apiKey|api_key)=)[^&\s)]+")
+QueryParamValue = str | int | float | bool | None
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,50 @@ def _optional_positive_float(value: object) -> float | None:
         return None
     out = float(cast(Any, value))
     return out if pd.notna(out) and out > 0 else None
+
+
+def redact_secret_query_params(text: str) -> str:
+    return _SECRET_QUERY_PATTERN.sub(r"\1<redacted>", text)
+
+
+def safe_exception_text(exc: Exception, *, max_chars: int = 300) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = redact_secret_query_params(" ".join(exc.response.text.strip().split()))
+        suffix = f": {body[:200]}" if body else ""
+        return redact_secret_query_params(f"HTTP {exc.response.status_code}{suffix}")[:max_chars]
+    return redact_secret_query_params(str(exc))[:max_chars]
+
+
+def _retryable_http_error(exc: httpx.HTTPStatusError) -> bool:
+    return exc.response.status_code in {429, 500, 502, 503, 504}
+
+
+def _get_json_with_retries(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: Mapping[str, QueryParamValue],
+    max_retries: int,
+    backoff_seconds: float,
+) -> dict[str, object]:
+    attempts = max(1, int(max_retries) + 1)
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = client.get(url, params=dict(params))
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else {"results": []}
+        except httpx.HTTPStatusError as exc:
+            if not _retryable_http_error(exc):
+                raise
+            last_exc = exc
+        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            last_exc = exc
+        if attempt < attempts - 1 and backoff_seconds > 0:
+            time_module.sleep(backoff_seconds * (2**attempt))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _aware_et_timestamp(value: object, *, name: str) -> pd.Timestamp:
@@ -151,10 +201,19 @@ def fetch_massive_option_second_aggregates(
         "limit": limit,
         "apiKey": _api_key(config),
     }
-    with httpx.Client(timeout=timeout_seconds or config.massive_request_timeout_seconds) as client:
-        response = client.get(url, params=params)
-        response.raise_for_status()
-        payload = response.json()
+    try:
+        with httpx.Client(
+            timeout=timeout_seconds or config.massive_request_timeout_seconds
+        ) as client:
+            payload = _get_json_with_retries(
+                client,
+                url,
+                params=params,
+                max_retries=config.massive_max_retries,
+                backoff_seconds=config.massive_retry_backoff_seconds,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(safe_exception_text(exc)) from None
     return pd.DataFrame(payload.get("results", []))
 
 
@@ -310,7 +369,7 @@ def select_preclose_entry_proxy_price(
 
 def build_trade_proxy_price_frame(
     contracts: pd.DataFrame,
-    bar_frames: dict[str, pd.DataFrame],
+    bar_frames: Mapping[Any, Any],
     *,
     lookback_seconds: int = 900,
     price_field: str = "option_vwap",
@@ -338,13 +397,19 @@ def build_trade_proxy_price_frame(
         cutoff = (
             _to_datetime(cutoff_raw)
             if cutoff_raw is not None and not pd.isna(cutoff_raw)
-            else pd.Timestamp(
-                _to_date(contract["entry_date"]).isoformat() + " 16:00:00",
-                tz="America/New_York",
-            ).to_pydatetime()
+            else market_close_timestamp(_to_date(contract["entry_date"]))
         )
+        entry_date = _to_date(contract["entry_date"])
+        cutoff_key = pd.Timestamp(cutoff).tz_convert("America/New_York").isoformat()
+        bars = bar_frames.get((option_ticker, entry_date, cutoff_key))
+        if bars is None:
+            bars = bar_frames.get((option_ticker, entry_date))
+        if bars is None:
+            bars = bar_frames.get(option_ticker)
+        if bars is None:
+            bars = pd.DataFrame()
         selection = select_preclose_entry_proxy_price(
-            bar_frames.get(option_ticker, pd.DataFrame()),
+            bars,
             cutoff_timestamp=cutoff,
             lookback_seconds=lookback_seconds,
             price_field=price_field,
@@ -599,6 +664,7 @@ def build_post_open_option_vwap_frame(
         "last_trade_age_seconds",
         "status",
         "source",
+        "panel_grade",
     ]
     if selected_straddles.empty:
         return pd.DataFrame(columns=columns)
@@ -642,6 +708,7 @@ def build_post_open_option_vwap_frame(
                         "last_trade_age_seconds": selection.proxy_age_seconds,
                         "status": selection.status,
                         "source": POST_OPEN_OPTION_VWAP_SOURCE,
+                        "panel_grade": TRADE_PROXY_PANEL_GRADE,
                     }
                 )
     return pd.DataFrame(rows, columns=columns)
@@ -672,6 +739,7 @@ def build_exit_preclose_option_vwap_frame(
         "last_trade_age_seconds",
         "status",
         "source",
+        "panel_grade",
     ]
     if selected_straddles.empty:
         return pd.DataFrame(columns=columns)
@@ -679,9 +747,7 @@ def build_exit_preclose_option_vwap_frame(
     for straddle in selected_straddles.to_dict("records"):
         event_id = straddle["event_id"]
         exit_date = _to_date(straddle["exit_date"])
-        close_ts = pd.Timestamp(
-            f"{exit_date.isoformat()} 16:00:00", tz="America/New_York"
-        ).to_pydatetime()
+        close_ts = market_close_timestamp(exit_date)
         start_ts = (pd.Timestamp(close_ts) - pd.Timedelta(seconds=lookback_seconds)).to_pydatetime()
         for option_column in ("call_options_ticker", "put_options_ticker"):
             option_ticker_raw = straddle.get(option_column)
@@ -712,6 +778,7 @@ def build_exit_preclose_option_vwap_frame(
                     "last_trade_age_seconds": selection.proxy_age_seconds,
                     "status": selection.status,
                     "source": EXIT_PRECLOSE_OPTION_VWAP_SOURCE,
+                    "panel_grade": TRADE_PROXY_PANEL_GRADE,
                 }
             )
     return pd.DataFrame(rows, columns=columns)
@@ -1078,7 +1145,12 @@ def build_proxy_straddle_diagnostics(
         exit_preclose_value = _optional_positive_float(
             exit_preclose_metrics.get("exit_option_vwap_preclose_15m_value_usd")
         )
-        if exit_preclose_value is not None:
+        if expiry <= exit_date:
+            exit_option_value_usd = exit_intrinsic_usd
+            primary_exit_status = OPTION_EXIT_STATUS_EXPIRATION_AT_EXIT
+            primary_exit_source = OPTION_EXIT_PAYOFF_FALLBACK_INTRINSIC
+            primary_used_intrinsic = True
+        elif exit_preclose_value is not None:
             exit_option_value_usd = exit_preclose_value
             primary_exit_status = EXIT_PRECLOSE_OPTION_VWAP_STATUS_OK
             primary_exit_source = EXIT_PRECLOSE_OPTION_VWAP_SOURCE

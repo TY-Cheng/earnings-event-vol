@@ -195,5 +195,7 @@ def build_vix_features(
 
     features = pd.DataFrame(rows, index=out.index)
     for column in VIX_FEATURE_COLUMNS:
-        out[column] = features[column]
+        out[column] = (
+            features[column].astype("boolean") if column == "vix_above_30" else features[column]
+        )
     return out

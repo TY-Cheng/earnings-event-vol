@@ -102,6 +102,19 @@ def _read_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _parse_bool_cell(value: object, *, default: bool = False) -> bool:
+    if value is None or pd.isna(value):
+        return default
+    if isinstance(value, bool | int | float):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", ""}:
+        return False
+    return default
+
+
 def _read_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
@@ -231,7 +244,7 @@ def _align_events(args: argparse.Namespace) -> int:
     earnings = validate_calendar_frame(_read_csv(args.earnings))
     underlying = _read_csv(args.underlying)
     underlying["date"] = pd.to_datetime(underlying["date"]).dt.date
-    trading_dates = underlying["date"].tolist()
+    trading_dates = sorted(set(underlying["date"].tolist()))
     windows = []
     for row in earnings.to_dict("records"):
         event = EarningsEvent(
@@ -255,17 +268,18 @@ def _compute_variance(args: argparse.Namespace) -> int:
     rows = []
     for (ticker, event_date_raw), group in iv.groupby(["ticker", "event_date"]):
         event_date = pd.Timestamp(event_date_raw).date()
-        event_exit_date = (
-            pd.Timestamp(group["event_exit_date"].dropna().iloc[0]).date()
-            if "event_exit_date" in group.columns and not group["event_exit_date"].dropna().empty
-            else None
-        )
+        event_exit_date = None
+        if "event_exit_date" in group.columns:
+            non_null_exit = group["event_exit_date"].dropna()
+            if non_null_exit.empty:
+                raise ValueError(f"missing event_exit_date for {ticker} {event_date}")
+            event_exit_date = pd.Timestamp(non_null_exit.iloc[0]).date()
         points = [
             TotalVariancePoint(
                 expiration=pd.Timestamp(row["expiration"]).date(),
                 iv=None if pd.isna(row["iv"]) else float(row["iv"]),
                 dte_days=int(row["dte_days"]),
-                stale=bool(row.get("stale", False)),
+                stale=_parse_bool_cell(row.get("stale", False)),
             )
             for row in group.to_dict("records")
         ]
@@ -379,11 +393,7 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         start_date=pd.Timestamp(args.start).date(),
         end_date=pd.Timestamp(args.end).date(),
         dates=[pd.Timestamp(value).date() for value in parse_text_list(args.dates)],
-        events_path=args.events,
-        contracts_path=args.contracts,
-        quotes_path=args.quotes,
         options_day_aggs_path=args.options_day_aggs,
-        ex_dividends_path=args.ex_dividends,
         sec_submissions_dir=args.sec_submissions_dir,
         massive_8k_text_dir=args.massive_8k_text_dir,
         validate_with_massive=not args.skip_massive_validation,
@@ -479,7 +489,11 @@ def _train_models(args: argparse.Namespace, config: ProjectConfig) -> int:
         column = prediction_column_for_model(model_id)
         if column not in predictions.columns:
             continue
-        scored = predictions.copy()
+        scored = (
+            predictions.loc[predictions["split"].astype(str).eq("test")].copy()
+            if "split" in predictions.columns
+            else predictions.copy()
+        )
         scored[f"score_{model_id}"] = pd.to_numeric(
             scored[column], errors="coerce"
         ) - pd.to_numeric(scored["ivar_event"], errors="coerce")
@@ -511,7 +525,7 @@ def _train_models(args: argparse.Namespace, config: ProjectConfig) -> int:
             strategy_rows.append(
                 {
                     "model_id": model_id,
-                    **strategy_metrics(trades),
+                    **strategy_metrics(trades, gross_pnl_col="gross_strategy_pnl_usd"),
                 }
             )
             for breakdown in (
@@ -526,6 +540,7 @@ def _train_models(args: argparse.Namespace, config: ProjectConfig) -> int:
                         trades,
                         by=[breakdown],
                         forecast_col=column,
+                        gross_pnl_col="gross_strategy_pnl_usd",
                     )
                     frame.insert(0, "model_id", model_id)
                     frame.insert(1, "breakdown", breakdown)
@@ -751,7 +766,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         choices=[
             "all",
-            "proxy-all",
             "fixture-audit",
             "massive-probe",
             "market-covariates",
@@ -760,13 +774,11 @@ def build_parser() -> argparse.ArgumentParser:
             "options-day-aggs-bulk",
             "universe",
             "dynamic-calendar",
-            "contracts",
             "contract-reference-validation",
-            "panel",
             "event-window-panel",
             "trade-proxy-panel",
         ],
-        default="proxy-all",
+        default="all",
     )
     data.add_argument("--out-dir", "--out-root", dest="out_dir", type=Path)
     data.add_argument("--force", action="store_true")
@@ -780,11 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--start", default="2022-12-01")
     data.add_argument("--end", default="2025-12-31")
     data.add_argument("--dates", nargs="*", default=[])
-    data.add_argument("--events", type=Path)
-    data.add_argument("--contracts", type=Path)
-    data.add_argument("--quotes", type=Path)
     data.add_argument("--options-day-aggs", type=Path)
-    data.add_argument("--ex-dividends", type=Path)
     data.add_argument("--sec-submissions-dir", type=Path)
     data.add_argument("--massive-8k-text-dir", type=Path)
     data.add_argument(
@@ -795,8 +803,8 @@ def build_parser() -> argparse.ArgumentParser:
             "validation remains the default calendar route."
         ),
     )
-    data.add_argument("--dte-min", type=int, default=5)
-    data.add_argument("--dte-max", type=int, default=14)
+    data.add_argument("--dte-min", type=int, default=3)
+    data.add_argument("--dte-max", type=int, default=21)
     data.add_argument("--max-events", type=int)
     data.add_argument("--max-contracts", type=int)
     data.add_argument("--download-samples", action="store_true")
