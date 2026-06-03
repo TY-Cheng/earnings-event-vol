@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -2117,18 +2118,22 @@ def _train_elastic_net_tuned(
     )
     if params is None:
         cv_splits = min(5, max(2, len(train_fit) - 1))
+        elastic_net_cv_kwargs: dict[str, Any] = {
+            "l1_ratio": [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0],
+            "cv": TimeSeriesSplit(n_splits=cv_splits),
+            "max_iter": 10_000,
+            "random_state": tuning_state.seed,
+        }
+        alpha_count_key = (
+            "n_alphas" if "n_alphas" in inspect.signature(ElasticNetCV).parameters else "alphas"
+        )
+        elastic_net_cv_kwargs[alpha_count_key] = 100
         cv_model = Pipeline(
             [
                 ("scaler", StandardScaler()),
                 (
                     "elastic_net",
-                    ElasticNetCV(
-                        l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0],
-                        n_alphas=100,
-                        cv=TimeSeriesSplit(n_splits=cv_splits),
-                        max_iter=10_000,
-                        random_state=tuning_state.seed,
-                    ),
+                    ElasticNetCV(**elastic_net_cv_kwargs),
                 ),
             ]
         )
