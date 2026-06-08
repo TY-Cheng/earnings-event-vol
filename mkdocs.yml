@@ -65,6 +65,8 @@ extra_javascript:
   - assets/javascripts/mermaid-init.js
 nav:
   - Home: index.md
+  - Technical Overview (ZH): technical_overview_zh.md
+  - Optimization Roadmap (ZH): optimization_roadmap_zh.md
   - Results Snapshot: results_snapshot.md
   - Paper Plan: paper_plan.md
   - Audit Prompts:
