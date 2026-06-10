@@ -34,9 +34,11 @@ implied-volatility forecasting.
 - SEC CompanyFacts XBRL fundamentals with conservative as-of gating.
 - Massive options day aggregates, underlying day aggregates, and targeted
   option one-second trade aggregates.
-- Latest proxy panel: 810 BMO/AMC events; 801 with C2C `rvar_event`; 693 with
-  trade-proxy `IVAR_event`; 12,038 proxy contract candidates; 10,165 usable
-  pre-cutoff prices.
+- Massive `quotes_v1` flat-file object availability has been confirmed. The
+  repo now has a targeted quote execution extractor, but canonical modeling
+  artifacts have not yet been rerun with quote-window marks.
+- Canonical 2026-05-12 modeling snapshot: 810 BMO/AMC events; 801 with C2C `rvar_event`; 693 with trade-proxy `IVAR_event`; 12,038 proxy contract candidates; 10,165 usable pre-cutoff prices.
+- Current external gold `trade_proxy_event_panel.parquet` observed during the 2026-06-03 audit has 816 events, 807 C2C RVAR rows, and 699 IVAR rows, so the data panel and modeling/docs snapshot need refresh synchronization before paper-facing reruns.
 
 ## Feature Protocol
 
@@ -49,6 +51,24 @@ implied-volatility forecasting.
   run-up/surface proxy features.
 - If FE V2 underperforms FE V1 on locked test, report it as a diagnostic
   negative result instead of cherry-picking.
+- Execution confidence and quote diagnostics are evaluation/casebook fields,
+  not model features. `execution_confidence_score`,
+  `execution_confidence_band`, quote status/route, and spread diagnostics are
+  excluded from trainable features by default.
+
+## Quote-Aware Evidence Modules
+
+- `quote-execution-panel` builds targeted quote-window requests from event
+  windows and candidate contracts, filters local or Massive `quotes_v1` rows by
+  event date / option ticker / entry and exit windows, and writes quote marks
+  plus event-level execution confidence.
+- It is designed to avoid storing full-day raw quote files. Outputs are
+  `quote_window_requests.csv`, `quote_window_marks.csv`,
+  `quote_execution_confidence.csv`, and `quote_execution_report.json`.
+- Research metrics now generate IVAR defeat and casebook artifacts:
+  `ivar_defeat_events.csv`, `ivar_defeat_metrics.csv`,
+  `ivar_defeat_breakdowns.csv`, `casebook_events.csv`, and
+  `casebook_summary.csv`.
 
 ## Implemented Models
 
@@ -118,6 +138,17 @@ diagnostic result.
 Do not claim paper-grade executable performance, Mamba superiority,
 full-spread tradability, NBBO evidence, FE V2 improvement, or that lower RMSE
 alone proves economic value.
+
+## Current Implementation Status
+
+- PR #1 was squash-merged as `6ab8cb9`; its two Chinese contributor docs were
+  later deleted after the useful ideas were absorbed into code and
+  paper-facing docs.
+- `paper_plan.md` and `results_snapshot.md` now carry the expected experiment
+  and Results & Discussion roadmap for quote-aware execution confidence, IVAR
+  defeat analysis, and the casebook.
+- `just check` passed after implementation: 129 tests, coverage 95.10%, ruff,
+  mypy, MkDocs strict, status, and source-probe all passing.
 
 ## Command Surface
 

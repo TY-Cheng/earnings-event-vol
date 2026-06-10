@@ -497,13 +497,30 @@ The current implementation of that ledger is in
 
 | Experiment | Required for |
 | --- | --- |
-| Historical quote/NBBO or equivalent data route | Paper-grade IVAR and executable bid/ask strategy claims. |
+| Targeted `quotes_v1` extraction and quote execution panel | Converts quote flat-file availability into event/leg/window bid-ask evidence without storing full-day raw quote files. |
+| Quote-aware execution confidence | Stratifies strategy and ranking results by quote availability, stale quote, spread, invalid bid/ask, and fallback flags. |
+| IVAR defeat analysis | Tests where each model actually beats market `IVAR_event`, where it only repeats market information, and where market IVAR remains better. |
+| False-positive / false-negative casebook | Turns model failures and market-vs-model disagreements into reusable research diagnostics. |
+| Historical quote/NBBO or equivalent data route | Paper-grade IVAR and executable bid/ask strategy claims beyond the current targeted extraction prototype. |
 | Quote-based IVAR reconstruction | Replacing trade-aggregate IV proxies. |
 | Leg-level bid/ask execution | Full-spread long straddle and short iron fly tests. |
 | 2013-2025 full sample rebuild | Target paper sample and longer-history inference. |
 | DTE 5-14 main and DTE 3-21 robustness reruns | Maturity-window robustness. |
 | Liquidity, year, ticker, sector, VIX-regime, and BMO/AMC subgroup tables | Stability and concentration diagnostics. |
 | Block/bootstrap or model-comparison inference | Final statistical claims under multiple models/thresholds. |
+
+The quote route status has changed from a pure entitlement blocker to an
+engineering blocker: the Massive `quotes_v1` flat-file object is visible, but
+single-day compressed files are too large for naive full-day download into the
+research repo. The required implementation is a targeted streaming extractor
+keyed by event date, candidate option ticker, and entry/exit windows. Its
+minimum paper-facing artifacts are:
+
+| Module | Required artifacts | Claim boundary |
+| --- | --- | --- |
+| Quote-aware execution confidence | `quote_window_requests.csv`, `quote_window_marks.csv`, `quote_execution_confidence.csv`, `quote_execution_report.json` | Quote-aware diagnostic, not final NBBO execution unless the source is verified as NBBO-equivalent. |
+| IVAR defeat analysis | `ivar_defeat_events.csv`, `ivar_defeat_metrics.csv`, `ivar_defeat_breakdowns.csv` | Model-vs-market interpretation on locked-test rows; not a new tuning signal. |
+| Casebook | `casebook_events.csv`, `casebook_summary.csv` | Research interpretation and failure taxonomy; not manual sample repair. |
 
 ### 3.3 Decision Rules for the Paper
 
@@ -526,7 +543,9 @@ The results page should carry the full evidence ledger in paper order:
 6. Feature-schema ablation: FE V1 versus FE V2.
 7. Sequence diagnostics and control comparisons.
 8. Cost sensitivity and inference diagnostics.
-9. Discussion: sellable claim, non-results, limitations, and next
+9. Quote-aware execution confidence, IVAR defeat analysis, and casebook
+   roadmap/results when artifacts exist.
+10. Discussion: sellable claim, non-results, limitations, and next
    paper-grade experiments.
 
 The current detailed implementation of that section is
@@ -536,7 +555,8 @@ The current detailed implementation of that section is
 
 | Limitation | Consequence |
 | --- | --- |
-| No historical bid/ask, quote midpoint, OPRA, or NBBO records | Cannot claim full-spread executable strategy performance. |
+| No filtered event-level quote execution panel in the canonical run | Cannot claim full-spread executable strategy performance from the current snapshot. |
+| `quotes_v1` flat-file object is large | Requires targeted extraction; full-day raw quote files should not be stored as repo artifacts. |
 | Option second aggregates are trade OHLCV bars | IV surfaces and strategy marks are trade-price proxies. |
 | Current sample starts in 2022 | Does not yet cover the target 2013-2025 paper window. |
 | IVAR coverage screen is material | Events without usable trade-proxy IVAR cannot enter IVAR-based strategy claims. |

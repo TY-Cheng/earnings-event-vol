@@ -34,7 +34,7 @@ Current sell: conservative proxy-stage signal screening. FE V1 LightGBM/XGBoost 
 
 Docs answer the user-facing questions and are close to paper structure: `paper_plan.md` is Abstract -> Intro -> Materials/Methods -> Experiments -> Limitations -> Conclusion; `results_snapshot.md` is a manuscript-like Results and Discussion ledger; `future_work.md` lists paper blockers. Docs are not yet a final submission manuscript because they still need refreshed artifact sync, literature citations, final robustness/inference, and quote/NBBO execution data.
 
-Legacy cleanup is partial. Retired fake Mamba ids remain only as retired manifest/test assertions and are not active models. `fe_v1_legacy` intentionally remains for ablation. Generated artifacts/reports/site are ignored. `.serena/` is untracked because `.gitignore` currently comments out `.serena/`; decide whether to ignore or commit selected memories.
+Legacy cleanup is partial. Retired fake Mamba ids remain only as retired manifest/test assertions and are not active models. `fe_v1_legacy` intentionally remains for ablation. Generated artifacts/reports/site are ignored. `.serena/` is tracked project memory/config and currently has local updates; decide whether to commit selected memories with the implementation changes.
 
 ## Recommended next run order
 
@@ -47,3 +47,23 @@ Legacy cleanup is partial. Retired fake Mamba ids remain only as retired manifes
 ## Bottom line
 
 The repo is good enough for an internal working-paper/proxy-stage research review. It is not yet paper-grade/submission-ready. Missing blockers are quote/NBBO or equivalent data, quote-based IVAR, leg-level bid/ask execution, 2013-2025 full sample, DTE/liquidity/regime robustness, stronger inference, and artifact/doc synchronization after the latest panel state.
+
+## Update 2026-06-10 MCP/tooling sync
+
+- Actual repo root remains `/home/tycheng/projects/earnings-event-vol/earnings-event-vol`; Codex Serena MCP config was updated to start Serena with this inner repo as `--project` instead of the outer workspace folder.
+- Serena CLI/MCP tool is now `Serena 1.5.3`, matching the latest GitHub release observed on 2026-06-10. Activating the inner repo lists the project memories correctly.
+- Serena 1.5.x refreshed `.serena/project.yml` with its newer config-template comments/fields; this is a tracked project-config change, not business-code churn.
+- Massive MCP remains installed as `mcp-massive v0.9.1`; `uv tool upgrade mcp-massive` reported `Nothing to upgrade`. Codex still launches it through `/home/tycheng/.local/bin/mcp_massive_from_file`, which reads the local Massive API key file and then execs `mcp_massive`.
+- J-Quants MCP was reinstalled from the official JPX/J-Quants GitHub source with `uv tool install --reinstall git+https://github.com/J-Quants/j-quants-doc-mcp.git`. Codex config uses the installed local command `/home/tycheng/.local/bin/j-quants-doc-mcp` directly, which is safer here than `uvx j-quants-doc-mcp` because the package was not resolvable from the public registry in this environment.
+- After the official J-Quants reinstall, `uv tool upgrade --all` succeeds and reports `Nothing to upgrade`. `uv tool list` reports `j-quants-doc-mcp v1.0.0`; the command's own `--version` still prints `0.1.0`, which appears to be an upstream CLI version-string mismatch.
+- Codex project trust config now includes both the outer workspace and the inner repo path.
+- Current git working tree after the MCP sync shows `.serena/project.yml` modified. No source-code diff was present in `src/earnings_event_vol/research.py` at the time of this update.
+
+## Update 2026-06-10 PR #1 and quote-aware implementation
+
+- PR #1 was squash-merged into `main` as `6ab8cb9` and then pulled locally. The two Chinese contributor docs from that PR were later deleted because their useful ideas were absorbed into code plus `paper_plan.md` / `results_snapshot.md`; MkDocs nav is back to the paper-facing front door.
+- New implementation added `src/earnings_event_vol/quote_execution.py` and CLI command `quote-execution-panel`. It builds targeted quote-window requests, filters Massive `quotes_v1`-like rows by event date / option ticker / entry and exit windows, writes quote-window marks, and builds event-level `execution_confidence_score` / `execution_confidence_band`. It does not store full-day raw quote files.
+- Research metrics now emit IVAR defeat and casebook artifacts from locked-test predictions: `ivar_defeat_events.csv`, `ivar_defeat_metrics.csv`, `ivar_defeat_breakdowns.csv`, `casebook_events.csv`, and `casebook_summary.csv`.
+- Feature schema now excludes execution-confidence and quote-diagnostic fields from trainable model features by default.
+- Docs now state that Massive quote flat-file objects are available but not yet incorporated into the canonical run; targeted extraction and quote-aware artifacts are implemented but the canonical FE V2/FE V1 results have not been rerun.
+- Verification after this implementation: `just check` passed with 129 tests, coverage 95.10%, ruff, mypy, MkDocs strict, status, and source-probe all passing. Existing sklearn `n_alphas` deprecation warnings remain non-blocking.

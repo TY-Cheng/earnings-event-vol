@@ -4031,6 +4031,336 @@ def build_common_row_diagnostics(
     return {key: str(value) for key, value in paths.items()}
 
 
+def _copy_optional_columns(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    out = pd.DataFrame(index=frame.index)
+    for column in columns:
+        if column in frame.columns:
+            out[column] = frame[column]
+    return out
+
+
+def _ivar_defeat_event_frame(
+    predictions: pd.DataFrame,
+    *,
+    feature_schema_version: str,
+    tuning_profile: TuningProfile,
+) -> pd.DataFrame:
+    forecast_columns = model_forecast_columns(predictions)
+    test_all = predictions.loc[predictions["split"].eq("test")].copy()
+    if "event_year" not in test_all.columns and "announcement_date" in test_all.columns:
+        test_all["event_year"] = pd.to_datetime(
+            test_all["announcement_date"], errors="coerce"
+        ).dt.year
+    rows: list[pd.DataFrame] = []
+    groups = (
+        list(test_all.groupby("target_id", dropna=False))
+        if "target_id" in test_all.columns
+        else [("day_c2c", test_all)]
+    )
+    optional_columns = [
+        "event_id",
+        "ticker",
+        "announcement_date",
+        "announcement_timing",
+        "entry_date",
+        "exit_date",
+        "event_year",
+        "dte_1",
+        "dte_bucket",
+        "regime",
+        "liquidity_bucket",
+        "execution_confidence_score",
+        "execution_confidence_band",
+        "gross_proxy_pnl_usd",
+        "net_proxy_pnl_usd",
+        "used_intrinsic_fallback",
+    ]
+    for target_id, group in groups:
+        target_id = str(target_id)
+        for model_id, column in forecast_columns.items():
+            if column not in group.columns:
+                continue
+            clean = group.copy()
+            clean["_forecast"] = pd.to_numeric(clean[column], errors="coerce")
+            clean["_rvar"] = pd.to_numeric(clean["rvar_event"], errors="coerce")
+            clean["_ivar"] = pd.to_numeric(clean["ivar_event"], errors="coerce")
+            clean = clean.loc[
+                np.isfinite(clean["_forecast"])
+                & np.isfinite(clean["_rvar"])
+                & np.isfinite(clean["_ivar"])
+            ].copy()
+            if clean.empty:
+                continue
+            out = _copy_optional_columns(clean, optional_columns)
+            out.insert(0, "feature_schema_version", feature_schema_version)
+            out.insert(1, "tuning_profile", tuning_profile)
+            out.insert(2, "target_id", target_id)
+            out.insert(3, "model_id", model_id)
+            out["forecast_col"] = column
+            out["forecast_rvar_event"] = clean["_forecast"].to_numpy(dtype=float)
+            out["rvar_event"] = clean["_rvar"].to_numpy(dtype=float)
+            out["ivar_event"] = clean["_ivar"].to_numpy(dtype=float)
+            out["realized_edge_var"] = out["rvar_event"] - out["ivar_event"]
+            out["forecast_edge_var"] = out["forecast_rvar_event"] - out["ivar_event"]
+            out["model_abs_error"] = (out["forecast_rvar_event"] - out["rvar_event"]).abs()
+            out["ivar_abs_error"] = (out["ivar_event"] - out["rvar_event"]).abs()
+            out["model_squared_error"] = np.square(out["forecast_rvar_event"] - out["rvar_event"])
+            out["ivar_squared_error"] = np.square(out["ivar_event"] - out["rvar_event"])
+            out["model_beats_ivar_abs"] = out["model_abs_error"] < out["ivar_abs_error"]
+            out["model_beats_ivar_squared"] = out["model_squared_error"] < out["ivar_squared_error"]
+            out["forecast_edge_positive"] = out["forecast_edge_var"] > 0
+            out["realized_edge_positive"] = out["realized_edge_var"] > 0
+            out["forecast_sign_correct"] = (
+                out["forecast_edge_positive"] == out["realized_edge_positive"]
+            )
+            out["false_positive"] = out["forecast_edge_positive"] & ~out["realized_edge_positive"]
+            out["false_negative"] = ~out["forecast_edge_positive"] & out["realized_edge_positive"]
+            out["model_corrected_market"] = (
+                out["model_beats_ivar_abs"]
+                & out["forecast_sign_correct"]
+                & out["realized_edge_var"].ne(0)
+            )
+            out["market_right_model_wrong"] = (
+                ~out["model_beats_ivar_abs"] & ~out["forecast_sign_correct"]
+            )
+            top_n = max(1, int(math.ceil(len(out) / 10)))
+            out["top_decile_forecast_edge"] = False
+            if out["forecast_edge_var"].nunique(dropna=True) <= 1:
+                out.loc[:, "top_decile_forecast_edge"] = True
+            else:
+                top_index = out.sort_values("forecast_edge_var", ascending=False).head(top_n).index
+                out.loc[top_index, "top_decile_forecast_edge"] = True
+            out["defeat_label"] = np.where(
+                out["model_beats_ivar_abs"], "model_beats_ivar", "ivar_beats_or_ties_model"
+            )
+            rows.append(out.reset_index(drop=True))
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _ivar_defeat_summary(group: pd.DataFrame) -> dict[str, float | int | None]:
+    if group.empty:
+        return {
+            "n": 0,
+            "model_beats_ivar_abs_rate": None,
+            "model_beats_ivar_squared_rate": None,
+            "mae_lift_vs_ivar": None,
+            "rmse_lift_vs_ivar": None,
+            "sign_accuracy": None,
+            "false_positive_rate": None,
+            "false_negative_rate": None,
+            "top_decile_model_beats_ivar_rate": None,
+            "top_decile_realized_positive_rate": None,
+        }
+    top = group.loc[group["top_decile_forecast_edge"].astype(bool)].copy()
+    model_rmse = float(np.sqrt(pd.to_numeric(group["model_squared_error"], errors="coerce").mean()))
+    ivar_rmse = float(np.sqrt(pd.to_numeric(group["ivar_squared_error"], errors="coerce").mean()))
+    return {
+        "n": int(len(group)),
+        "model_beats_ivar_abs_rate": float(group["model_beats_ivar_abs"].mean()),
+        "model_beats_ivar_squared_rate": float(group["model_beats_ivar_squared"].mean()),
+        "mae_lift_vs_ivar": float(group["ivar_abs_error"].mean() - group["model_abs_error"].mean()),
+        "rmse_lift_vs_ivar": float(ivar_rmse - model_rmse),
+        "sign_accuracy": float(group["forecast_sign_correct"].mean()),
+        "false_positive_rate": float(group["false_positive"].mean()),
+        "false_negative_rate": float(group["false_negative"].mean()),
+        "top_decile_model_beats_ivar_rate": None
+        if top.empty
+        else float(top["model_beats_ivar_abs"].mean()),
+        "top_decile_realized_positive_rate": None
+        if top.empty
+        else float(top["realized_edge_positive"].mean()),
+    }
+
+
+def _summarize_ivar_defeat(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if events.empty:
+        return pd.DataFrame()
+    for keys, group in events.groupby(["target_id", "model_id"], dropna=False):
+        target_id, model_id = keys
+        rows.append(
+            {
+                "target_id": target_id,
+                "model_id": model_id,
+                **_ivar_defeat_summary(group),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _ivar_defeat_breakdowns(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if events.empty:
+        return pd.DataFrame()
+    for breakdown in (
+        "announcement_timing",
+        "event_year",
+        "dte_bucket",
+        "liquidity_bucket",
+        "regime",
+        "execution_confidence_band",
+    ):
+        if breakdown not in events.columns:
+            continue
+        for keys, group in events.groupby(["target_id", "model_id", breakdown], dropna=False):
+            target_id, model_id, value = keys
+            rows.append(
+                {
+                    "target_id": target_id,
+                    "model_id": model_id,
+                    "breakdown": breakdown,
+                    "breakdown_value": value,
+                    **_ivar_defeat_summary(group),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_ivar_defeat_tables(
+    predictions: pd.DataFrame,
+    *,
+    out_dir: Path,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    tuning_profile: TuningProfile = "tuned_phase1",
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    events = _ivar_defeat_event_frame(
+        predictions,
+        feature_schema_version=feature_schema_version,
+        tuning_profile=tuning_profile,
+    )
+    metrics = _summarize_ivar_defeat(events)
+    breakdowns = _ivar_defeat_breakdowns(events)
+    paths = {
+        "ivar_defeat_events": out_dir / "ivar_defeat_events.csv",
+        "ivar_defeat_metrics": out_dir / "ivar_defeat_metrics.csv",
+        "ivar_defeat_breakdowns": out_dir / "ivar_defeat_breakdowns.csv",
+    }
+    events.to_csv(paths["ivar_defeat_events"], index=False)
+    metrics.to_csv(paths["ivar_defeat_metrics"], index=False)
+    breakdowns.to_csv(paths["ivar_defeat_breakdowns"], index=False)
+    return {key: str(value) for key, value in paths.items()}
+
+
+def _case_columns(frame: pd.DataFrame) -> list[str]:
+    preferred = [
+        "case_type",
+        "case_reason",
+        "severity_score",
+        "feature_schema_version",
+        "tuning_profile",
+        "target_id",
+        "model_id",
+        "event_id",
+        "ticker",
+        "announcement_date",
+        "announcement_timing",
+        "ivar_event",
+        "forecast_rvar_event",
+        "rvar_event",
+        "forecast_edge_var",
+        "realized_edge_var",
+        "model_abs_error",
+        "ivar_abs_error",
+        "gross_proxy_pnl_usd",
+        "net_proxy_pnl_usd",
+        "execution_confidence_score",
+        "execution_confidence_band",
+    ]
+    return [column for column in preferred if column in frame.columns]
+
+
+def build_casebook_tables(
+    defeat_events: pd.DataFrame,
+    *,
+    out_dir: Path,
+    top_n: int = 25,
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    case_frames: list[pd.DataFrame] = []
+
+    def add_cases(mask: pd.Series, case_type: str, reason: str, severity: pd.Series) -> None:
+        subset = defeat_events.loc[mask].copy()
+        if subset.empty:
+            return
+        subset["case_type"] = case_type
+        subset["case_reason"] = reason
+        subset["severity_score"] = pd.to_numeric(severity.loc[subset.index], errors="coerce").abs()
+        grouped = subset.sort_values("severity_score", ascending=False).groupby(
+            ["case_type", "target_id", "model_id"], dropna=False
+        )
+        case_frames.append(grouped.head(int(top_n)).reset_index(drop=True))
+
+    if not defeat_events.empty:
+        add_cases(
+            defeat_events["false_positive"].astype(bool),
+            "false_positive",
+            "forecast_edge_positive_realized_edge_nonpositive",
+            defeat_events["forecast_edge_var"],
+        )
+        add_cases(
+            defeat_events["false_negative"].astype(bool),
+            "false_negative",
+            "forecast_edge_nonpositive_realized_edge_positive",
+            defeat_events["realized_edge_var"],
+        )
+        add_cases(
+            defeat_events["model_corrected_market"].astype(bool),
+            "model_corrected_market",
+            "model_error_below_ivar_and_edge_sign_correct",
+            defeat_events["ivar_abs_error"] - defeat_events["model_abs_error"],
+        )
+        add_cases(
+            defeat_events["market_right_model_wrong"].astype(bool),
+            "market_right_model_wrong",
+            "ivar_error_not_exceeded_and_model_edge_sign_wrong",
+            defeat_events["model_abs_error"] - defeat_events["ivar_abs_error"],
+        )
+        fragile = pd.Series(False, index=defeat_events.index)
+        if "execution_confidence_score" in defeat_events.columns:
+            fragile |= pd.to_numeric(
+                defeat_events["execution_confidence_score"], errors="coerce"
+            ).lt(0.5)
+        if "execution_confidence_band" in defeat_events.columns:
+            fragile |= (
+                defeat_events["execution_confidence_band"].astype(str).isin({"low", "missing"})
+            )
+        if "used_intrinsic_fallback" in defeat_events.columns:
+            fragile |= defeat_events["used_intrinsic_fallback"].astype(bool)
+        add_cases(
+            fragile,
+            "execution_fragile",
+            "low_or_missing_execution_confidence_or_intrinsic_fallback",
+            defeat_events["forecast_edge_var"],
+        )
+    events = (
+        pd.concat(case_frames, ignore_index=True)
+        if case_frames
+        else pd.DataFrame(columns=["case_type", "case_reason", "severity_score"])
+    )
+    if not events.empty:
+        events = events[_case_columns(events)]
+    summary = (
+        events.groupby(["case_type", "target_id", "model_id"], dropna=False)
+        .agg(
+            n=("case_type", "size"),
+            mean_severity_score=("severity_score", "mean"),
+            mean_model_abs_error=("model_abs_error", "mean"),
+            mean_ivar_abs_error=("ivar_abs_error", "mean"),
+        )
+        .reset_index()
+        if not events.empty
+        else pd.DataFrame(columns=["case_type", "target_id", "model_id", "n"])
+    )
+    paths = {
+        "casebook_events": out_dir / "casebook_events.csv",
+        "casebook_summary": out_dir / "casebook_summary.csv",
+    }
+    events.to_csv(paths["casebook_events"], index=False)
+    summary.to_csv(paths["casebook_summary"], index=False)
+    return {key: str(value) for key, value in paths.items()}
+
+
 def build_metric_tables(
     predictions: pd.DataFrame,
     *,
@@ -4277,6 +4607,24 @@ def build_metric_tables(
     (pd.concat(inference_frames, ignore_index=True) if inference_frames else pd.DataFrame()).to_csv(
         inference_path, index=False
     )
+    defeat_events = _ivar_defeat_event_frame(
+        predictions,
+        feature_schema_version=feature_schema_version,
+        tuning_profile=tuning_profile,
+    )
+    ivar_defeat_paths = {
+        "ivar_defeat_events": out_dir / "ivar_defeat_events.csv",
+        "ivar_defeat_metrics": out_dir / "ivar_defeat_metrics.csv",
+        "ivar_defeat_breakdowns": out_dir / "ivar_defeat_breakdowns.csv",
+    }
+    defeat_events.to_csv(ivar_defeat_paths["ivar_defeat_events"], index=False)
+    _summarize_ivar_defeat(defeat_events).to_csv(
+        ivar_defeat_paths["ivar_defeat_metrics"], index=False
+    )
+    _ivar_defeat_breakdowns(defeat_events).to_csv(
+        ivar_defeat_paths["ivar_defeat_breakdowns"], index=False
+    )
+    casebook_paths = build_casebook_tables(defeat_events, out_dir=out_dir)
     return {
         "forecast_metrics": str(forecast_path),
         "ranking_metrics": str(ranking_path),
@@ -4287,6 +4635,8 @@ def build_metric_tables(
         "qlike_sanity": str(qlike_path),
         "extreme_predictions": str(extreme_path),
         "inference": str(inference_path),
+        **{key: str(value) for key, value in ivar_defeat_paths.items()},
+        **casebook_paths,
     }
 
 

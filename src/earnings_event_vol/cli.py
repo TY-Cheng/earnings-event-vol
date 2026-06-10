@@ -48,6 +48,7 @@ from earnings_event_vol.models import (
     prediction_column_for_model,
     run_model_suite,
 )
+from earnings_event_vol.quote_execution import extract_quote_execution_panel
 from earnings_event_vol.research import remove_model_level_csv_artifacts, run_proxy_research_package
 from earnings_event_vol.schemas import EarningsEvent, OptionRight, OptionSide, TradeLeg
 from earnings_event_vol.variance import (
@@ -134,6 +135,16 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
 
+def _parse_dates(raw_values: list[str] | None) -> list[pd.Timestamp]:
+    dates: list[pd.Timestamp] = []
+    for raw in raw_values or []:
+        for text in str(raw).split(","):
+            cleaned = text.strip()
+            if cleaned:
+                dates.append(pd.Timestamp(cleaned))
+    return dates
+
+
 def _audit_data(args: argparse.Namespace) -> int:
     quotes = _read_csv(args.quotes)
     underlying = _read_csv(args.underlying)
@@ -189,6 +200,31 @@ def _massive_flat_files(args: argparse.Namespace, config: ProjectConfig) -> int:
         }
     )
     return 0 if ok else 1
+
+
+def _quote_execution_panel(args: argparse.Namespace, config: ProjectConfig) -> int:
+    contracts = _read_table(args.contracts)
+    windows = _read_table(args.windows)
+    date_values = [value.date() for value in _parse_dates(args.date)]
+    quote_csv_paths = tuple(Path(path) for path in (args.quotes_csv or []))
+    report = extract_quote_execution_panel(
+        config=config,
+        contracts=contracts,
+        windows=windows,
+        out_dir=Path(args.out),
+        quote_csv_paths=quote_csv_paths,
+        dates=date_values,
+        metadata_only=bool(args.metadata_only),
+        chunksize=int(args.chunksize),
+        entry_lookback_seconds=int(args.entry_lookback_seconds),
+        exit_lookback_seconds=int(args.exit_lookback_seconds),
+        stale_seconds=int(args.stale_seconds),
+        wide_spread_threshold=float(args.wide_spread_threshold),
+        max_events=args.max_events,
+        aws_executable=args.aws_executable,
+    )
+    _print_json(report.as_dict())
+    return 0 if report.ok else 1
 
 
 def _validate_calendar(args: argparse.Namespace) -> int:
@@ -699,6 +735,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--metadata-only", action="store_true", help="Skip small day-aggregate sample download."
     )
 
+    quote_exec = subparsers.add_parser(
+        "quote-execution-panel",
+        help="Build targeted quote-window execution diagnostics from Massive quotes_v1.",
+    )
+    quote_exec.add_argument("--contracts", type=Path, required=True)
+    quote_exec.add_argument("--windows", type=Path, required=True)
+    quote_exec.add_argument("--out", type=Path, required=True)
+    quote_exec.add_argument(
+        "--quotes-csv",
+        action="append",
+        help="Local quotes_v1-like CSV fixture/path. Repeat for multiple files.",
+    )
+    quote_exec.add_argument(
+        "--date",
+        action="append",
+        help="Restrict extraction to one date or a comma-separated date list.",
+    )
+    quote_exec.add_argument("--metadata-only", action="store_true")
+    quote_exec.add_argument("--chunksize", type=int, default=250_000)
+    quote_exec.add_argument("--entry-lookback-seconds", type=int, default=900)
+    quote_exec.add_argument("--exit-lookback-seconds", type=int, default=900)
+    quote_exec.add_argument("--stale-seconds", type=int, default=60)
+    quote_exec.add_argument("--wide-spread-threshold", type=float, default=0.25)
+    quote_exec.add_argument("--max-events", type=int)
+    quote_exec.add_argument("--aws-executable", default="aws")
+
     validate_calendar = subparsers.add_parser("validate-calendar", help="Validate earnings timing.")
     validate_calendar.add_argument("--input", type=Path, required=True)
     validate_calendar.add_argument("--out", type=Path)
@@ -919,6 +981,8 @@ def main(argv: list[str] | None = None) -> int:
         return _audit_data(args)
     if args.command == "massive-flat-files":
         return _massive_flat_files(args, config)
+    if args.command == "quote-execution-panel":
+        return _quote_execution_panel(args, config)
     if args.command == "validate-calendar":
         return _validate_calendar(args)
     if args.command == "build-earnings-calendar":

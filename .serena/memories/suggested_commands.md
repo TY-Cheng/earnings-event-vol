@@ -7,7 +7,7 @@ The project uses `just` as the command runner and `uv` for package management.
 Run commands through WSL from Windows/Codex desktop when needed:
 
 ```bash
-wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol -- bash -lc "just check"
+wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol/earnings-event-vol -- bash -lc "just check"
 ```
 
 ## Primary Commands
@@ -51,7 +51,12 @@ PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli status
 PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli source-probe all
 PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli data --stage <stage> [args]
 PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli research [args]
+PYTHONPATH=src uv run --env-file .env python -m earnings_event_vol.cli quote-execution-panel --contracts /home/tycheng/data/earnings-event-vol/silver/contracts/event_contract_candidates.parquet --windows /home/tycheng/data/earnings-event-vol/silver/event_windows/event_windows.parquet --out artifacts/quote_execution_smoke --metadata-only --max-events 5
 ```
+
+For a real quote extraction smoke test, remove `--metadata-only` and pass a
+single `--date YYYY-MM-DD`. This streams the Massive `quotes_v1` flat file for
+that date and may be large; do not store full-day raw quote files in the repo.
 
 ## Development Shortcuts
 
@@ -75,6 +80,12 @@ uv run mkdocs build --strict --clean
 - Forecast metrics: `artifacts/modeling/forecast_metrics.csv`
 - Ranking metrics: `artifacts/modeling/ranking_metrics.csv`
 - Strategy metrics: `artifacts/modeling/strategy_metrics.csv`
+- Quote execution smoke artifacts: `artifacts/quote_execution_smoke/`
+- IVAR defeat artifacts: `artifacts/modeling/ivar_defeat_events.csv`,
+  `artifacts/modeling/ivar_defeat_metrics.csv`,
+  `artifacts/modeling/ivar_defeat_breakdowns.csv`
+- Casebook artifacts: `artifacts/modeling/casebook_events.csv`,
+  `artifacts/modeling/casebook_summary.csv`
 - Model fit diagnostics: `artifacts/modeling/model_fit_diagnostics.csv`
 - Tuning trials: `artifacts/modeling/tuning_trials.csv`
 - Tuning selected params: `artifacts/modeling/tuning_selected_params.json`

@@ -1,12 +1,13 @@
 # Current State and Caveats
 
-Updated for `/home/tycheng/projects/earnings-event-vol` on 2026-05-12 after
-the canonical FE V2 tuned run and same-code FE V1 versus FE V2 ablation.
+Updated originally for the canonical FE V2 tuned run and same-code FE V1 versus FE V2 ablation on 2026-05-12. Current actual repo root is `/home/tycheng/projects/earnings-event-vol/earnings-event-vol`; the outer `/home/tycheng/projects/earnings-event-vol` is only the workspace wrapper.
 
 ## Local Execution Status
 
-- Run commands through WSL, for example:
-  `wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol -- bash -lc "just check"`.
+- MCP/tooling status as of 2026-06-10: Serena CLI is `1.5.3` and Codex now starts Serena with `--project /home/tycheng/projects/earnings-event-vol/earnings-event-vol`; Massive MCP is `mcp-massive v0.9.1` via `mcp_massive_from_file`; J-Quants MCP was reinstalled from official JPX/J-Quants GitHub source `git+https://github.com/J-Quants/j-quants-doc-mcp.git` and Codex uses the installed local command `/home/tycheng/.local/bin/j-quants-doc-mcp`. `uv tool upgrade --all` now succeeds and reports `Nothing to upgrade`; `uv tool list` reports `j-quants-doc-mcp v1.0.0`, while the command's own `--version` still prints `0.1.0`.
+
+- Run commands through WSL from the inner repo, for example:
+  `wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol/earnings-event-vol -- bash -lc "just check"`.
 - `.env` is machine-local and ignored. It should set
   `UV_PROJECT_ENVIRONMENT=/home/tycheng/.venvs/earnings-event-vol` and a
   device-specific absolute `DATA_DIR` outside the repo.
@@ -29,6 +30,13 @@ the canonical FE V2 tuned run and same-code FE V1 versus FE V2 ablation.
   to FE V2 after the FE V1 run.
 - `just mamba-doctor` has passed locally under WSL2 with CUDA and official
   `mamba-ssm`; sequence rows remain diagnostic without the bootstrap gate.
+- PR #1 was squash-merged as `6ab8cb9`, then its two Chinese contributor docs
+  were deleted after the useful roadmap ideas were absorbed into code and
+  paper-facing docs. MkDocs now keeps `Results Snapshot` and `Paper Plan` as
+  the front-door research docs.
+- `just check` passed after the quote-aware implementation: 129 tests, total
+  coverage 95.10%, ruff, mypy, MkDocs strict, status, and source-probe all
+  passing.
 
 ## Research Question and Scope
 
@@ -40,17 +48,14 @@ premium-space proxy economics after costs.
 ## Current Data and Execution Grade
 
 - Current proxy window: 2022-12-01 through 2025-12-31.
-- Dynamic calendar rows: 1,054.
-- BMO/AMC main-sample events: 810.
-- Trade-proxy event-panel rows: 810.
-- Events with C2C `rvar_event` alias: 801.
-- Events with trade-proxy `IVAR_event`: 693.
-- Proxy contracts: 12,038.
-- Usable pre-cutoff proxy contract prices: 10,165.
-- Contracts with local IV proxy: 10,138.
-- Proxy straddle diagnostic rows: 779.
+- The 2026-05-12 canonical modeling snapshot used 810 BMO/AMC main-sample events, 801 C2C `rvar_event` rows, 693 trade-proxy `IVAR_event` rows, 12,038 proxy contracts, 10,165 usable pre-cutoff proxy contract prices, 10,138 contracts with local IV proxy, and 779 proxy straddle diagnostic rows.
+- The newer external gold `trade_proxy_event_panel.parquet` observed during the 2026-06-03 audit has 816 events, 807 C2C RVAR rows, and 699 IVAR rows. Treat docs/modeling artifacts as needing refresh synchronization before the next canonical rerun.
 - Panel grade: `no_nbbo_trade_proxy`.
 - `paper_grade=false`; no bid/ask, OPRA, or NBBO execution claim.
+- Massive `quotes_v1` flat-file objects are visible, but the canonical run has
+  not yet built a filtered quote execution panel. Full-day quote files are too
+  large for naive artifact storage; use targeted extraction by event date,
+  option ticker, and entry/exit windows.
 
 ## Target System
 
@@ -68,6 +73,10 @@ premium-space proxy economics after costs.
 - `tuned_phase1` is the canonical tuned protocol. It uses train and
   locked-validation rows for selection, then refits on train+validation and
   evaluates locked test once.
+- Quote-aware execution confidence is implemented as a diagnostic/evaluation
+  layer, not as a model input. New fields such as `execution_confidence_score`,
+  `execution_confidence_band`, quote route/status, and spread diagnostics are
+  excluded from trainable features by default.
 - Current model rows include market IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto spread, Elastic Net, LightGBM, XGBoost, LightGBM/XGBoost
   rank-average ensemble, FT-Transformer, ridge-flat sequence aggregates,
@@ -114,6 +123,8 @@ Current sell:
   in a no-NBBO proxy sample.
 - FE V2 is a negative diagnostic result, not a headline improvement.
 - Sequence rows, including official `mamba-ssm`, remain diagnostic.
+- Newly implemented but not yet rerun in canonical artifacts: quote execution
+  panel, IVAR defeat tables, and false-positive/false-negative casebook.
 
 ## Caveats
 
@@ -125,3 +136,7 @@ Current sell:
 - Paper-grade claims require historical bid/ask or NBBO-equivalent data,
   quote-based IVAR, leg-level execution with bid/ask crossing, and robust
   inference.
+- Next execution path should run `quote-execution-panel` on a bounded event/date
+  slice first, inspect quote coverage and confidence bands, then rebuild
+  research artifacts so `ivar_defeat_*` and `casebook_*` tables reflect the
+  canonical prediction set.

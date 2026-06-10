@@ -490,10 +490,11 @@ def build_event_window_panel(
     _write_parquet(silver_contracts_dir / "event_contract_candidates.parquet", contracts)
 
     quote_report = {
-        "nbbo_quote_route": "blocked",
-        "rest_quotes_status": "not_entitled_in_current_massive_plan",
+        "nbbo_quote_route": "not_built",
+        "rest_quotes_status": "flat_file_quote_route_preferred",
         "s3_select_status": "method_not_allowed_on_massive_flat_file_endpoint",
-        "flat_file_full_scan_status": "deferred_too_large_for_proxy_pipeline",
+        "flat_file_object_status": "available_targeted_extraction_required",
+        "flat_file_full_scan_status": "deferred_too_large_for_naive_proxy_pipeline",
         "observed_quotes_v1_compressed_size_example_bytes": 115_992_798_867,
         "provisional_route_used": "options_day_aggs_close_proxy",
         "paper_grade": False,

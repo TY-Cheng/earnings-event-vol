@@ -15,6 +15,11 @@ Generated outputs remain under ignored `artifacts/`, `reports/`, and external
 `no_nbbo_trade_proxy`: current option prices come from trade-aggregate proxy
 marks, not quote midpoints, bid/ask records, OPRA, or NBBO.
 
+Massive `quotes_v1` flat-file object availability has now been confirmed, but
+the canonical run has not yet built the filtered event-level quote execution
+panel. The next results update must therefore distinguish quote availability
+from quote-validated execution evidence.
+
 This page is the handoff from the planned manuscript design to observed
 evidence. Each completed experiment from the paper plan should appear here with
 its sample, table or figure, outcome, interpretation, and claim boundary. The
@@ -61,8 +66,9 @@ strategy numbers must remain labeled `paper_grade=false`.
 
 **Discussion.** The current result can be sold only as signal-screening
 evidence. It cannot be sold as executable option-trading performance because
-bid/ask crossing, quote availability, and NBBO routing are unavailable in this
-data route.
+the canonical snapshot still lacks filtered event/leg quote marks,
+quote-based IVAR, and bid/ask crossing metrics. Quote flat-file availability
+is a necessary input, not yet a completed paper-grade result.
 
 ### 3.2 Research Question and Evidence Map
 
@@ -107,6 +113,9 @@ The completed proxy-stage experiment ledger below is the bridge from
 | Cost sensitivity | 3.10 | Cost multiplier table and figure | Only the FE V2 ridge-flat diagnostic row stays positive through 5x proxy haircut. | Cost robustness is not quote-execution evidence. |
 | Calibration and QLIKE | 3.11 | Calibration and QLIKE diagnostic figures | Ranking evidence is stronger than calibrated variance-level evidence. | Supports the metric hierarchy from the paper plan. |
 | Sequence diagnostic suite | 3.12 | Sequence diagnostic gate table | Official `mamba-ssm` does not beat controls or tabular baselines. | Do not sell Mamba or sequence superiority. |
+| Quote-aware execution confidence | Planned 3.15 | Quote-window marks and execution confidence bands | Not yet run in the canonical snapshot. | Required before upgrading proxy PnL to quote-aware evidence. |
+| IVAR defeat analysis | Planned 3.15 | Model-vs-IVAR event and summary tables | Implemented as a planned artifact path; not yet in the canonical snapshot. | Required to explain where models really beat market IVAR. |
+| False-positive / false-negative casebook | Planned 3.15 | Casebook event and summary tables | Implemented as a planned artifact path; not yet in the canonical snapshot. | Required for discussion of failure modes and market-vs-model disagreements. |
 
 The rest of this section expands those rows into manuscript-ready result
 blocks. Each block distinguishes the numerical result from the interpretation
@@ -485,12 +494,24 @@ Paper-grade claims require:
 
 | Requirement | Why it is needed |
 | --- | --- |
-| Historical quote/NBBO or equivalent data | Converts no-NBBO proxy marks into executable entry/exit evidence. |
+| Targeted quote execution panel | Converts quote flat-file availability into event/leg/window bid-ask diagnostics. |
+| Historical quote/NBBO or equivalent data | Converts no-NBBO proxy marks into executable entry/exit evidence beyond the current targeted extractor. |
 | Quote-based `IVAR_event` construction | Replaces trade-close IV proxies with quote-consistent implied variance. |
 | Leg-level execution and realistic bid/ask crossing | Converts premium-space proxy edge into executable PnL. |
 | Longer historical sample | Supports stronger inference, liquidity stratification, and crisis/regime checks. |
 | DTE and liquidity robustness | Tests whether results survive contract-selection choices. |
 | Clustered/bootstrap inference over final sample | Separates stable cross-sectional signal from small-sample luck. |
+
+### 3.15 Next-Stage Results Roadmap
+
+The next results refresh should add three blocks before any stronger trading
+claim is made.
+
+| Planned block | Required tables | Current status | Interpretation rule |
+| --- | --- | --- | --- |
+| Quote-aware execution confidence | `quote_window_marks.csv`, `quote_execution_confidence.csv`, `quote_execution_report.json` | Code path planned/implemented after PR #1; canonical result not rerun. | Report strategy and ranking metrics by high/medium/low quote confidence before claiming execution improvement. |
+| IVAR defeat analysis | `ivar_defeat_events.csv`, `ivar_defeat_metrics.csv`, `ivar_defeat_breakdowns.csv` | Artifact path planned/implemented after PR #1; canonical result not rerun. | Sell model value only where locked-test rows show improvement over `IVAR_event`, not merely lower standalone error. |
+| Failure casebook | `casebook_events.csv`, `casebook_summary.csv` | Artifact path planned/implemented after PR #1; canonical result not rerun. | Use false positives, false negatives, model-corrects-market, market-right-model-wrong, and execution-fragile cases to structure the discussion. |
 
 **Bottom line.** The project has all code paths and proxy-stage results needed
 for an internal working-paper draft. It does not yet have the final data
