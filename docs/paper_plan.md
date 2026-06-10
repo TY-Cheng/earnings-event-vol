@@ -35,18 +35,21 @@ premium-space trade selection after costs.
 
 The current proxy-stage study uses a SEC-first earnings calendar and Massive
 market-data proxy route for U.S. single-name equity options from 2022-12-01
-through 2025-12-31. The canonical modeling snapshot contains 810 BMO/AMC
-earnings events, of which 693 have a trade-proxy `IVAR_event`. The primary
-scientific target is close-to-open earnings jump variance (`jump_c2o`); the V1
-proxy-PnL headline is close-to-close event variance (`day_c2c`); post-open
-digestion (`reaction_o2c`) is diagnostic.
+through 2025-12-31. The refreshed 2026-06-11 local data snapshot contains 816
+BMO/AMC earnings events, of which 705 have a trade-proxy `IVAR_event`. The
+latest local modeling refresh uses `sequence_suite=all` on that 816-row feature
+matrix with explicit 5-seed BiGRU and official `mamba-ssm` diagnostics. The
+primary scientific target is close-to-open earnings jump variance (`jump_c2o`);
+the V1 proxy-PnL headline is close-to-close event variance (`day_c2c`);
+post-open digestion (`reaction_o2c`) is diagnostic.
 
-The current same-code feature ablation is negative for the richer default
-`fe_v2_sec_xbrl` schema and stronger for the parsimonious `fe_v1_legacy`
-schema. The defensible conclusion is that a tabular event-level feature set
-shows preliminary cross-sectional ranking signal for earnings event-variance
-mispricing in a no-NBBO proxy sample. Paper-grade claims require historical
-quote/NBBO or equivalent data, quote-based IVAR, and leg-level execution with
+The refreshed FE V2 fast run finds that the Goyal-Saretto-style spread leads
+`jump_c2o` ranking, while the LightGBM/XGBoost ensemble leads `jump_c2o` OOS
+R2 versus IVAR. The C2C proxy economics remain negative across refreshed
+tabular rows. The defensible conclusion is therefore preliminary
+signal-screening and benchmark discipline, not executable trading
+outperformance. Paper-grade claims require historical quote/NBBO or equivalent
+data, populated quote-based IVAR diagnostics, and leg-level execution with
 realistic bid/ask crossing.
 
 ## 1. Introduction
@@ -117,13 +120,15 @@ asset-pricing ML.
 | Empirical asset pricing with ML | ML claims need out-of-sample ranking, economic value, and strong tabular baselines. | Requires LightGBM/XGBoost and validation-only tuning before deep-model claims. |
 | Surface and sequence modeling | Ordered option-surface paths may contain incremental pre-event information. | Motivates FT-Transformer, BiGRU, official `mamba-ssm`, attention, CNN, mask-only, and time-shuffle diagnostics. |
 
-The current in-repo results are proxy-stage only. In the canonical FE V2 run,
-the strongest `jump_c2o` AUC is the Goyal-Saretto-style spread at about 0.602,
-while FE V2 LightGBM/XGBoost rows have weak `jump_c2o` AUC and negative C2C
-proxy PnL. The same-code FE V1 ablation is stronger: LightGBM reaches
-`jump_c2o` AUC about 0.677, XGBoost has best `jump_c2o` OOS R2 versus IVAR at
-about 0.375, and LightGBM leads the `day_c2c` headline proxy strategy at about
-53,664 USD net PnL.
+The current in-repo results are proxy-stage only. In the refreshed 2026-06-11
+FE V2 fast run, Goyal-Saretto-style spread has the strongest `jump_c2o` AUC
+at about 0.620 and the LightGBM/XGBoost ensemble has the best `jump_c2o` OOS
+R2 versus IVAR at about 0.236. Refreshed `day_c2c` proxy economics remain
+negative; the best tabular net proxy PnL is about -1,948 USD for the
+Goyal-Saretto-style spread. Older FE V1/FE V2 ablation artifacts remain useful
+for design comparison, but the current paper plan should treat the refreshed
+FE V2 fast run as the live local evidence ledger until a full sequence
+canonical rerun replaces it.
 
 ### 1.3 Research Gap
 
@@ -228,8 +233,11 @@ absence of quote/NBBO execution evidence before presenting model results.
 ### 2.2 Sample, Universe, and Event Timing
 
 The active proxy modeling snapshot covers 2022-12-01 through 2025-12-31. The
-target paper range remains 2013-2025, pending historical quote/NBBO or
-equivalent data.
+target paper range remains 2013-2025. The current lake-quality audit makes this
+gap explicit: all 12 required 2013-2025 paper-grade datasets are still
+span-incomplete, with options day aggregates starting on 2022-05-04, underlying
+day aggregates starting on 2016-05-04, and the main event/modeling sample
+starting in December 2022.
 
 The universe is dynamic. Each month, eligible U.S. single-name option
 underlyings are ranked by trailing six-month option premium dollar volume:
@@ -322,7 +330,8 @@ pre-entry information set.
 
 The pipeline separates event discovery, market-data construction, feature
 engineering, model training, and proxy backtesting. The diagram keeps the
-execution caveat explicit: current prices are trade-aggregate proxies.
+execution caveat explicit: the canonical strategy prices are trade-aggregate
+proxies, while quote data enters only through targeted event-window extraction.
 
 ```mermaid
 flowchart TB
@@ -338,6 +347,9 @@ flowchart TB
   contracts --> ivar["IVAR_event\n2-expiry event variance extraction"]
   optsec["Option one-second trade aggregates\nnot quote, not NBBO"] --> entry["Pre-cutoff entry VWAP"]
   optsec --> exit["C2C exit preclose VWAP\nC2O/O2C post-open VWAP diagnostics"]
+  quotes["Massive quotes_v1 flat files\nstreamed by date/ticker/window"] --> qbronze["Bronze quote requests\nand matched normalized subset"]
+  qbronze --> qsilver["Silver quote marks\nand leg-level bid/ask fills"]
+  qsilver --> qgold["Gold straddle execution,\nquote-IVAR, bounded quote-IV surface,\nand confidence bands"]
   fred["FRED VIXCLS"] --> features["Feature matrix and sequences"]
   secfacts["SEC CompanyFacts\npoint-in-time fundamentals"] --> features
   ivar --> features
@@ -346,6 +358,7 @@ flowchart TB
   features --> models["Benchmarks, tabular models,\nFT-Transformer, sequence diagnostics"]
   models --> metrics["Forecast, ranking,\nproxy strategy metrics"]
   exit --> metrics
+  qgold --> metrics
   metrics --> results["Results and Discussion"]
 ```
 
@@ -483,7 +496,7 @@ as exploratory.
 | Canonical FE V2 tuned package | Default feature-schema evidence ledger. | Completed as proxy-stage modeling snapshot. |
 | FE V1 versus FE V2 same-code ablation | Tests whether richer features improve locked-test ranking/economics. | Completed; negative for FE V2. |
 | Benchmark ladder | Compares market IVAR, historical baselines, Goyal-Saretto spread, Elastic Net, LightGBM/XGBoost. | Completed. |
-| Full sequence diagnostic suite | Tests ordered proxy-surface paths against mask/time-shuffle controls. | Completed; diagnostic only. |
+| Full sequence diagnostic suite | Tests ordered proxy-surface paths against mask/time-shuffle controls. | Completed for the current proxy sample with explicit 5-seed BiGRU and official `mamba-ssm` rows; all sequence rows remain diagnostic because the primary gate does not pass. |
 | C2C proxy strategy | Tests premium-space headline economics. | Completed for no-NBBO long-straddle proxy. |
 | C2O and O2C diagnostics | Decomposes jump and post-open digestion evidence. | Completed as diagnostic outputs. |
 | Cost sensitivity and inference diagnostics | Stress-tests proxy economics and forecast losses. | Completed at proxy-stage. |
@@ -499,8 +512,10 @@ The current implementation of that ledger is in
 | --- | --- |
 | Targeted `quotes_v1` extraction and quote execution panel | Converts quote flat-file availability into event/leg/window bid-ask evidence without storing full-day raw quote files. |
 | Quote-aware execution confidence | Stratifies strategy and ranking results by quote availability, stale quote, spread, invalid bid/ask, and fallback flags. |
+| Lake quality audit | Verifies bronze/silver/gold date ranges, rows, partitions, quote coverage, and 2013-2025 blockers. |
 | IVAR defeat analysis | Tests where each model actually beats market `IVAR_event`, where it only repeats market information, and where market IVAR remains better. |
 | False-positive / false-negative casebook | Turns model failures and market-vs-model disagreements into reusable research diagnostics. |
+| Robustness summary gates | Summarizes DTE, liquidity, VIX-regime, BMO/AMC, ticker, year, and quote-confidence subgroup coverage and flags small-cell splits. |
 | Historical quote/NBBO or equivalent data route | Paper-grade IVAR and executable bid/ask strategy claims beyond the current targeted extraction prototype. |
 | Quote-based IVAR reconstruction | Replacing trade-aggregate IV proxies. |
 | Leg-level bid/ask execution | Full-spread long straddle and short iron fly tests. |
@@ -510,17 +525,44 @@ The current implementation of that ledger is in
 | Block/bootstrap or model-comparison inference | Final statistical claims under multiple models/thresholds. |
 
 The quote route status has changed from a pure entitlement blocker to an
-engineering blocker: the Massive `quotes_v1` flat-file object is visible, but
-single-day compressed files are too large for naive full-day download into the
-research repo. The required implementation is a targeted streaming extractor
-keyed by event date, candidate option ticker, and entry/exit windows. Its
-minimum paper-facing artifacts are:
+engineering/data-coverage blocker. The Massive `quotes_v1` flat-file object is
+visible, but single-day compressed files are too large for naive full-day
+download into the research repo. Targeted Massive REST quote windows now work
+for option tickers, and a bounded 64-event slice has populated 1,226,559
+matched quote rows, quote marks, leg execution rows, straddle execution rows,
+quote-IVAR diagnostics, bounded quote-IV surface diagnostics, and confidence
+bands. The bounded surface contains 821 finite `quote_mid_iv` leg values, 412
+finite quote total-variance surface-pair rows, and 57 finite surface-IVAR mid
+rows. The required full implementation remains keyed by event date, candidate
+option ticker, and entry/exit windows. The quote step now supports resumable
+batch slices via `--quote-event-offset`, `--max-events`, and
+`--quote-batch-label`; batch-labeled runs write under `batches/batch=...` and
+do not overwrite the canonical bounded slice. A separate
+`quote-execution-merge` stage consolidates verified batch shards into the
+canonical quote lake and research-facing CSV/report artifacts. Its data-lake
+contract is:
+
+| Lake layer | Quote artifact | Purpose |
+| --- | --- | --- |
+| Bronze | `quote_window_requests.parquet`, `quote_window_quotes.parquet` | Request table and matched normalized quote subset only; no full-day raw quote files. |
+| Silver | `quote_window_marks.parquet`, `quote_execution_legs.parquet` | Selected window marks and leg-level buy/sell bid-ask execution diagnostics. |
+| Gold | `quote_straddle_execution.parquet`, `quote_ivar_event.parquet`, `quote_iv_surface.parquet`, `quote_iv_surface_summary.parquet`, `quote_surface_ivar_event.parquet`, `quote_execution_confidence.parquet` | Event/strike straddle execution diagnostics, diagnostic quote-premium variance proxy, bounded quote-IV surface diagnostics, bounded surface-IVAR diagnostics, and event-level confidence bands. |
+
+The data-readiness contract is tracked by
+`artifacts/data_pipeline/lake_quality_audit/`. The audit must become `ok=true`
+for the 2013-2025 target window before the paper can claim full historical
+coverage or paper-grade quote execution.
+
+Its minimum paper-facing artifacts are:
 
 | Module | Required artifacts | Claim boundary |
 | --- | --- | --- |
-| Quote-aware execution confidence | `quote_window_requests.csv`, `quote_window_marks.csv`, `quote_execution_confidence.csv`, `quote_execution_report.json` | Quote-aware diagnostic, not final NBBO execution unless the source is verified as NBBO-equivalent. |
+| Quote-aware execution confidence and bounded quote-IV surface | `quote_window_requests.csv`, `quote_window_quotes.csv`, `quote_window_marks.csv`, `quote_execution_legs.csv`, `quote_straddle_execution.csv`, `quote_ivar_event.csv`, `quote_iv_surface.csv`, `quote_iv_surface_summary.csv`, `quote_surface_ivar_event.csv`, `quote_execution_confidence.csv`, `quote_execution_report.json`, `quote_confidence_prediction_coverage.csv`, `quote_ivar_summary.csv`, `quote_confidence_strategy_summary.csv`, `quote_confidence_ivar_defeat_summary.csv`, `quote_confidence_casebook_summary.csv` | Quote-aware diagnostic, not final NBBO execution unless the source is verified as NBBO-equivalent. `quote_ivar_event` remains a premium-total-variance proxy; the new quote-IV surface artifacts are bounded diagnostics, not full 2013-2025 NBBO-equivalent surface coverage. |
+| Lake quality audit | `lake_dataset_coverage.csv`, `lake_year_coverage.csv`, `lake_quality_report.json` | Required negative/positive gate for 2013-2025 coverage; not a modeling result. |
+| Completion gap audit | `completion_gap_audit.csv`, `completion_gap_audit.json` | Machine-readable target-vs-evidence ledger; required to keep bounded quote/sequence progress separate from unresolved 2013-2025 coverage, NBBO-equivalent execution, and full historical quote-IV surface blockers. |
 | IVAR defeat analysis | `ivar_defeat_events.csv`, `ivar_defeat_metrics.csv`, `ivar_defeat_breakdowns.csv` | Model-vs-market interpretation on locked-test rows; not a new tuning signal. |
 | Casebook | `casebook_events.csv`, `casebook_summary.csv` | Research interpretation and failure taxonomy; not manual sample repair. |
+| Robustness summary | `strategy_breakdowns.csv`, `ivar_defeat_breakdowns.csv`, `robustness_summary.csv` | Current proxy-stage subgroup evidence. Small-cell strategy splits are exploratory; paper-grade robustness still requires the full historical/quote sample. |
 
 ### 3.3 Decision Rules for the Paper
 
@@ -555,7 +597,7 @@ The current detailed implementation of that section is
 
 | Limitation | Consequence |
 | --- | --- |
-| No filtered event-level quote execution panel in the canonical run | Cannot claim full-spread executable strategy performance from the current snapshot. |
+| Quote execution panel is only populated for a bounded slice | The pipeline can build targeted requests, matched quote subsets, leg fills, straddle diagnostics, and confidence bands, but the current results snapshot still cannot claim full-spread executable strategy performance. |
 | `quotes_v1` flat-file object is large | Requires targeted extraction; full-day raw quote files should not be stored as repo artifacts. |
 | Option second aggregates are trade OHLCV bars | IV surfaces and strategy marks are trade-price proxies. |
 | Current sample starts in 2022 | Does not yet cover the target 2013-2025 paper window. |

@@ -185,15 +185,20 @@ from earnings_event_vol.research import (
     HYBRID_STEPS,
     SEQUENCE_FEATURE_NAMES,
     TARGET_IDS,
+    TUNING_SEQUENCE_ENSEMBLE_SEEDS,
     TuningState,
     _latest_xbrl_values_for_event,
+    _load_reusable_tuning_state,
     _model_ids_for_sequence_suite,
     _train_sequence_seed_ensemble,
     _write_tuning_artifacts,
     aggregate_sequence_features,
     assign_event_splits,
     build_common_row_diagnostics,
+    build_completion_gap_audit,
     build_metric_tables,
+    build_quote_diagnostic_tables,
+    build_robustness_summary_table,
     build_sequence_tensor,
     build_sequence_v2_quality,
     enrich_feature_matrix_for_research,
@@ -204,10 +209,14 @@ from earnings_event_vol.research import (
     proxy_surface_distribution_audit,
     proxy_transaction_cost,
     qlike_sanity_table,
+    research_paths,
     run_proxy_model_suite,
+    run_proxy_research_package,
+    run_research_models,
     run_research_report,
     sequence_coverage_by_event,
     sequence_coverage_report,
+    write_proxy_research_report,
     write_retired_model_manifest,
 )
 from earnings_event_vol.schemas import (
@@ -2146,6 +2155,29 @@ def test_contract_reference_validation_empty_and_invalid_reports() -> None:
     )
     assert minimal["deliverable_status"].tolist() == ["standard"]
     assert minimal["corporate_action_flag"].tolist() == [False]
+    missing_reference_standard = apply_contract_reference_validation(
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_discovery_status": ["ok"],
+                "eligible_for_quote_pool": [True],
+                "is_main_dte_5_14": [True],
+                "is_robustness_dte_3_21": [True],
+                "option_multiplier": [100],
+                "contract_size": [100],
+            }
+        ),
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_reference_status": ["missing_reference"],
+                "contract_reference_has_adjusted_deliverable": [False],
+            }
+        ),
+    )
+    assert bool(missing_reference_standard["contract_reference_validated"].iloc[0]) is False
+    assert bool(missing_reference_standard["contract_reference_proxy_usable"].iloc[0]) is True
+    assert bool(missing_reference_standard["eligible_for_quote_pool"].iloc[0]) is True
     failed_minimal = apply_contract_reference_validation(
         pd.DataFrame(
             {
@@ -2262,6 +2294,63 @@ def test_contract_reference_validation_pipeline_step_updates_candidates(
         refresh_bronze=False,
     )
     assert resume.status == "skipped"
+
+
+def test_contract_reference_validation_reuses_existing_reference_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        silver_data_dir=tmp_path / "silver",
+        bronze_data_dir=tmp_path / "bronze",
+    )
+    candidate_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    reference_path = config.silver_data_dir / "contracts" / "contract_reference_validation.parquet"
+    candidate_path.parent.mkdir(parents=True)
+    candidates = pd.DataFrame(
+        {
+            "event_id": ["evt1"],
+            "options_ticker": ["O:AAA260213C00100000"],
+            "option_multiplier": [100],
+            "contract_size": [100],
+            "contract_discovery_status": ["ok"],
+            "eligible_for_quote_pool": [True],
+        }
+    )
+    reference_report = pd.DataFrame(
+        {
+            "options_ticker": ["O:AAA260213C00100000"],
+            "fetch_status": ["hit"],
+            "contract_reference_status": ["missing_reference"],
+            "contract_reference_has_adjusted_deliverable": [False],
+        }
+    )
+    pl.from_pandas(candidates).write_parquet(candidate_path)
+    pl.from_pandas(reference_report).write_parquet(reference_path)
+
+    def fail_fetch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("existing reference report should be reused")
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.fetch_massive_option_contract_reference",
+        fail_fetch,
+    )
+
+    step = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=1,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+
+    assert step.status == "ran"
+    validated = pd.read_parquet(candidate_path)
+    assert bool(validated["contract_reference_proxy_usable"].iloc[0]) is True
+    assert bool(validated["eligible_for_quote_pool"].iloc[0]) is True
+    assert step.metadata["reused_reference_report"] is True
 
 
 def test_contract_reference_validation_pipeline_step_blocks_without_candidates(
@@ -2658,6 +2747,74 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
     fixture_force = run_data_pipeline(config, stage="fixture-audit", out_root=out_root, force=True)
     assert _pipeline_steps(fixture_force)[0]["status"] == "ran"
 
+    lake_config = replace(
+        config,
+        bronze_data_dir=tmp_path / "lake_bronze",
+        silver_data_dir=tmp_path / "lake_silver",
+        gold_data_dir=tmp_path / "lake_gold",
+        artifacts_dir=tmp_path / "lake_artifacts",
+    )
+    option_partition = (
+        lake_config.bronze_data_dir
+        / "massive"
+        / "options_day_aggs"
+        / "date=2022-12-01"
+        / "part.parquet"
+    )
+    underlying_partition = (
+        lake_config.bronze_data_dir
+        / "massive"
+        / "underlying_day_aggs"
+        / "date=2022-12-01"
+        / "part.parquet"
+    )
+    option_partition.parent.mkdir(parents=True)
+    underlying_partition.parent.mkdir(parents=True)
+    pl.DataFrame(
+        {"ticker": ["O:AAA230120C00100000"], "close": [1.0], "volume": [10]}
+    ).write_parquet(
+        option_partition,
+    )
+    pl.DataFrame({"ticker": ["AAA"], "close": [100.0], "volume": [1000]}).write_parquet(
+        underlying_partition,
+    )
+    calendar_path = lake_config.silver_data_dir / "earnings_calendar" / "main_sample.parquet"
+    calendar_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "event_id": ["AAA_2022Q4"],
+            "ticker": ["AAA"],
+            "announcement_date": ["2022-12-01"],
+        }
+    ).to_parquet(calendar_path, index=False)
+    lake_run = run_data_pipeline(
+        lake_config,
+        stage="lake-quality-audit",
+        out_root=out_root,
+        start_date=date(2013, 1, 1),
+        end_date=date(2025, 12, 31),
+    )
+    assert lake_run["ok"] is True
+    lake_step = _pipeline_steps(lake_run)[0]
+    assert lake_step["status"] == "ran"
+    report = json.loads(
+        (out_root / "lake_quality_audit" / "lake_quality_report.json").read_text(encoding="utf-8")
+    )
+    assert report["ok"] is False
+    assert "bronze_options_day_aggs" in report["incomplete_required_dataset_ids"]
+    coverage = pd.read_csv(out_root / "lake_quality_audit" / "lake_dataset_coverage.csv")
+    options_row = coverage.loc[coverage["dataset_id"].eq("bronze_options_day_aggs")].iloc[0]
+    assert options_row["target_coverage_status"] == "target_span_incomplete"
+    assert "history_starts_after_target" in str(options_row["gap_reason"])
+    lake_resume = run_data_pipeline(
+        lake_config,
+        stage="lake-quality-audit",
+        out_root=out_root,
+        start_date=date(2013, 1, 1),
+        end_date=date(2025, 12, 31),
+    )
+    assert _pipeline_steps(lake_resume)[0]["status"] == "skipped"
+
     massive_out = out_root / "massive_probe" / "2025-02-05"
     massive_out.mkdir(parents=True)
     (massive_out / "massive_flat_file_manifest.json").write_text("{}")
@@ -2772,6 +2929,22 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
             out_root=out_root,
             universe_trailing_months=0,
         )
+    with pytest.raises(ValueError, match="quote_workers"):
+        run_data_pipeline(config, stage="quote-execution-panel", out_root=out_root, quote_workers=0)
+    with pytest.raises(ValueError, match="quote_event_offset"):
+        run_data_pipeline(
+            config,
+            stage="quote-execution-panel",
+            out_root=out_root,
+            quote_event_offset=-1,
+        )
+    with pytest.raises(ValueError, match="quote_batch_label"):
+        run_data_pipeline(
+            config,
+            stage="quote-execution-panel",
+            out_root=out_root,
+            quote_batch_label="../bad",
+        )
 
     dry_run = run_data_pipeline(
         config,
@@ -2783,13 +2956,37 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         max_events=8,
         max_contracts=80,
         dry_run=True,
+        quote_workers=4,
+        quote_event_offset=8,
+        quote_batch_label="offset8_size8",
+        quote_merge_batch_labels=["offset8_size8", "offset16_size8"],
+        quote_merge_include_canonical=False,
     )
     assert dry_run["dry_run"] is True
     assert dry_run["writes_data_outputs"] is False
     assert cast(dict[str, object], dry_run["estimated_counts"])["second_agg_rest_calls"] == 80
+    assert cast(dict[str, object], dry_run["estimated_counts"])["quote_rest_workers"] == 0
+    assert cast(dict[str, object], dry_run["parameters"])["quote_workers"] == 4
+    assert cast(dict[str, object], dry_run["parameters"])["quote_event_offset"] == 8
+    assert cast(dict[str, object], dry_run["parameters"])["quote_batch_label"] == "offset8_size8"
+    assert cast(dict[str, object], dry_run["parameters"])["quote_batch_mode"] is True
+    assert cast(dict[str, object], dry_run["parameters"])["quote_merge_batch_labels"] == [
+        "offset8_size8",
+        "offset16_size8",
+    ]
+    assert cast(dict[str, object], dry_run["parameters"])["quote_merge_include_canonical"] is False
     assert "missing_option_day_agg_exit_price" in cast(
         dict[str, object], dry_run["exclusion_estimate"]
     )
+    empty_label_dry_run = run_data_pipeline(
+        config,
+        stage="quote-execution-panel",
+        out_root=out_root,
+        dry_run=True,
+        quote_batch_label="  ",
+    )
+    assert cast(dict[str, object], empty_label_dry_run["parameters"])["quote_batch_label"] is None
+    assert cast(dict[str, object], empty_label_dry_run["parameters"])["quote_batch_mode"] is False
     assert dry_run["planned_stages"] == [
         "options-day-aggs-bulk",
         "universe",
@@ -2798,6 +2995,7 @@ def test_data_pipeline_resume_force_and_stage_outputs(tmp_path: Path) -> None:
         "event-window-panel",
         "contract-reference-validation",
         "trade-proxy-panel",
+        "quote-execution-panel",
     ]
 
     assert cast(dict[str, object], dry_run["bulk_day_aggs_date_range"])["start"] == "2025-07-01"
@@ -2973,6 +3171,44 @@ def test_data_pipeline_completion_and_bulk_helper_edges(tmp_path: Path) -> None:
     assert data_pipeline._bulk_day_aggs_complete_with_params(
         [output], manifest_path=manifest, expected_params={"x": 1}
     )
+    manifest.write_text("{bad json", encoding="utf-8")
+    assert (
+        data_pipeline._bulk_day_aggs_complete_with_params(
+            [output], manifest_path=manifest, expected_params={"x": 1}
+        )
+        is False
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {"x": 1},
+                "status_counts": {"failed": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        data_pipeline._bulk_day_aggs_complete_with_params(
+            [output], manifest_path=manifest, expected_params={"x": 1}
+        )
+        is False
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {"x": 1},
+                "status_counts": {"failed": 0},
+                "dataset_counts": {"underlying_day_aggs": {"hit": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        data_pipeline._bulk_day_aggs_complete_with_params(
+            [output], manifest_path=manifest, expected_params={"x": 1}
+        )
+        is False
+    )
 
     assert data_pipeline._date_partition_value(
         tmp_path / "date=2025-01-02" / "part.parquet"
@@ -3003,6 +3239,316 @@ def test_data_pipeline_completion_and_bulk_helper_edges(tmp_path: Path) -> None:
         source_key="key",
     )
     assert normalized["source_date"].to_list() == ["2025-01-02"]
+
+
+def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
+    target_start = date(2025, 1, 1)
+    target_end = date(2025, 1, 3)
+    assert data_pipeline._parquet_row_count(tmp_path / "missing.parquet") is None
+    dated = tmp_path / "dated.parquet"
+    pd.DataFrame(
+        {
+            "event_id": ["E1", "E2"],
+            "ticker": ["AAA", "BBB"],
+            "entry_date": ["2025-01-01", "2025-01-03"],
+        }
+    ).to_parquet(dated, index=False)
+    assert data_pipeline._parquet_row_count(dated) == 2
+    assert data_pipeline._extract_date_bounds(
+        pd.DataFrame({"bad": ["x"], "entry_date": ["2025-01-02"]}),
+        ("missing", "bad", "entry_date"),
+    ) == ("entry_date", date(2025, 1, 2), date(2025, 1, 2), 1)
+    assert data_pipeline._extract_date_bounds(
+        pd.DataFrame({"bad": ["x"]}),
+        ("missing", "bad"),
+    ) == (None, None, None, 0)
+
+    assert data_pipeline._target_coverage_status(
+        exists=False,
+        first_date=None,
+        last_date=None,
+        target_start=target_start,
+        target_end=target_end,
+    ) == ("missing", "dataset_path_missing", 0.0)
+    assert data_pipeline._target_coverage_status(
+        exists=True,
+        first_date=None,
+        last_date=None,
+        target_start=target_start,
+        target_end=target_end,
+    ) == ("exists_no_date_bounds", "no_auditable_date_column", None)
+    assert data_pipeline._target_coverage_status(
+        exists=True,
+        first_date=target_start,
+        last_date=target_end,
+        target_start=target_start,
+        target_end=target_end,
+        available_partitions=1,
+        expected_partitions=3,
+    ) == ("span_ok_partition_gap", "date_span_covers_target_but_partitions_incomplete", 1 / 3)
+    assert data_pipeline._target_coverage_status(
+        exists=True,
+        first_date=target_start,
+        last_date=target_end,
+        target_start=target_start,
+        target_end=target_end,
+        available_partitions=3,
+        expected_partitions=3,
+    ) == ("target_span_covered", None, 1.0)
+
+    missing_row, missing_years = data_pipeline._lake_dataset_row(
+        dataset_id="missing",
+        layer="bronze",
+        path=tmp_path / "not_there",
+        target_start=target_start,
+        target_end=target_end,
+        date_columns=("entry_date",),
+        required_for_2013_2025=True,
+        paper_grade_requirement="required",
+        note="missing path",
+    )
+    assert missing_row["target_coverage_status"] == "missing"
+    assert missing_years.empty
+
+    partitioned = tmp_path / "partitioned"
+    for value in (target_start, target_end):
+        part = partitioned / f"date={value.isoformat()}" / "part.parquet"
+        part.parent.mkdir(parents=True)
+        pd.DataFrame({"ticker": ["AAA"], "close": [1.0], "volume": [1]}).to_parquet(
+            part,
+            index=False,
+        )
+    partition_row, partition_years = data_pipeline._lake_dataset_row(
+        dataset_id="partitioned",
+        layer="bronze",
+        path=partitioned,
+        target_start=target_start,
+        target_end=target_end,
+        date_columns=("source_date",),
+        required_for_2013_2025=True,
+        paper_grade_requirement="required",
+        note="partitioned",
+        partitioned_by_date=True,
+        expected_weekday_partitions=3,
+    )
+    assert partition_row["partition_count"] == 2
+    assert partition_row["target_coverage_status"] == "span_ok_partition_gap"
+    assert int(partition_years["available_rows_or_partitions"].sum()) == 2
+
+    csv_path = tmp_path / "dated.csv"
+    pd.DataFrame({"event_id": ["E1"], "entry_date": ["2025-01-02"]}).to_csv(
+        csv_path,
+        index=False,
+    )
+    csv_row, csv_years = data_pipeline._lake_dataset_row(
+        dataset_id="csv",
+        layer="silver",
+        path=csv_path,
+        target_start=target_start,
+        target_end=target_end,
+        date_columns=("entry_date",),
+        required_for_2013_2025=True,
+        paper_grade_requirement="required",
+        note="csv",
+    )
+    assert csv_row["row_count"] == 1
+    assert csv_row["event_count"] == 1
+    assert csv_row["target_coverage_status"] == "target_span_incomplete"
+    assert int(csv_years["available_rows_or_partitions"].sum()) == 1
+
+    text_path = tmp_path / "metadata.txt"
+    text_path.write_text("ok", encoding="utf-8")
+    text_row, _ = data_pipeline._lake_dataset_row(
+        dataset_id="text",
+        layer="bronze",
+        path=text_path,
+        target_start=target_start,
+        target_end=target_end,
+        date_columns=("entry_date",),
+        required_for_2013_2025=False,
+        paper_grade_requirement="metadata",
+        note="text",
+    )
+    assert text_row["read_status"] == "exists_unread_date_not_applicable"
+
+    corrupt = tmp_path / "bad.parquet"
+    corrupt.write_text("not parquet", encoding="utf-8")
+    bad_row, _ = data_pipeline._lake_dataset_row(
+        dataset_id="bad",
+        layer="bronze",
+        path=corrupt,
+        target_start=target_start,
+        target_end=target_end,
+        date_columns=("entry_date",),
+        required_for_2013_2025=False,
+        paper_grade_requirement="bad",
+        note="bad",
+    )
+    assert bad_row["read_status"] == "read_failed"
+
+    full_config = replace(
+        load_project_config(),
+        data_dir=tmp_path / "full_lake",
+        bronze_data_dir=tmp_path / "full_lake" / "bronze",
+        silver_data_dir=tmp_path / "full_lake" / "silver",
+        gold_data_dir=tmp_path / "full_lake" / "gold",
+        artifacts_dir=tmp_path / "full_artifacts",
+    )
+
+    def write_parquet(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(path, index=False)
+
+    for value in (date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 3)):
+        for dataset in ("options_day_aggs", "underlying_day_aggs"):
+            write_parquet(
+                full_config.bronze_data_dir
+                / "massive"
+                / dataset
+                / f"date={value.isoformat()}"
+                / "part.parquet",
+                [{"ticker": "AAA", "close": 1.0, "volume": 1}],
+            )
+    spanning_rows = [
+        {"event_id": "E1", "ticker": "AAA", "entry_date": "2025-01-01"},
+        {"event_id": "E2", "ticker": "AAA", "entry_date": "2025-01-03"},
+    ]
+    write_parquet(
+        full_config.bronze_data_dir
+        / "massive"
+        / "quotes_v1_target_windows"
+        / "quote_window_quotes.parquet",
+        [
+            {"options_ticker": "O:AAA250117C00100000", "quote_date": "2025-01-01"},
+            {"options_ticker": "O:AAA250117P00100000", "quote_date": "2025-01-03"},
+        ],
+    )
+    write_parquet(
+        full_config.silver_data_dir / "earnings_calendar" / "main_sample.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.silver_data_dir / "event_windows" / "event_windows.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.silver_data_dir / "contracts" / "event_contract_candidates.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.silver_data_dir / "quote_execution" / "quote_window_marks.parquet",
+        [
+            {"event_id": "E1", "ticker": "AAA", "quote_date": "2025-01-01"},
+            {"event_id": "E2", "ticker": "AAA", "quote_date": "2025-01-03"},
+        ],
+    )
+    write_parquet(
+        full_config.silver_data_dir / "quote_execution" / "quote_execution_legs.parquet",
+        [
+            {"event_id": "E1", "ticker": "AAA", "quote_date": "2025-01-01"},
+            {"event_id": "E2", "ticker": "AAA", "quote_date": "2025-01-03"},
+        ],
+    )
+    write_parquet(
+        full_config.gold_data_dir / "modeling" / "feature_matrix.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_straddle_execution.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_ivar_event.parquet",
+        spanning_rows,
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_iv_surface.parquet",
+        [
+            {
+                "event_id": "E1",
+                "ticker": "AAA",
+                "entry_date": "2025-01-01",
+                "expiration": "2025-01-17",
+            },
+            {
+                "event_id": "E2",
+                "ticker": "AAA",
+                "entry_date": "2025-01-03",
+                "expiration": "2025-01-17",
+            },
+        ],
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_iv_surface_summary.parquet",
+        [
+            {
+                "event_id": "E1",
+                "ticker": "AAA",
+                "entry_date": "2025-01-01",
+                "expiration": "2025-01-17",
+            },
+            {
+                "event_id": "E2",
+                "ticker": "AAA",
+                "entry_date": "2025-01-03",
+                "expiration": "2025-01-17",
+            },
+        ],
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_surface_ivar_event.parquet",
+        [
+            {
+                "event_id": "E1",
+                "ticker": "AAA",
+                "entry_date": "2025-01-01",
+                "expiration_1": "2025-01-17",
+                "expiration_2": "2025-02-21",
+            },
+            {
+                "event_id": "E2",
+                "ticker": "AAA",
+                "entry_date": "2025-01-03",
+                "expiration_1": "2025-01-17",
+                "expiration_2": "2025-02-21",
+            },
+        ],
+    )
+    write_parquet(
+        full_config.gold_data_dir / "quote_execution" / "quote_execution_confidence.parquet",
+        spanning_rows,
+    )
+    full_step = data_pipeline._lake_quality_audit_step(
+        full_config,
+        out_root=tmp_path / "full_audit",
+        force=False,
+        target_start=target_start,
+        target_end=target_end,
+    )
+    assert full_step.status == "ran"
+    full_report = json.loads(
+        (tmp_path / "full_audit" / "lake_quality_audit" / "lake_quality_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert full_report["ok"] is True
+    assert full_report["incomplete_required_datasets"] == 0
+    skipped_step = data_pipeline._lake_quality_audit_step(
+        full_config,
+        out_root=tmp_path / "full_audit",
+        force=False,
+        target_start=target_start,
+        target_end=target_end,
+    )
+    assert skipped_step.status == "skipped"
+    assert skipped_step.reason == "outputs_exist_params_match"
+
+    normalized = data_pipeline._normalize_bulk_day_agg_frame(
+        pl.DataFrame({"ticker": ["A"], "close": [1], "volume": [2], "vwap": [1.1]}),
+        dataset="options_day_aggs",
+        date_value=date(2025, 1, 2),
+        source_key="key",
+    )
     assert normalized["vwap"].dtype == pl.Float64
     assert (
         data_pipeline._download_error_status(
@@ -3129,6 +3675,7 @@ def test_data_pipeline_source_readers_and_massive_probe_parallel(
     ).write_parquet(parquet_file)
     assert data_pipeline._read_universe_source(parquet_file)["ticker"].tolist() == ["C"]
 
+    (tmp_path / "empty_dir").mkdir()
     with pytest.raises(FileNotFoundError):
         data_pipeline._read_universe_source(tmp_path / "empty_dir")
 
@@ -4097,6 +4644,49 @@ def test_trade_proxy_panel_requires_contract_reference_validation(tmp_path: Path
         )
 
 
+def test_trade_proxy_reference_proxy_mask_allows_standard_missing_reference() -> None:
+    contracts = pd.DataFrame(
+        {
+            "contract_reference_validated": [True, False, False, False, False, False],
+            "contract_reference_status": [
+                "validated",
+                "missing_reference",
+                "missing_reference",
+                "missing_reference",
+                "fetch_failed",
+                "not_requested",
+            ],
+            "contract_discovery_status_pre_reference": [
+                "ok",
+                "ok",
+                "ok",
+                "non_standard_excluded",
+                "ok",
+                "ok",
+            ],
+            "contract_reference_has_adjusted_deliverable": [
+                False,
+                False,
+                True,
+                False,
+                False,
+                False,
+            ],
+            "option_multiplier": [100, 100, 100, 100, 100, pd.NA],
+            "contract_size": [100, 100, 100, 100, 100, 100],
+        }
+    )
+
+    assert trade_proxy_panel_script._contract_reference_proxy_mask(contracts).tolist() == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        True,
+    ]
+
+
 def test_trade_proxy_panel_keeps_ivar_support_contracts_outside_trade_pool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4313,6 +4903,9 @@ def test_data_pipeline_all_orchestrates_dynamic_top50_proxy_dag(
     def fake_contract_reference(*args: object, **kwargs: object) -> DataPipelineStep:
         return DataPipelineStep("contract-reference-validation", "ran")
 
+    def fake_quote_execution(*args: object, **kwargs: object) -> DataPipelineStep:
+        return DataPipelineStep("quote-execution-panel", "ran")
+
     def fake_run(
         command: Sequence[str],
         *,
@@ -4344,6 +4937,10 @@ def test_data_pipeline_all_orchestrates_dynamic_top50_proxy_dag(
         "earnings_event_vol.data_pipeline._contract_reference_validation_step",
         fake_contract_reference,
     )
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline._quote_execution_panel_step",
+        fake_quote_execution,
+    )
     monkeypatch.setattr("earnings_event_vol.data_pipeline._run_command_with_progress", fake_run)
 
     result = run_data_pipeline(
@@ -4367,8 +4964,18 @@ def test_data_pipeline_all_orchestrates_dynamic_top50_proxy_dag(
         "event-window-panel",
         "contract-reference-validation",
         "trade-proxy-panel",
+        "quote-execution-panel",
     ]
-    assert [step["status"] for step in steps] == ["ran", "ran", "ran", "ran", "ran", "ran", "ran"]
+    assert [step["status"] for step in steps] == [
+        "ran",
+        "ran",
+        "ran",
+        "ran",
+        "ran",
+        "ran",
+        "ran",
+        "ran",
+    ]
     assert len(captured_commands) == 1
     trade_command = captured_commands[0]
     assert "build_trade_proxy_panel.py" in trade_command[1]
@@ -4492,6 +5099,103 @@ def test_sec_companyfacts_stage_writes_silver_and_diagnostics(
     )
     assert manifest["mapped_acceptance_rows"] == 1
     assert manifest["fallback_filed_rows"] == 0
+
+
+def test_sec_companyfacts_missing_calendar_and_payload_edges(tmp_path: Path) -> None:
+    config = replace(
+        load_project_config(),
+        bronze_data_dir=tmp_path / "bronze",
+        silver_data_dir=tmp_path / "silver",
+    )
+    out_root = tmp_path / "artifacts" / "data_pipeline"
+
+    blocked = data_pipeline._sec_companyfacts_step(config, out_root=out_root, force=True)
+    assert blocked.status == "blocked"
+    assert blocked.reason == "requires dynamic-calendar earnings_calendar_candidates.csv"
+
+    calendar_path = out_root / "dynamic_calendar" / "earnings_calendar_candidates.csv"
+    calendar_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"ticker": "AAA"}]).to_csv(calendar_path, index=False)
+    silver_path = config.silver_data_dir / "sec" / "companyfacts.parquet"
+    diagnostics_path = out_root / "sec_companyfacts" / "sec_companyfacts_diagnostics.csv"
+    manifest_path = out_root / "sec_companyfacts" / "sec_companyfacts_manifest.json"
+    silver_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    silver_path.write_text("cached", encoding="utf-8")
+    diagnostics_path.write_text("ticker,status\nAAA,cached\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {
+                    "stage": "sec-companyfacts",
+                    "calendar": data_pipeline._path_signature(calendar_path),
+                    "endpoint": config.sec_companyfacts_url_template,
+                    "request_interval_seconds": 0.125,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    skipped = data_pipeline._sec_companyfacts_step(config, out_root=out_root, force=False)
+    assert skipped.status == "skipped"
+    assert skipped.reason == "outputs_exist_params_match"
+
+    acceptance = data_pipeline._submission_acceptance_lookup(
+        {
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["RECENT"],
+                    "acceptanceDateTime": ["2025-01-02T20:00:00.000Z"],
+                }
+            },
+            "archive_payloads": [
+                {
+                    "accessionNumber": ["ARCHIVE", None],
+                    "acceptanceDateTime": ["2025-01-03T22:00:00.000Z", ""],
+                },
+                "not-a-block",
+            ],
+        }
+    )
+    assert acceptance == {
+        "RECENT": "2025-01-02T20:00:00.000Z",
+        "ARCHIVE": "2025-01-03T22:00:00.000Z",
+    }
+    assert data_pipeline._normalize_companyfacts_payload(
+        ticker="AAA",
+        cik=1,
+        payload={"facts": {"us-gaap": []}},
+        acceptance_lookup={},
+    ).empty
+    normalized = data_pipeline._normalize_companyfacts_payload(
+        ticker="AAA",
+        cik=1,
+        payload={
+            "facts": {
+                "us-gaap": {
+                    "Assets": {
+                        "units": {
+                            "shares": [{"accn": "SHARES", "val": 10}],
+                            "USD": [
+                                "not-a-row",
+                                {
+                                    "accn": "ARCHIVE",
+                                    "val": 100,
+                                    "filed": "2025-01-04",
+                                    "end": "2024-12-31",
+                                },
+                            ],
+                        }
+                    },
+                    "Revenues": {"units": []},
+                    "NetIncomeLoss": {},
+                }
+            }
+        },
+        acceptance_lookup=acceptance,
+    )
+    assert normalized["feature_concept"].tolist() == ["assets"]
+    assert normalized["acceptance_datetime"].tolist() == ["2025-01-03T22:00:00.000Z"]
 
 
 def test_sec_companyfacts_stage_keeps_successful_rows_when_one_ticker_fails(
@@ -6283,12 +6987,26 @@ def _synthetic_tuning_frame() -> pd.DataFrame:
 def test_research_tuning_cli_and_model_ids() -> None:
     parser = build_parser()
     args = parser.parse_args(
-        ["research", "--tuning-profile", "tuned_phase1", "--tuning-seed", "123"]
+        [
+            "research",
+            "--tuning-profile",
+            "tuned_phase1",
+            "--tuning-seed",
+            "123",
+            "--reuse-tuning-params",
+        ]
     )
 
     assert args.tuning_profile == "tuned_phase1"
     assert args.tuning_seed == 123
+    assert args.reuse_tuning_params is True
     assert args.feature_schema_version == FEATURE_SCHEMA_V2_SEC_XBRL
+    expected_sequence_seeds = ",".join(str(seed) for seed in TUNING_SEQUENCE_ENSEMBLE_SEEDS)
+    assert args.mamba_seeds == expected_sequence_seeds
+    for function in (run_proxy_model_suite, run_research_models, run_proxy_research_package):
+        defaults = function.__kwdefaults__
+        assert defaults is not None
+        assert defaults["mamba_seeds"] == TUNING_SEQUENCE_ENSEMBLE_SEEDS
     with pytest.raises(SystemExit):
         parser.parse_args(["research", "--tuning-profile", "bad_profile"])
 
@@ -6355,6 +7073,65 @@ def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> 
     assert {"validation_auc", "validation_top_decile_precision", "validation_rmse"}.issubset(
         trials.columns
     )
+
+
+def test_reusable_tuning_state_requires_matching_schema_profile_and_seed(tmp_path: Path) -> None:
+    tuning_state = TuningState(profile="tuned_phase1", seed=17)
+    cache_params: dict[str, object] = {"alpha": 0.01, "l1_ratio": 0.1, "max_iter": 100}
+    _cache_payload: dict[str, object] = {
+        "model_id": "linear_elastic_net_tuned",
+        "selection_target_id": "jump_c2o",
+        "selection_protocol": "train_validation_only",
+        "refit_protocol": "train_plus_validation",
+        "primary_metric": "validation_jump_c2o_predicted_edge_auc",
+        "params": cache_params,
+        "validation_metrics": {"validation_auc": 0.5},
+    }
+    tuning_state.selected["linear_elastic_net_tuned"] = _cache_payload
+    tuning_state.trials.append(
+        {
+            "model_id": "linear_elastic_net_tuned",
+            "target_id": "jump_c2o",
+            "trial_number": 0,
+            "selected": True,
+            "seed": 17,
+            "params_json": json.dumps(cache_params, sort_keys=True),
+            "validation_n": 10,
+            "validation_mae": 0.1,
+            "validation_rmse": 0.2,
+            "validation_auc": 0.5,
+            "validation_top_decile_precision": 0.3,
+            "objective_value": 0.5,
+        }
+    )
+    _write_tuning_artifacts(
+        tmp_path,
+        tuning_state=tuning_state,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    loaded, reused, source = _load_reusable_tuning_state(
+        tmp_path,
+        tuning_profile="tuned_phase1",
+        tuning_seed=17,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    assert reused is True
+    assert source == str(tmp_path / "tuning_selected_params.json")
+    assert loaded.selected["linear_elastic_net_tuned"]["params"] == _cache_payload["params"]
+    assert loaded.trials[0]["model_id"] == "linear_elastic_net_tuned"
+
+    fallback, reused, reason = _load_reusable_tuning_state(
+        tmp_path,
+        tuning_profile="tuned_phase1",
+        tuning_seed=123,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    assert reused is False
+    assert reason == "tuning_seed_mismatch"
+    assert fallback.selected == {}
 
 
 def test_trained_model_with_no_usable_predictions_is_invalid(
@@ -7045,6 +7822,341 @@ def test_research_metrics_cover_empty_and_breakdown_paths() -> None:
     assert "announcement_timing" in bundle.breakdowns
 
 
+def test_quote_diagnostic_tables_write_confidence_artifacts(tmp_path: Path) -> None:
+    predictions = pd.DataFrame(
+        {
+            "event_id": ["E1", "E1", "E2", "E3"],
+            "target_id": ["jump_c2o", "day_c2c", "jump_c2o", "jump_c2o"],
+            "split": ["test", "test", "test", "train"],
+            "ticker": ["AAA", "AAA", "BBB", "CCC"],
+            "execution_confidence_band": ["high", "high", "medium", "missing"],
+            "execution_confidence_score": [0.95, 0.95, 0.72, np.nan],
+            "max_quote_age_seconds": [12.0, 12.0, 45.0, np.nan],
+            "median_spread_over_mid": [0.04, 0.04, 0.18, np.nan],
+            "quote_mid_ivar_event": [0.012, 0.012, 0.015, np.nan],
+            "quote_ask_ivar_event": [0.013, 0.013, np.nan, np.nan],
+            "paper_grade_quote_ivar_mid": [True, True, True, False],
+            "paper_grade_quote_ivar_ask": [True, True, False, False],
+        }
+    )
+    strategy_breakdowns = pd.DataFrame(
+        {
+            "target_id": ["day_c2c"],
+            "model_id": ["goyal_saretto_rv_iv_spread"],
+            "strategy_proxy_kind": ["day_c2c_exit_preclose_15m_proxy"],
+            "breakdown": ["execution_confidence_band"],
+            "execution_confidence_band": ["high"],
+            "strategy_n": [1],
+            "strategy_net_pnl_usd": [100.0],
+        }
+    )
+    ivar_defeat_breakdowns = pd.DataFrame(
+        {
+            "target_id": ["jump_c2o"],
+            "model_id": ["goyal_saretto_rv_iv_spread"],
+            "breakdown": ["execution_confidence_band"],
+            "breakdown_value": ["high"],
+            "n": [1],
+            "model_beats_ivar_abs_rate": [1.0],
+        }
+    )
+    casebook_events = pd.DataFrame(
+        {
+            "execution_confidence_band": ["high", "medium"],
+            "case_type": ["false_positive", "market_right_model_wrong"],
+            "target_id": ["jump_c2o", "jump_c2o"],
+            "model_id": ["xgboost_tuned", "xgboost_tuned"],
+            "severity_score": [0.02, 0.01],
+            "model_abs_error": [0.03, 0.02],
+            "ivar_abs_error": [0.01, 0.01],
+        }
+    )
+
+    paths = build_quote_diagnostic_tables(
+        predictions,
+        strategy_breakdowns=strategy_breakdowns,
+        ivar_defeat_breakdowns=ivar_defeat_breakdowns,
+        casebook_events=casebook_events,
+        out_dir=tmp_path,
+    )
+
+    assert set(paths) == {
+        "quote_confidence_prediction_coverage",
+        "quote_ivar_summary",
+        "quote_confidence_strategy_summary",
+        "quote_confidence_ivar_defeat_summary",
+        "quote_confidence_casebook_summary",
+    }
+    coverage = pd.read_csv(paths["quote_confidence_prediction_coverage"])
+    high_jump = coverage.loc[
+        coverage["execution_confidence_band"].eq("high") & coverage["target_id"].eq("jump_c2o")
+    ].iloc[0]
+    assert high_jump["n_target_rows"] == 1
+    assert high_jump["n_events"] == 1
+    quote_ivar = pd.read_csv(paths["quote_ivar_summary"])
+    high = quote_ivar.loc[quote_ivar["execution_confidence_band"].eq("high")].iloc[0]
+    assert high["n_events"] == 1
+    assert high["mid_ivar_available_events"] == 1
+    assert high["ask_ivar_available_events"] == 1
+    casebook = pd.read_csv(paths["quote_confidence_casebook_summary"])
+    assert set(casebook["case_type"]) == {"false_positive", "market_right_model_wrong"}
+
+
+def test_completion_gap_audit_separates_quote_progress_from_paper_grade_gaps(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        load_project_config(),
+        repo_root=tmp_path,
+        data_dir=tmp_path / "data",
+        bronze_data_dir=tmp_path / "data" / "bronze",
+        silver_data_dir=tmp_path / "data" / "silver",
+        gold_data_dir=tmp_path / "data" / "gold",
+        artifacts_dir=tmp_path / "artifacts",
+        reports_dir=tmp_path / "reports",
+    )
+    paths = research_paths(config)
+    quote_dir = config.artifacts_dir / "data_pipeline" / "quote_execution_panel"
+    lake_dir = config.artifacts_dir / "data_pipeline" / "lake_quality_audit"
+    quote_dir.mkdir(parents=True)
+    lake_dir.mkdir(parents=True)
+    paths.modeling_artifacts_dir.mkdir(parents=True)
+
+    (quote_dir / "quote_execution_panel_manifest.json").write_text(
+        json.dumps(
+            {
+                "report": {
+                    "ok": True,
+                    "metadata_only": False,
+                    "raw_full_day_files_written": False,
+                    "quote_rows_matched": 42,
+                    "route": "massive_quotes_v3_rest_targeted",
+                },
+                "lake_output_rows": {
+                    "bronze_quote_window_quotes": 42,
+                    "silver_quote_window_marks": 8,
+                    "silver_quote_execution_legs": 8,
+                    "gold_quote_straddle_execution": 4,
+                    "gold_quote_ivar_event": 2,
+                    "gold_quote_iv_surface": 4,
+                    "gold_quote_iv_surface_summary": 2,
+                    "gold_quote_surface_ivar_event": 1,
+                    "gold_quote_execution_confidence": 2,
+                },
+                "lake_policy": {
+                    "quote_source": "rest",
+                    "raw_full_day_quote_files_in_repo": False,
+                },
+                "raw_full_day_files_written": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame({"quote_mid_iv": [0.35]}).to_csv(quote_dir / "quote_iv_surface.csv", index=False)
+    pd.DataFrame({"quote_mid_total_variance": [0.01]}).to_csv(
+        quote_dir / "quote_iv_surface_summary.csv", index=False
+    )
+    pd.DataFrame({"quote_surface_mid_ivar_event": [0.008]}).to_csv(
+        quote_dir / "quote_surface_ivar_event.csv", index=False
+    )
+    (lake_dir / "lake_quality_report.json").write_text(
+        json.dumps(
+            {
+                "status": "ran",
+                "ok": False,
+                "target_window": {"start": "2013-01-01", "end": "2025-12-31"},
+                "incomplete_required_datasets": 2,
+                "incomplete_required_dataset_ids": [
+                    "bronze_options_day_aggs",
+                    "gold_quote_ivar_event",
+                ],
+                "paper_grade_execution_ready": False,
+                "paper_grade_execution_blocker": "requires full-window quote/NBBO",
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in [
+        "quote_confidence_prediction_coverage.csv",
+        "quote_ivar_summary.csv",
+        "quote_confidence_strategy_summary.csv",
+        "quote_confidence_ivar_defeat_summary.csv",
+        "quote_confidence_casebook_summary.csv",
+        "robustness_summary.csv",
+    ]:
+        pd.DataFrame({"x": [1]}).to_csv(paths.modeling_artifacts_dir / name, index=False)
+    sequence_rows = [
+        {
+            "model_id": model_id,
+            "target_id": target_id,
+            "coverage": 10,
+            "headline_eligible": False,
+        }
+        for model_id in [
+            "ridge_flat_aggregates_sequence",
+            "bigru_sequence_5seed",
+            "mamba_ssm_sequence_5seed",
+            "attention_pooling_sequence",
+            "dilated_cnn_sequence",
+            "mask_only_sequence",
+            "time_shuffle_sequence",
+        ]
+        for target_id in TARGET_IDS
+    ]
+    pd.DataFrame(sequence_rows).to_csv(
+        paths.modeling_artifacts_dir / "sequence_model_fit_diagnostics.csv",
+        index=False,
+    )
+
+    outputs = build_completion_gap_audit(paths)
+
+    audit = pd.read_csv(outputs["completion_gap_audit"])
+    statuses = dict(zip(audit["requirement_id"], audit["status"], strict=True))
+    assert statuses["bounded_quote_extraction_matched_rows"] == "complete"
+    assert statuses["quote_marks_legs_straddles_confidence_populated"] == "complete"
+    assert statuses["quote_confidence_stratified_results"] == "complete"
+    assert statuses["bounded_quote_iv_surface_diagnostics_populated"] == "complete"
+    assert statuses["sequence_diagnostics_full_suite_populated"] == "complete"
+    assert statuses["full_historical_lake_quality_audit"] == "complete"
+    assert statuses["quote_ivar_populated_but_not_surface"] == "diagnostic_only"
+    assert statuses["sequence_headline_gate"] == "diagnostic_only"
+    assert statuses["historical_2013_2025_data_coverage"] == "incomplete"
+    assert statuses["paper_grade_bid_ask_nbbo_execution"] == "incomplete"
+    summary = json.loads(Path(outputs["completion_gap_audit_summary"]).read_text())
+    assert summary["paper_grade_ready"] is False
+    assert "paper_grade_bid_ask_nbbo_execution" in summary["blocking_requirement_ids"]
+
+
+def test_robustness_summary_table_covers_dte_liquidity_and_vix_regime(tmp_path: Path) -> None:
+    strategy_breakdowns = pd.DataFrame(
+        {
+            "target_id": ["day_c2c"] * 6,
+            "model_id": ["goyal_saretto_rv_iv_spread"] * 6,
+            "strategy_proxy_kind": ["day_c2c_exit_preclose_15m_proxy"] * 6,
+            "pnl_headline_eligible": [True] * 6,
+            "breakdown": [
+                "dte_bucket",
+                "dte_bucket",
+                "liquidity_bucket",
+                "liquidity_bucket",
+                "vix_regime_tercile",
+                "vix_regime_tercile",
+            ],
+            "dte_bucket": ["main_5_14", "lt_5", np.nan, np.nan, np.nan, np.nan],
+            "liquidity_bucket": [np.nan, np.nan, "high", "low", np.nan, np.nan],
+            "vix_regime_tercile": [np.nan, np.nan, np.nan, np.nan, "low", "high"],
+            "strategy_n": [8, 4, 12, 3, 9, 7],
+            "strategy_net_pnl_usd": [100.0, -50.0, 250.0, -20.0, 10.0, -5.0],
+        }
+    )
+    ivar_defeat_breakdowns = pd.DataFrame(
+        {
+            "target_id": ["jump_c2o"] * 6,
+            "model_id": ["lightgbm_tuned"] * 6,
+            "breakdown": [
+                "dte_bucket",
+                "dte_bucket",
+                "liquidity_bucket",
+                "liquidity_bucket",
+                "vix_regime_tercile",
+                "vix_regime_tercile",
+            ],
+            "breakdown_value": ["main_5_14", "lt_5", "high", "low", "low", "high"],
+            "n": [20, 6, 18, 5, 10, 9],
+            "mae_lift_vs_ivar": [0.02, -0.01, 0.03, -0.02, 0.01, 0.00],
+        }
+    )
+
+    paths = build_robustness_summary_table(
+        strategy_breakdowns,
+        ivar_defeat_breakdowns,
+        out_dir=tmp_path,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    summary = pd.read_csv(paths["robustness_summary"])
+    assert {"dte_bucket", "liquidity_bucket", "vix_regime_tercile"}.issubset(
+        set(summary["breakdown"])
+    )
+    assert set(summary["source"]) == {"strategy", "ivar_defeat"}
+    vix_strategy = summary.loc[
+        summary["source"].eq("strategy") & summary["breakdown"].eq("vix_regime_tercile")
+    ].iloc[0]
+    assert vix_strategy["subgroup_count"] == 2
+    assert vix_strategy["primary_metric"] == "strategy_net_pnl_usd"
+    assert vix_strategy["claim_gate_status"] == "available_multi_bucket"
+    dte_strategy = summary.loc[
+        summary["source"].eq("strategy") & summary["breakdown"].eq("dte_bucket")
+    ].iloc[0]
+    assert dte_strategy["claim_gate_status"] == "exploratory_small_cells"
+    dte_ivar = summary.loc[
+        summary["source"].eq("ivar_defeat") & summary["breakdown"].eq("dte_bucket")
+    ].iloc[0]
+    assert dte_ivar["primary_metric"] == "mae_lift_vs_ivar"
+    assert dte_ivar["positive_metric_rows"] == 1
+
+
+def test_report_uses_sequence_gate_when_mamba_is_unavailable(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    reports = tmp_path / "reports"
+    artifacts.mkdir()
+    (artifacts / "sequence_coverage_report.json").write_text(
+        json.dumps(
+            {
+                "eligible_events": 20,
+                "total_events": 25,
+                "drop_rate": 0.2,
+                "high_sequence_selection_risk": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        {
+            "model_id": ["mamba_ssm_sequence_5seed"],
+            "target_id": ["jump_c2o"],
+            "status": ["skipped_dependency_unavailable"],
+            "feature_count": [243],
+        }
+    ).to_csv(artifacts / "model_fit_diagnostics.csv", index=False)
+    pd.DataFrame(
+        {
+            "feature_schema_version": [FEATURE_SCHEMA_V2_SEC_XBRL] * 4,
+            "tuning_profile": ["tuned_phase1"] * 4,
+            "target_id": ["jump_c2o"] * 4,
+            "model_id": [
+                "ridge_flat_aggregates_sequence",
+                "bigru_sequence_5seed",
+                "mamba_ssm_sequence_5seed",
+                "mask_only_sequence",
+            ],
+            "coverage": [12, 10, 0, 10],
+            "drop_rate": [0.1, 0.2, 1.0, 0.2],
+            "auc_lift": [0.03, -0.01, np.nan, 0.0],
+            "auc_lift_ci_low": [-0.02, -0.04, np.nan, 0.0],
+            "auc_lift_ci_high": [0.08, 0.02, np.nan, 0.0],
+            "mask_only_lift": [0.03, -0.01, np.nan, 0.0],
+            "time_shuffle_lift": [0.02, -0.02, np.nan, 0.0],
+            "headline_eligible": [False, False, False, False],
+            "claim_scope": ["diagnostic"] * 4,
+            "fail_reason": ["gate_not_passed_or_control_missing"] * 4,
+        }
+    ).to_csv(artifacts / "sequence_model_fit_diagnostics.csv", index=False)
+
+    report = write_proxy_research_report(
+        artifacts_dir=artifacts,
+        reports_dir=reports,
+        figure_paths={},
+    )
+
+    text = report.read_text(encoding="utf-8")
+    assert "Sequence diagnostics were unavailable" not in text
+    assert "Current sequence diagnostics are populated" in text
+    assert "skipped_dependency_unavailable" in text
+    assert "official Mamba runtime is available" not in text
+    assert "sequence rows pass common-row/control/bootstrap/economics gates" in text
+
+
 def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) -> None:
     events = pd.DataFrame(
         {
@@ -7308,6 +8420,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         "ranking_metrics",
         "strategy_metrics",
         "cost_sensitivity",
+        "robustness_summary",
         "qlike_sanity",
         "inference",
     ):
@@ -8495,6 +9608,7 @@ def test_cli_private_command_branches(tmp_path: Path, monkeypatch: pytest.Monkey
         tuning_profile="tuned_phase1",
         tuning_seed=17,
         feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+        reuse_tuning_params=False,
     )
     assert cli_module._research(research_args, load_project_config()) == 1
 

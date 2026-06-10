@@ -53,10 +53,15 @@ audit date="": _format
     @probe_date="{{ date }}"; probe_date="${probe_date#date=}"; if [[ -n "$probe_date" ]]; then {{ cli }} massive-flat-files --date "$probe_date" --out artifacts/massive_flat_file_probe; else {{ cli }} audit-data --quotes tests/fixtures/option_quotes.csv --underlying tests/fixtures/underlying_bars.csv --earnings tests/fixtures/earnings_calendar.csv --out artifacts/audit_data_fixtures; fi
 
 data stage="all" args="": _require-external-uv-env _require-external-data
-    @stage='{{ stage }}'; extra='{{ args }}'; if [[ "$stage" == args=* ]]; then extra="${stage#args=}"; stage="all"; elif [[ "$stage" == --* ]]; then extra="$stage ${extra#args=}"; stage="all"; else extra="${extra#args=}"; fi; defaults=(); if [[ "$stage" == "all" ]]; then defaults=(--start 2022-12-01 --end 2025-12-31 --jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap --dte-min 3 --dte-max 21 --universe-top-n 50 --universe-trailing-months 6); elif [[ "$stage" == "event-window-panel" ]]; then defaults=(--dte-min 3 --dte-max 21); elif [[ "$stage" == "trade-proxy-panel" || "$stage" == "market-second-covariates" ]]; then defaults=(--jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap); elif [[ "$stage" == "contract-reference-validation" ]]; then defaults=(--jobs 4); fi; read -r -a extra_args <<< "$extra"; {{ cli }} data --stage "$stage" "${defaults[@]}" "${extra_args[@]}"
+    @stage='{{ stage }}'; extra='{{ args }}'; if [[ "$stage" == args=* ]]; then extra="${stage#args=}"; stage="all"; elif [[ "$stage" == --* ]]; then extra="$stage ${extra#args=}"; stage="all"; else extra="${extra#args=}"; fi; defaults=(); if [[ "$stage" == "all" ]]; then defaults=(--start 2013-01-01 --end 2025-12-31 --jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap --dte-min 3 --dte-max 21 --universe-top-n 50 --universe-trailing-months 6); elif [[ "$stage" == "event-window-panel" ]]; then defaults=(--dte-min 3 --dte-max 21); elif [[ "$stage" == "trade-proxy-panel" || "$stage" == "market-second-covariates" ]]; then defaults=(--jobs 4 --lookback-seconds 900 --second-agg-buffer-minutes 60 --price-field option_vwap); elif [[ "$stage" == "contract-reference-validation" ]]; then defaults=(--jobs 4); fi; read -r -a extra_args <<< "$extra"; {{ cli }} data --stage "$stage" "${defaults[@]}" "${extra_args[@]}"
 
 research args="": _require-external-data _sync
     @extra='{{ args }}'; extra="${extra#args=}"; if [[ -z "$extra" ]]; then extra="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 200"; fi; read -r -a extra_args <<< "$extra"; {{ cli }} research "${extra_args[@]}"
+    just _sync-doc-figures
+
+research-fast: _require-external-data _sync
+    {{ cli }} research --stage models --sequence-suite none --allow-high-sequence-risk --bootstrap-iter 50 --reuse-tuning-params
+    {{ cli }} research --stage report --sequence-suite none --allow-high-sequence-risk --bootstrap-iter 50 --reuse-tuning-params
     just _sync-doc-figures
 
 research-report: _require-external-data _sync

@@ -28,6 +28,9 @@ REFERENCE_STATUS_FETCH_FAILED = "fetch_failed"
 REFERENCE_STATUS_MISSING_REFERENCE = "missing_reference"
 REFERENCE_STATUS_PARSE_FAILED = "parse_failed"
 REFERENCE_STATUS_NOT_REQUESTED = "not_requested"
+REFERENCE_PROXY_SOURCE_EXCLUDED = "excluded"
+REFERENCE_PROXY_SOURCE_VALIDATED = "validated_reference"
+REFERENCE_PROXY_SOURCE_MISSING_STANDARD_FALLBACK = "missing_reference_standard_contract_fallback"
 
 
 @dataclass(frozen=True)
@@ -283,6 +286,43 @@ def extract_contract_reference_fields(
     }
 
 
+def _bool_column(frame: pd.DataFrame, column: str, default: bool = False) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(default, index=frame.index)
+    return frame[column].fillna(default).astype(bool)
+
+
+def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def _contract_reference_proxy_mask(frame: pd.DataFrame) -> pd.Series:
+    validated = _bool_column(frame, "contract_reference_validated")
+    status = (
+        frame["contract_reference_status"].astype(str)
+        if "contract_reference_status" in frame.columns
+        else pd.Series("", index=frame.index)
+    )
+    discovery_status = (
+        frame["contract_discovery_status_pre_reference"].astype(str)
+        if "contract_discovery_status_pre_reference" in frame.columns
+        else frame.get("contract_discovery_status", pd.Series("", index=frame.index))
+        .fillna("")
+        .astype(str)
+    )
+    adjusted = _bool_column(frame, "contract_reference_has_adjusted_deliverable")
+    standard_size = _numeric_column(frame, "option_multiplier").eq(100) | _numeric_column(
+        frame, "contract_size"
+    ).eq(100)
+    reference_missing = status.isin(
+        {REFERENCE_STATUS_MISSING_REFERENCE, REFERENCE_STATUS_NOT_REQUESTED}
+    )
+    fallback = reference_missing & discovery_status.eq("ok") & standard_size & ~adjusted
+    return validated | fallback
+
+
 def apply_contract_reference_validation(
     candidates: pd.DataFrame,
     reference_report: pd.DataFrame,
@@ -298,6 +338,8 @@ def apply_contract_reference_validation(
     if reference_report.empty:
         out["contract_reference_status"] = REFERENCE_STATUS_NOT_REQUESTED
         out["contract_reference_validated"] = False
+        out["contract_reference_proxy_usable"] = False
+        out["contract_reference_proxy_source"] = REFERENCE_PROXY_SOURCE_EXCLUDED
         out["contract_reference_source_dataset"] = CONTRACT_REFERENCE_SOURCE_DATASET
         if "eligible_for_quote_pool" in out.columns:
             out.loc[:, "eligible_for_quote_pool"] = False
@@ -338,6 +380,17 @@ def apply_contract_reference_validation(
     out["contract_reference_validated"] = out["contract_reference_status"].eq(
         REFERENCE_STATUS_VALIDATED
     )
+    proxy_usable = _contract_reference_proxy_mask(out)
+    out["contract_reference_proxy_usable"] = proxy_usable
+    out["contract_reference_proxy_source"] = REFERENCE_PROXY_SOURCE_EXCLUDED
+    out.loc[
+        out["contract_reference_validated"].astype(bool),
+        "contract_reference_proxy_source",
+    ] = REFERENCE_PROXY_SOURCE_VALIDATED
+    out.loc[
+        proxy_usable & ~out["contract_reference_validated"].astype(bool),
+        "contract_reference_proxy_source",
+    ] = REFERENCE_PROXY_SOURCE_MISSING_STANDARD_FALLBACK
     out["contract_reference_source_dataset"] = CONTRACT_REFERENCE_SOURCE_DATASET
 
     raw_shares = (
@@ -350,13 +403,14 @@ def apply_contract_reference_validation(
     out["option_multiplier"] = pd.to_numeric(out.get("option_multiplier"), errors="coerce")
     out["contract_size"] = pd.to_numeric(out.get("contract_size"), errors="coerce")
     has_reference_shares = validated & shares.notna()
-    out.loc[has_reference_shares, "option_multiplier"] = shares.loc[has_reference_shares]
-    out.loc[has_reference_shares, "contract_size"] = shares.loc[has_reference_shares]
+    if has_reference_shares.any():
+        out.loc[has_reference_shares, "option_multiplier"] = shares.loc[has_reference_shares]
+        out.loc[has_reference_shares, "contract_size"] = shares.loc[has_reference_shares]
 
     adjusted = out.get("contract_reference_has_adjusted_deliverable", False)
     adjusted = pd.Series(adjusted, index=out.index).fillna(False).astype(bool)
     non_standard = validated & (shares.ne(100) | adjusted)
-    unvalidated = ~validated
+    not_proxy_usable = ~proxy_usable
     if "deliverable_status" not in out.columns:
         out["deliverable_status"] = "standard"
     out.loc[validated & ~non_standard, "deliverable_status"] = "standard"
@@ -369,13 +423,13 @@ def apply_contract_reference_validation(
 
     out.loc[non_standard, "contract_discovery_status"] = CONTRACT_STATUS_NON_STANDARD_EXCLUDED
     if "eligible_for_quote_pool" in out.columns:
-        out.loc[non_standard | unvalidated, "eligible_for_quote_pool"] = False
+        out.loc[non_standard | not_proxy_usable, "eligible_for_quote_pool"] = False
     if "is_main_dte_5_14" in out.columns:
-        out.loc[non_standard | unvalidated, "is_main_dte_5_14"] = False
+        out.loc[non_standard | not_proxy_usable, "is_main_dte_5_14"] = False
     if "is_robustness_dte_3_21" in out.columns:
-        out.loc[non_standard | unvalidated, "is_robustness_dte_3_21"] = False
+        out.loc[non_standard | not_proxy_usable, "is_robustness_dte_3_21"] = False
     out.loc[
-        unvalidated & out["contract_discovery_status"].astype(str).eq("ok"),
+        not_proxy_usable & out["contract_discovery_status"].astype(str).eq("ok"),
         "contract_discovery_status",
     ] = CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED
     return out

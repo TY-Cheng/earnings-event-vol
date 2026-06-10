@@ -203,6 +203,17 @@ TUNING_LIGHTGBM_TRIALS = 50
 TUNING_XGBOOST_TRIALS = 50
 TUNING_FT_TRANSFORMER_TRIALS = 30
 TUNING_SEQUENCE_ENSEMBLE_SEEDS = (17, 42, 123, 456, 789)
+ROBUSTNESS_BREAKDOWN_COLUMNS = (
+    "dte_bucket",
+    "is_main_dte_5_14",
+    "liquidity_bucket",
+    "vix_regime_tercile",
+    "regime",
+    "announcement_timing",
+    "event_year",
+    "ticker",
+    "execution_confidence_band",
+)
 
 
 @dataclass
@@ -3343,9 +3354,11 @@ def run_proxy_model_suite(
     event_features: Sequence[str] | None = None,
     tree_features: Sequence[str] | None = None,
     mamba_backend: str = "mamba_ssm",
-    mamba_seeds: Sequence[int] = (17,),
+    mamba_seeds: Sequence[int] = TUNING_SEQUENCE_ENSEMBLE_SEEDS,
     tuning_state: TuningState | None = None,
     target_id: str = TUNING_SELECTION_TARGET_ID,
+    log_progress: bool = False,
+    progress_prefix: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if mamba_backend != "mamba_ssm":
         raise ValueError(f"unsupported mamba_backend: {mamba_backend}")
@@ -3363,6 +3376,9 @@ def run_proxy_model_suite(
     )
     active_tuning_state = tuning_state or TuningState()
     for model_id in model_ids:
+        if log_progress:
+            prefix = f"{progress_prefix} " if progress_prefix else ""
+            print(f"[research] {prefix}model start: {model_id}", flush=True)
         if model_id in DETERMINISTIC_MODEL_IDS:
             diagnostics.append(
                 {
@@ -3374,11 +3390,20 @@ def run_proxy_model_suite(
                     "test_rows": int(predictions["split"].eq("test").sum()),
                 }
             )
+            if log_progress:
+                prefix = f"{progress_prefix} " if progress_prefix else ""
+                print(f"[research] {prefix}model end: {model_id} status=evaluated", flush=True)
             continue
         if model_id == "patell_wolfson_diagnostic":
             diagnostics.append(
                 {"model_id": model_id, "status": "diagnostic_features_only", "feature_count": 4}
             )
+            if log_progress:
+                prefix = f"{progress_prefix} " if progress_prefix else ""
+                print(
+                    f"[research] {prefix}model end: {model_id} status=diagnostic_features_only",
+                    flush=True,
+                )
             continue
         pred, diag, _ = _train_model_dispatch(
             model_id,
@@ -3413,6 +3438,12 @@ def run_proxy_model_suite(
                 **diag,
             }
         )
+        if log_progress:
+            prefix = f"{progress_prefix} " if progress_prefix else ""
+            print(
+                f"[research] {prefix}model end: {model_id} status={diag.get('status')}",
+                flush=True,
+            )
     return predictions, pd.DataFrame(diagnostics)
 
 
@@ -4067,6 +4098,8 @@ def _ivar_defeat_event_frame(
         "event_year",
         "dte_1",
         "dte_bucket",
+        "is_main_dte_5_14",
+        "vix_regime_tercile",
         "regime",
         "liquidity_bucket",
         "execution_confidence_score",
@@ -4192,14 +4225,7 @@ def _ivar_defeat_breakdowns(events: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     if events.empty:
         return pd.DataFrame()
-    for breakdown in (
-        "announcement_timing",
-        "event_year",
-        "dte_bucket",
-        "liquidity_bucket",
-        "regime",
-        "execution_confidence_band",
-    ):
+    for breakdown in ROBUSTNESS_BREAKDOWN_COLUMNS:
         if breakdown not in events.columns:
             continue
         for keys, group in events.groupby(["target_id", "model_id", breakdown], dropna=False):
@@ -4359,6 +4385,778 @@ def build_casebook_tables(
     events.to_csv(paths["casebook_events"], index=False)
     summary.to_csv(paths["casebook_summary"], index=False)
     return {key: str(value) for key, value in paths.items()}
+
+
+def build_quote_diagnostic_tables(
+    predictions: pd.DataFrame,
+    *,
+    strategy_breakdowns: pd.DataFrame,
+    ivar_defeat_breakdowns: pd.DataFrame,
+    casebook_events: pd.DataFrame,
+    out_dir: Path,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    tuning_profile: TuningProfile = "tuned_phase1",
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    band_col = "execution_confidence_band"
+    paths = {
+        "quote_confidence_prediction_coverage": out_dir
+        / "quote_confidence_prediction_coverage.csv",
+        "quote_ivar_summary": out_dir / "quote_ivar_summary.csv",
+        "quote_confidence_strategy_summary": out_dir / "quote_confidence_strategy_summary.csv",
+        "quote_confidence_ivar_defeat_summary": out_dir
+        / "quote_confidence_ivar_defeat_summary.csv",
+        "quote_confidence_casebook_summary": out_dir / "quote_confidence_casebook_summary.csv",
+    }
+
+    if band_col in predictions.columns:
+        coverage_frame = predictions.copy()
+        coverage_frame[band_col] = coverage_frame[band_col].fillna("missing").astype(str)
+        coverage_groups = (
+            ["split", "target_id", band_col]
+            if {"split", "target_id"}.issubset(coverage_frame.columns)
+            else [band_col]
+        )
+        coverage = (
+            coverage_frame.groupby(coverage_groups, dropna=False)
+            .agg(
+                n_target_rows=(band_col, "size"),
+                n_events=("event_id", "nunique")
+                if "event_id" in coverage_frame.columns
+                else (band_col, "size"),
+            )
+            .reset_index()
+        )
+    else:
+        coverage = pd.DataFrame(columns=["split", "target_id", band_col, "n_target_rows"])
+    coverage.insert(0, "feature_schema_version", feature_schema_version)
+    coverage.insert(1, "tuning_profile", tuning_profile)
+    coverage.to_csv(paths["quote_confidence_prediction_coverage"], index=False)
+
+    quote_ivar_columns = [
+        "event_id",
+        "ticker",
+        "announcement_date",
+        band_col,
+        "execution_confidence_score",
+        "max_quote_age_seconds",
+        "median_spread_over_mid",
+        "quote_mid_ivar_event",
+        "quote_ask_ivar_event",
+        "paper_grade_quote_ivar_mid",
+        "paper_grade_quote_ivar_ask",
+        "quote_mid_ivar_failure_reason",
+        "quote_ask_ivar_failure_reason",
+    ]
+    if {"event_id", band_col}.issubset(predictions.columns):
+        event_quote = predictions[
+            [column for column in quote_ivar_columns if column in predictions.columns]
+        ].drop_duplicates("event_id")
+        event_quote[band_col] = event_quote[band_col].fillna("missing").astype(str)
+        quote_rows: list[dict[str, object]] = []
+        for band, group in event_quote.groupby(band_col, dropna=False):
+            quote_rows.append(
+                {
+                    "feature_schema_version": feature_schema_version,
+                    "tuning_profile": tuning_profile,
+                    band_col: band,
+                    "n_events": int(group["event_id"].nunique()),
+                    "mid_ivar_available_events": int(
+                        pd.to_numeric(group.get("quote_mid_ivar_event"), errors="coerce")
+                        .notna()
+                        .sum()
+                    )
+                    if "quote_mid_ivar_event" in group
+                    else 0,
+                    "ask_ivar_available_events": int(
+                        pd.to_numeric(group.get("quote_ask_ivar_event"), errors="coerce")
+                        .notna()
+                        .sum()
+                    )
+                    if "quote_ask_ivar_event" in group
+                    else 0,
+                    "median_quote_mid_ivar_event": float(
+                        pd.to_numeric(group["quote_mid_ivar_event"], errors="coerce").median()
+                    )
+                    if "quote_mid_ivar_event" in group
+                    else np.nan,
+                    "median_quote_ask_ivar_event": float(
+                        pd.to_numeric(group["quote_ask_ivar_event"], errors="coerce").median()
+                    )
+                    if "quote_ask_ivar_event" in group
+                    else np.nan,
+                    "paper_grade_quote_ivar_mid_events": int(
+                        group.get("paper_grade_quote_ivar_mid", pd.Series(False, index=group.index))
+                        .fillna(False)
+                        .astype(bool)
+                        .sum()
+                    ),
+                    "paper_grade_quote_ivar_ask_events": int(
+                        group.get("paper_grade_quote_ivar_ask", pd.Series(False, index=group.index))
+                        .fillna(False)
+                        .astype(bool)
+                        .sum()
+                    ),
+                    "median_execution_confidence_score": float(
+                        pd.to_numeric(
+                            group.get(
+                                "execution_confidence_score",
+                                pd.Series(np.nan, index=group.index),
+                            ),
+                            errors="coerce",
+                        ).median()
+                    ),
+                    "median_spread_over_mid": float(
+                        pd.to_numeric(
+                            group.get(
+                                "median_spread_over_mid",
+                                pd.Series(np.nan, index=group.index),
+                            ),
+                            errors="coerce",
+                        ).median()
+                    ),
+                }
+            )
+        quote_ivar = pd.DataFrame(quote_rows)
+    else:
+        quote_ivar = pd.DataFrame(columns=["feature_schema_version", "tuning_profile", band_col])
+    quote_ivar.to_csv(paths["quote_ivar_summary"], index=False)
+
+    strategy_confidence = (
+        strategy_breakdowns.loc[
+            strategy_breakdowns.get("breakdown", pd.Series(dtype=object)).astype(str).eq(band_col)
+        ].copy()
+        if not strategy_breakdowns.empty and "breakdown" in strategy_breakdowns.columns
+        else pd.DataFrame()
+    )
+    strategy_confidence.to_csv(paths["quote_confidence_strategy_summary"], index=False)
+
+    ivar_confidence = (
+        ivar_defeat_breakdowns.loc[
+            ivar_defeat_breakdowns.get("breakdown", pd.Series(dtype=object))
+            .astype(str)
+            .eq(band_col)
+        ].copy()
+        if not ivar_defeat_breakdowns.empty and "breakdown" in ivar_defeat_breakdowns.columns
+        else pd.DataFrame()
+    )
+    ivar_confidence.to_csv(paths["quote_confidence_ivar_defeat_summary"], index=False)
+
+    if not casebook_events.empty and {band_col, "case_type"}.issubset(casebook_events.columns):
+        casebook = casebook_events.copy()
+        casebook[band_col] = casebook[band_col].fillna("missing").astype(str)
+        case_groups = [
+            column
+            for column in [band_col, "case_type", "target_id", "model_id"]
+            if column in casebook.columns
+        ]
+        casebook_summary = (
+            casebook.groupby(case_groups, dropna=False)
+            .agg(
+                n=("case_type", "size"),
+                mean_severity_score=("severity_score", "mean"),
+                mean_model_abs_error=("model_abs_error", "mean"),
+                mean_ivar_abs_error=("ivar_abs_error", "mean"),
+            )
+            .reset_index()
+        )
+        casebook_summary.insert(0, "feature_schema_version", feature_schema_version)
+        casebook_summary.insert(1, "tuning_profile", tuning_profile)
+    else:
+        casebook_summary = pd.DataFrame(
+            columns=[
+                "feature_schema_version",
+                "tuning_profile",
+                band_col,
+                "case_type",
+                "target_id",
+                "model_id",
+                "n",
+            ]
+        )
+    casebook_summary.to_csv(paths["quote_confidence_casebook_summary"], index=False)
+
+    return {key: str(value) for key, value in paths.items()}
+
+
+def _optional_json(path: Path) -> dict[str, object]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return {}
+    try:
+        return read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            if value.strip() == "":
+                return default
+            numeric_value = float(value)
+        elif isinstance(value, int | float | np.integer | np.floating):
+            numeric_value = float(value)
+        else:
+            return default
+        if not np.isfinite(numeric_value):
+            return default
+        return int(numeric_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _csv_data_row_count(path: Path) -> int:
+    if not path.exists() or path.stat().st_size <= 0:
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return max(sum(1 for _ in handle) - 1, 0)
+    except OSError:
+        return 0
+
+
+def _csv_finite_value_count(path: Path, column: str) -> int:
+    if not path.exists() or path.stat().st_size <= 0:
+        return 0
+    try:
+        frame = pd.read_csv(path, usecols=[column])
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return 0
+    values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+    return int(np.isfinite(values).sum())
+
+
+def build_completion_gap_audit(paths: ResearchPaths) -> dict[str, str]:
+    """Write a machine-readable audit of completed artifacts versus paper blockers."""
+
+    out_csv = paths.modeling_artifacts_dir / "completion_gap_audit.csv"
+    out_json = paths.modeling_artifacts_dir / "completion_gap_audit.json"
+    quote_manifest_path = (
+        paths.artifacts_dir
+        / "data_pipeline"
+        / "quote_execution_panel"
+        / "quote_execution_panel_manifest.json"
+    )
+    quote_manifest = _optional_json(quote_manifest_path)
+    quote_report = quote_manifest.get("report", {})
+    if not isinstance(quote_report, dict):
+        quote_report = {}
+    lake_rows = quote_manifest.get("lake_output_rows", {})
+    if not isinstance(lake_rows, dict):
+        lake_rows = {}
+    lake_policy = quote_manifest.get("lake_policy", {})
+    if not isinstance(lake_policy, dict):
+        lake_policy = {}
+    artifact_outputs = quote_manifest.get("artifact_outputs", {})
+    if not isinstance(artifact_outputs, dict):
+        artifact_outputs = {}
+    quote_artifact_root = paths.artifacts_dir / "data_pipeline" / "quote_execution_panel"
+
+    def quote_artifact_path(key: str, fallback_name: str) -> Path:
+        value = artifact_outputs.get(key)
+        return Path(str(value)) if value else quote_artifact_root / fallback_name
+
+    lake_report_path = (
+        paths.artifacts_dir / "data_pipeline" / "lake_quality_audit" / "lake_quality_report.json"
+    )
+    lake_report = _optional_json(lake_report_path)
+    target_window = lake_report.get("target_window", {})
+    if not isinstance(target_window, dict):
+        target_window = {}
+
+    quote_rows_matched = _safe_int(quote_report.get("quote_rows_matched"))
+    quote_ok = bool(quote_report.get("ok"))
+    quote_metadata_only = bool(quote_report.get("metadata_only"))
+    raw_full_day_files_written = bool(
+        quote_report.get(
+            "raw_full_day_files_written",
+            quote_manifest.get("raw_full_day_files_written", True),
+        )
+    )
+    quote_lake_required = {
+        "bronze_quote_window_quotes": "matched quote rows",
+        "silver_quote_window_marks": "quote marks",
+        "silver_quote_execution_legs": "leg execution diagnostics",
+        "gold_quote_straddle_execution": "straddle execution diagnostics",
+        "gold_quote_ivar_event": "quote-IVAR diagnostics",
+        "gold_quote_iv_surface": "bounded quote-IV leg surface diagnostics",
+        "gold_quote_iv_surface_summary": "bounded quote-IV call-put pair diagnostics",
+        "gold_quote_surface_ivar_event": "bounded quote-IV surface IVAR diagnostics",
+        "gold_quote_execution_confidence": "execution confidence diagnostics",
+    }
+    quote_lake_counts = {key: _safe_int(lake_rows.get(key)) for key in sorted(quote_lake_required)}
+    quote_lake_populated = all(value > 0 for value in quote_lake_counts.values())
+    quote_surface_populated = all(
+        quote_lake_counts.get(key, 0) > 0
+        for key in (
+            "gold_quote_iv_surface",
+            "gold_quote_iv_surface_summary",
+            "gold_quote_surface_ivar_event",
+        )
+    )
+    quote_surface_valid_counts = {
+        "quote_mid_iv_finite": _csv_finite_value_count(
+            quote_artifact_path("quote_iv_surface_csv", "quote_iv_surface.csv"),
+            "quote_mid_iv",
+        ),
+        "quote_mid_total_variance_finite": _csv_finite_value_count(
+            quote_artifact_path("quote_iv_surface_summary_csv", "quote_iv_surface_summary.csv"),
+            "quote_mid_total_variance",
+        ),
+        "quote_surface_mid_ivar_event_finite": _csv_finite_value_count(
+            quote_artifact_path("quote_surface_ivar_event_csv", "quote_surface_ivar_event.csv"),
+            "quote_surface_mid_ivar_event",
+        ),
+    }
+    quote_surface_valid_populated = quote_surface_populated and all(
+        value > 0 for value in quote_surface_valid_counts.values()
+    )
+
+    quote_summary_files = {
+        "quote_confidence_prediction_coverage": paths.modeling_artifacts_dir
+        / "quote_confidence_prediction_coverage.csv",
+        "quote_ivar_summary": paths.modeling_artifacts_dir / "quote_ivar_summary.csv",
+        "quote_confidence_strategy_summary": paths.modeling_artifacts_dir
+        / "quote_confidence_strategy_summary.csv",
+        "quote_confidence_ivar_defeat_summary": paths.modeling_artifacts_dir
+        / "quote_confidence_ivar_defeat_summary.csv",
+        "quote_confidence_casebook_summary": paths.modeling_artifacts_dir
+        / "quote_confidence_casebook_summary.csv",
+    }
+    quote_summary_counts = {
+        name: _csv_data_row_count(path) for name, path in quote_summary_files.items()
+    }
+    quote_summary_populated = all(value > 0 for value in quote_summary_counts.values())
+
+    robustness_rows = _csv_data_row_count(paths.modeling_artifacts_dir / "robustness_summary.csv")
+    sequence_path = paths.modeling_artifacts_dir / "sequence_model_fit_diagnostics.csv"
+    sequence_rows = _csv_data_row_count(sequence_path)
+    expected_sequence_ids = {
+        "ridge_flat_aggregates_sequence",
+        "bigru_sequence_5seed",
+        "mamba_ssm_sequence_5seed",
+        "attention_pooling_sequence",
+        "dilated_cnn_sequence",
+        "mask_only_sequence",
+        "time_shuffle_sequence",
+    }
+    observed_sequence_ids: set[str] = set()
+    observed_sequence_targets: set[str] = set()
+    headline_sequence_rows = 0
+    if sequence_rows > 0:
+        try:
+            sequence = pd.read_csv(sequence_path)
+            if "model_id" in sequence.columns:
+                observed_sequence_ids = set(sequence["model_id"].dropna().astype(str))
+            if "target_id" in sequence.columns:
+                observed_sequence_targets = set(sequence["target_id"].dropna().astype(str))
+            if "headline_eligible" in sequence.columns:
+                headline_sequence_rows = int(sequence["headline_eligible"].astype(bool).sum())
+        except (OSError, pd.errors.EmptyDataError):
+            observed_sequence_ids = set()
+            observed_sequence_targets = set()
+    sequence_suite_populated = expected_sequence_ids.issubset(observed_sequence_ids) and set(
+        TARGET_IDS
+    ).issubset(observed_sequence_targets)
+
+    rows: list[dict[str, object]] = []
+
+    def add(
+        requirement_id: str,
+        category: str,
+        required_state: str,
+        status: str,
+        evidence_path: Path,
+        evidence_value: object,
+        claim_boundary: str,
+    ) -> None:
+        rows.append(
+            {
+                "requirement_id": requirement_id,
+                "category": category,
+                "required_state": required_state,
+                "status": status,
+                "evidence_path": str(evidence_path),
+                "evidence_value": json.dumps(evidence_value, sort_keys=True, default=str),
+                "claim_boundary": claim_boundary,
+            }
+        )
+
+    add(
+        "bounded_quote_extraction_matched_rows",
+        "quote_execution",
+        "Targeted quote extraction has matched quote rows > 0 and is not metadata-only.",
+        "complete"
+        if quote_ok and quote_rows_matched > 0 and not quote_metadata_only
+        else "incomplete",
+        quote_manifest_path,
+        {
+            "ok": quote_ok,
+            "metadata_only": quote_metadata_only,
+            "quote_rows_matched": quote_rows_matched,
+            "route": quote_report.get("route"),
+        },
+        "Evidence supports a bounded targeted quote slice, not full historical quote coverage.",
+    )
+    add(
+        "quote_marks_legs_straddles_confidence_populated",
+        "quote_execution",
+        (
+            "Quote marks, leg execution, straddle execution, quote-IVAR, and "
+            "confidence outputs are populated."
+        ),
+        "complete" if quote_lake_populated else "incomplete",
+        quote_manifest_path,
+        quote_lake_counts,
+        "Populated rows are bounded diagnostics and inherit the targeted extraction window.",
+    )
+    add(
+        "targeted_quote_lake_policy",
+        "data_engineering",
+        (
+            "Quote pipeline stores targeted normalized windows/cache outputs, "
+            "not raw full-day quote files in repo."
+        ),
+        "complete" if not raw_full_day_files_written else "incomplete",
+        quote_manifest_path,
+        {
+            "raw_full_day_files_written": raw_full_day_files_written,
+            "quote_source": lake_policy.get("quote_source"),
+            "raw_full_day_quote_files_in_repo": lake_policy.get("raw_full_day_quote_files_in_repo"),
+        },
+        (
+            "This is the correct storage policy for very large quote data, "
+            "but it is not full-day NBBO coverage."
+        ),
+    )
+    add(
+        "quote_confidence_stratified_results",
+        "research_outputs",
+        (
+            "Prediction coverage, strategy, IVAR-defeat, and casebook outputs "
+            "are stratified by execution confidence."
+        ),
+        "complete" if quote_summary_populated else "incomplete",
+        paths.modeling_artifacts_dir,
+        quote_summary_counts,
+        "Small high/medium-confidence cells remain diagnostic until broader quote coverage exists.",
+    )
+    add(
+        "quote_ivar_populated_but_not_surface",
+        "quote_ivar",
+        "Quote-IVAR exists and is upgraded to a full quote-IV surface.",
+        "diagnostic_only"
+        if quote_lake_counts.get("gold_quote_ivar_event", 0) > 0 or quote_surface_valid_populated
+        else "incomplete",
+        quote_manifest_path,
+        {
+            "gold_quote_ivar_event_rows": quote_lake_counts.get("gold_quote_ivar_event", 0),
+            "gold_quote_iv_surface_rows": quote_lake_counts.get("gold_quote_iv_surface", 0),
+            "gold_quote_iv_surface_summary_rows": quote_lake_counts.get(
+                "gold_quote_iv_surface_summary", 0
+            ),
+            "gold_quote_surface_ivar_event_rows": quote_lake_counts.get(
+                "gold_quote_surface_ivar_event", 0
+            ),
+            **quote_surface_valid_counts,
+        },
+        (
+            "Bounded quote-IV surface diagnostics may exist, but this is not full "
+            "historical NBBO-equivalent quote-IV surface coverage."
+        ),
+    )
+    add(
+        "bounded_quote_iv_surface_diagnostics_populated",
+        "quote_ivar",
+        (
+            "Bounded quote-IV surface, call-put pair summary, and surface-IVAR "
+            "artifacts are populated."
+        ),
+        "complete" if quote_surface_valid_populated else "incomplete",
+        quote_manifest_path,
+        {
+            "gold_quote_iv_surface_rows": quote_lake_counts.get("gold_quote_iv_surface", 0),
+            "gold_quote_iv_surface_summary_rows": quote_lake_counts.get(
+                "gold_quote_iv_surface_summary", 0
+            ),
+            "gold_quote_surface_ivar_event_rows": quote_lake_counts.get(
+                "gold_quote_surface_ivar_event", 0
+            ),
+            **quote_surface_valid_counts,
+        },
+        (
+            "This closes the bounded diagnostic surface gap only; full 2013-2025 "
+            "paper-grade NBBO surface remains out of scope until coverage exists."
+        ),
+    )
+    add(
+        "liquidity_dte_regime_robustness",
+        "research_outputs",
+        "Liquidity, DTE, timing, ticker, and regime robustness summary is populated.",
+        "complete" if robustness_rows > 0 else "incomplete",
+        paths.modeling_artifacts_dir / "robustness_summary.csv",
+        {"rows": robustness_rows},
+        "Current robustness cells are proxy-stage diagnostics; small cells stay exploratory.",
+    )
+    add(
+        "sequence_diagnostics_full_suite_populated",
+        "sequence_models",
+        (
+            "Ridge-flat, BiGRU, official mamba-ssm, attention, dilated CNN, "
+            "mask-only, and time-shuffle rows exist for all targets."
+        ),
+        "complete" if sequence_suite_populated else "incomplete",
+        sequence_path,
+        {
+            "rows": sequence_rows,
+            "observed_model_ids": sorted(observed_sequence_ids),
+            "observed_targets": sorted(observed_sequence_targets),
+        },
+        "This proves the suite was run; it does not prove sequence superiority.",
+    )
+    add(
+        "sequence_headline_gate",
+        "sequence_models",
+        (
+            "At least one real sequence row is headline eligible after "
+            "control/bootstrap/economics gates."
+        ),
+        "diagnostic_only"
+        if sequence_suite_populated and headline_sequence_rows == 0
+        else "complete",
+        sequence_path,
+        {"headline_eligible_rows": headline_sequence_rows},
+        (
+            "Current sequence suite is populated but remains diagnostic because "
+            "no sequence row is headline eligible."
+        ),
+    )
+    add(
+        "full_historical_lake_quality_audit",
+        "data_engineering",
+        "2013-01-01 to 2025-12-31 lake-quality audit has been run.",
+        "complete"
+        if lake_report.get("status") == "ran"
+        and target_window.get("start") == "2013-01-01"
+        and target_window.get("end") == "2025-12-31"
+        else "incomplete",
+        lake_report_path,
+        {
+            "ok": lake_report.get("ok"),
+            "target_window": target_window,
+            "incomplete_required_datasets": lake_report.get("incomplete_required_datasets"),
+        },
+        "The audit is complete, but the reported coverage is not complete.",
+    )
+    add(
+        "historical_2013_2025_data_coverage",
+        "data_engineering",
+        "Required datasets cover the full 2013-2025 target window.",
+        "complete" if bool(lake_report.get("ok")) else "incomplete",
+        lake_report_path,
+        {
+            "ok": lake_report.get("ok"),
+            "incomplete_required_dataset_ids": lake_report.get(
+                "incomplete_required_dataset_ids", []
+            ),
+        },
+        "Current local coverage starts after 2013 for required datasets.",
+    )
+    add(
+        "paper_grade_bid_ask_nbbo_execution",
+        "execution",
+        "Execution evidence is paper-grade bid/ask or NBBO-equivalent across the study window.",
+        "complete" if bool(lake_report.get("paper_grade_execution_ready")) else "incomplete",
+        lake_report_path,
+        {
+            "paper_grade_execution_ready": lake_report.get("paper_grade_execution_ready"),
+            "paper_grade_execution_blocker": lake_report.get("paper_grade_execution_blocker"),
+        },
+        (
+            "Current canonical economics remain no-NBBO proxy economics plus "
+            "bounded quote diagnostics."
+        ),
+    )
+    frame = pd.DataFrame(rows)
+    frame.to_csv(out_csv, index=False)
+    status_counts = frame["status"].value_counts().sort_index().to_dict()
+    blocking = frame.loc[
+        frame["status"].isin(["incomplete", "diagnostic_only"]), "requirement_id"
+    ].tolist()
+    write_json(
+        out_json,
+        {
+            "ok": not blocking,
+            "paper_grade_ready": not blocking,
+            "audit_rows": int(len(frame)),
+            "status_counts": {str(key): int(value) for key, value in status_counts.items()},
+            "blocking_requirement_ids": blocking,
+            "completed_requirement_ids": frame.loc[
+                frame["status"].eq("complete"), "requirement_id"
+            ].tolist(),
+            "outputs": {
+                "completion_gap_audit_csv": str(out_csv),
+                "completion_gap_audit_json": str(out_json),
+            },
+        },
+    )
+    return {
+        "completion_gap_audit": str(out_csv),
+        "completion_gap_audit_summary": str(out_json),
+    }
+
+
+ROBUSTNESS_SUMMARY_COLUMNS = [
+    "feature_schema_version",
+    "tuning_profile",
+    "source",
+    "breakdown",
+    "primary_metric",
+    "row_count",
+    "target_count",
+    "model_count",
+    "strategy_proxy_kind_count",
+    "subgroup_count",
+    "min_cell_n",
+    "median_cell_n",
+    "max_cell_n",
+    "positive_metric_rows",
+    "negative_metric_rows",
+    "positive_metric_share",
+    "best_metric_value",
+    "worst_metric_value",
+    "headline_eligible_rows",
+    "claim_gate_status",
+]
+
+
+def _numeric_or_nan(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def _robustness_gate_status(subgroup_count: int, min_cell_n: float | None) -> str:
+    if subgroup_count < 2:
+        return "single_bucket_no_robustness_claim"
+    if min_cell_n is None or not np.isfinite(min_cell_n):
+        return "missing_cell_counts"
+    if min_cell_n < 5:
+        return "exploratory_small_cells"
+    return "available_multi_bucket"
+
+
+def _robustness_row(
+    frame: pd.DataFrame,
+    *,
+    source: str,
+    breakdown: str,
+    value_col: str,
+    n_col: str,
+    metric_col: str,
+    feature_schema_version: str,
+    tuning_profile: TuningProfile,
+) -> dict[str, object]:
+    subgroup_values = (
+        frame[value_col].dropna().astype(str)
+        if value_col in frame.columns
+        else pd.Series(dtype=str)
+    )
+    counts = _numeric_or_nan(frame, n_col)
+    metric = _numeric_or_nan(frame, metric_col)
+    finite_counts = counts.loc[counts.notna()]
+    finite_metric = metric.loc[metric.notna()]
+    min_cell_n = float(finite_counts.min()) if not finite_counts.empty else None
+    headline_eligible_rows = 0
+    if "pnl_headline_eligible" in frame.columns:
+        headline_eligible_rows = int(
+            frame["pnl_headline_eligible"].astype(str).str.lower().isin({"true", "1"}).sum()
+        )
+    positive_rows = int((finite_metric > 0).sum())
+    negative_rows = int((finite_metric <= 0).sum())
+    subgroup_count = int(subgroup_values.nunique())
+    return {
+        "feature_schema_version": feature_schema_version,
+        "tuning_profile": tuning_profile,
+        "source": source,
+        "breakdown": breakdown,
+        "primary_metric": metric_col,
+        "row_count": int(len(frame)),
+        "target_count": int(frame["target_id"].astype(str).nunique())
+        if "target_id" in frame
+        else 0,
+        "model_count": int(frame["model_id"].astype(str).nunique()) if "model_id" in frame else 0,
+        "strategy_proxy_kind_count": int(frame["strategy_proxy_kind"].astype(str).nunique())
+        if "strategy_proxy_kind" in frame
+        else 0,
+        "subgroup_count": subgroup_count,
+        "min_cell_n": min_cell_n,
+        "median_cell_n": float(finite_counts.median()) if not finite_counts.empty else None,
+        "max_cell_n": float(finite_counts.max()) if not finite_counts.empty else None,
+        "positive_metric_rows": positive_rows,
+        "negative_metric_rows": negative_rows,
+        "positive_metric_share": None
+        if finite_metric.empty
+        else float(positive_rows / max(len(finite_metric), 1)),
+        "best_metric_value": float(finite_metric.max()) if not finite_metric.empty else None,
+        "worst_metric_value": float(finite_metric.min()) if not finite_metric.empty else None,
+        "headline_eligible_rows": headline_eligible_rows,
+        "claim_gate_status": _robustness_gate_status(subgroup_count, min_cell_n),
+    }
+
+
+def build_robustness_summary_table(
+    strategy_breakdowns: pd.DataFrame,
+    ivar_defeat_breakdowns: pd.DataFrame,
+    *,
+    out_dir: Path,
+    feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    tuning_profile: TuningProfile = "tuned_phase1",
+) -> dict[str, str]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    if not strategy_breakdowns.empty and "breakdown" in strategy_breakdowns.columns:
+        selected = strategy_breakdowns.loc[
+            strategy_breakdowns["breakdown"].astype(str).isin(ROBUSTNESS_BREAKDOWN_COLUMNS)
+        ].copy()
+        for breakdown, group in selected.groupby("breakdown", dropna=False):
+            breakdown_name = str(breakdown)
+            value_col = breakdown_name if breakdown_name in group.columns else "breakdown_value"
+            rows.append(
+                _robustness_row(
+                    group,
+                    source="strategy",
+                    breakdown=breakdown_name,
+                    value_col=value_col,
+                    n_col="strategy_n",
+                    metric_col="strategy_net_pnl_usd",
+                    feature_schema_version=feature_schema_version,
+                    tuning_profile=tuning_profile,
+                )
+            )
+    if not ivar_defeat_breakdowns.empty and "breakdown" in ivar_defeat_breakdowns.columns:
+        selected = ivar_defeat_breakdowns.loc[
+            ivar_defeat_breakdowns["breakdown"].astype(str).isin(ROBUSTNESS_BREAKDOWN_COLUMNS)
+        ].copy()
+        for breakdown, group in selected.groupby("breakdown", dropna=False):
+            rows.append(
+                _robustness_row(
+                    group,
+                    source="ivar_defeat",
+                    breakdown=str(breakdown),
+                    value_col="breakdown_value",
+                    n_col="n",
+                    metric_col="mae_lift_vs_ivar",
+                    feature_schema_version=feature_schema_version,
+                    tuning_profile=tuning_profile,
+                )
+            )
+    summary = pd.DataFrame(rows, columns=ROBUSTNESS_SUMMARY_COLUMNS)
+    path = out_dir / "robustness_summary.csv"
+    summary.to_csv(path, index=False)
+    return {"robustness_summary": str(path)}
 
 
 def build_metric_tables(
@@ -4529,15 +5327,7 @@ def build_metric_tables(
                     sensitivity.insert(4, "strategy_proxy_kind", proxy_kind)
                     sensitivity.insert(5, "pnl_headline_eligible", headline_eligible)
                     cost_rows.append(sensitivity)
-                    for breakdown in (
-                        "dte_bucket",
-                        "is_main_dte_5_14",
-                        "announcement_timing",
-                        "ticker",
-                        "event_year",
-                        "regime",
-                        "liquidity_bucket",
-                    ):
+                    for breakdown in ROBUSTNESS_BREAKDOWN_COLUMNS:
                         if breakdown in trades.columns and not trades.empty:
                             table = breakdown_metrics(
                                 trades,
@@ -4564,9 +5354,10 @@ def build_metric_tables(
     (pd.concat(cost_rows, ignore_index=True) if cost_rows else pd.DataFrame()).to_csv(
         cost_path, index=False
     )
-    (pd.concat(breakdown_frames, ignore_index=True) if breakdown_frames else pd.DataFrame()).to_csv(
-        breakdown_path, index=False
+    strategy_breakdowns = (
+        pd.concat(breakdown_frames, ignore_index=True) if breakdown_frames else pd.DataFrame()
     )
+    strategy_breakdowns.to_csv(breakdown_path, index=False)
     o2c_scale_path = out_dir / "o2c_scale_diagnostic.csv"
     o2c_scale = o2c_scale_diagnostic(predictions)
     if not o2c_scale.empty and "feature_schema_version" not in o2c_scale.columns:
@@ -4621,10 +5412,29 @@ def build_metric_tables(
     _summarize_ivar_defeat(defeat_events).to_csv(
         ivar_defeat_paths["ivar_defeat_metrics"], index=False
     )
-    _ivar_defeat_breakdowns(defeat_events).to_csv(
-        ivar_defeat_paths["ivar_defeat_breakdowns"], index=False
+    ivar_defeat_breakdowns = _ivar_defeat_breakdowns(defeat_events)
+    ivar_defeat_breakdowns.to_csv(ivar_defeat_paths["ivar_defeat_breakdowns"], index=False)
+    robustness_paths = build_robustness_summary_table(
+        strategy_breakdowns,
+        ivar_defeat_breakdowns,
+        out_dir=out_dir,
+        feature_schema_version=feature_schema_version,
+        tuning_profile=tuning_profile,
     )
     casebook_paths = build_casebook_tables(defeat_events, out_dir=out_dir)
+    casebook_events_path = Path(casebook_paths["casebook_events"])
+    casebook_events = (
+        pd.read_csv(casebook_events_path) if casebook_events_path.exists() else pd.DataFrame()
+    )
+    quote_diagnostic_paths = build_quote_diagnostic_tables(
+        predictions,
+        strategy_breakdowns=strategy_breakdowns,
+        ivar_defeat_breakdowns=ivar_defeat_breakdowns,
+        casebook_events=casebook_events,
+        out_dir=out_dir,
+        feature_schema_version=feature_schema_version,
+        tuning_profile=tuning_profile,
+    )
     return {
         "forecast_metrics": str(forecast_path),
         "ranking_metrics": str(ranking_path),
@@ -4636,7 +5446,9 @@ def build_metric_tables(
         "extreme_predictions": str(extreme_path),
         "inference": str(inference_path),
         **{key: str(value) for key, value in ivar_defeat_paths.items()},
+        **robustness_paths,
         **casebook_paths,
+        **quote_diagnostic_paths,
     }
 
 
@@ -5023,6 +5835,105 @@ def write_research_figures(
     return outputs
 
 
+def _json_mapping(path: Path) -> Mapping[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return cast(Mapping[str, object], payload) if isinstance(payload, dict) else {}
+
+
+def _int_mapping_value(mapping: Mapping[str, object], key: str) -> int:
+    value = mapping.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if np.isfinite(value) else 0
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _quote_summary_int(summary: Mapping[str, object], key: str) -> int:
+    return _int_mapping_value(summary, key)
+
+
+def _quote_summary_count_text(summary: Mapping[str, object], key: str) -> str:
+    return f"{_quote_summary_int(summary, key):,}"
+
+
+def _quote_execution_report_summary(
+    *,
+    artifacts_dir: Path,
+    predictions: pd.DataFrame,
+) -> dict[str, object]:
+    quote_root = artifacts_dir.parent / "data_pipeline" / "quote_execution_panel"
+    report = _json_mapping(quote_root / "quote_execution_report.json")
+    manifest = _json_mapping(quote_root / "quote_execution_panel_manifest.json")
+    pipeline_params = cast(Mapping[str, object], manifest.get("pipeline_params", {}))
+    trigger_dates_raw = pipeline_params.get("dates", [])
+    trigger_dates = trigger_dates_raw if isinstance(trigger_dates_raw, list) else []
+    expanded_dates_raw = report.get("dates", [])
+    expanded_dates = expanded_dates_raw if isinstance(expanded_dates_raw, list) else []
+    summary: dict[str, object] = {
+        "has_quote_diagnostics": _int_mapping_value(report, "quote_rows_matched") > 0,
+        "trigger_date_count": len(trigger_dates),
+        "expanded_date_count": len(expanded_dates),
+        "event_count": _int_mapping_value(report, "event_count"),
+        "request_rows": _int_mapping_value(report, "request_rows"),
+        "quote_rows_matched": _int_mapping_value(report, "quote_rows_matched"),
+        "quote_rows_scanned": _int_mapping_value(report, "quote_rows_scanned"),
+    }
+    row_artifacts = {
+        "window_marks_rows": "quote_window_marks.csv",
+        "leg_rows": "quote_execution_legs.csv",
+        "straddle_rows": "quote_straddle_execution.csv",
+        "quote_ivar_rows": "quote_ivar_event.csv",
+        "confidence_rows": "quote_execution_confidence.csv",
+    }
+    for key, filename in row_artifacts.items():
+        path = quote_root / filename
+        summary[key] = int(len(pd.read_csv(path))) if path.exists() else 0
+    confidence_path = quote_root / "quote_execution_confidence.csv"
+    confidence_bands: dict[str, int] = {}
+    if confidence_path.exists():
+        confidence = pd.read_csv(confidence_path)
+        if "execution_confidence_band" in confidence.columns:
+            counts = (
+                confidence["execution_confidence_band"]
+                .fillna("NA")
+                .astype(str)
+                .value_counts(dropna=False)
+            )
+            confidence_bands = {str(key): int(value) for key, value in counts.items()}
+    summary["confidence_bands"] = confidence_bands
+    required_prediction_columns = {"split", "execution_confidence_band"}
+    if not predictions.empty and required_prediction_columns.issubset(predictions.columns):
+        band = predictions["execution_confidence_band"].fillna("missing").astype(str)
+        test_high_medium = predictions["split"].astype(str).eq("test") & band.isin(
+            ["high", "medium"]
+        )
+        summary["test_high_medium_target_rows"] = int(test_high_medium.sum())
+        summary["test_high_medium_events"] = (
+            int(predictions.loc[test_high_medium, "event_id"].astype(str).nunique())
+            if "event_id" in predictions.columns
+            else 0
+        )
+    else:
+        summary["test_high_medium_target_rows"] = 0
+        summary["test_high_medium_events"] = 0
+    return summary
+
+
 def write_proxy_research_report(
     *,
     artifacts_dir: Path,
@@ -5066,6 +5977,14 @@ def write_proxy_research_report(
         if (artifacts_dir / "o2c_scale_diagnostic.csv").exists()
         else pd.DataFrame()
     )
+    try:
+        sequence_diagnostics = (
+            pd.read_csv(artifacts_dir / "sequence_model_fit_diagnostics.csv")
+            if (artifacts_dir / "sequence_model_fit_diagnostics.csv").exists()
+            else pd.DataFrame()
+        )
+    except pd.errors.EmptyDataError:
+        sequence_diagnostics = pd.DataFrame()
     sequence_report_path = artifacts_dir / "sequence_coverage_report.json"
     sequence_report = (
         json.loads(sequence_report_path.read_text(encoding="utf-8"))
@@ -5074,6 +5993,10 @@ def write_proxy_research_report(
     )
     predictions_path = artifacts_dir / "model_predictions.parquet"
     predictions = pd.read_parquet(predictions_path) if predictions_path.exists() else pd.DataFrame()
+    quote_summary = _quote_execution_report_summary(
+        artifacts_dir=artifacts_dir,
+        predictions=predictions,
+    )
     tuning_selected_path = artifacts_dir / "tuning_selected_params.json"
     tuning_selected = (
         json.loads(tuning_selected_path.read_text(encoding="utf-8"))
@@ -5293,17 +6216,75 @@ def write_proxy_research_report(
         _append_bullets(lines, bullets)
 
     sequence_note = "Sequence diagnostics were unavailable."
+    sequence_status = ""
+    if not sequence_diagnostics.empty and {"model_id", "target_id", "coverage"}.issubset(
+        sequence_diagnostics.columns
+    ):
+        sequence_gate = sequence_diagnostics.loc[
+            sequence_diagnostics["target_id"].astype(str).eq("jump_c2o")
+        ].copy()
+        sequence_gate["coverage"] = pd.to_numeric(
+            sequence_gate["coverage"], errors="coerce"
+        ).fillna(0)
+        trained_gate = sequence_gate.loc[sequence_gate["coverage"].gt(0)].copy()
+        real_sequence_ids = {
+            "ridge_flat_aggregates_sequence",
+            "bigru_sequence_5seed",
+            "attention_pooling_sequence",
+            "dilated_cnn_sequence",
+            "mamba_ssm_sequence_5seed",
+        }
+        real_gate = trained_gate.loc[
+            trained_gate["model_id"].astype(str).isin(real_sequence_ids)
+        ].copy()
+        best_gate = _best(real_gate, "auc_lift", higher_is_better=True)
+        headline_rows = (
+            int(sequence_diagnostics["headline_eligible"].astype(bool).sum())
+            if "headline_eligible" in sequence_diagnostics.columns
+            else 0
+        )
+        mamba_status_rows = (
+            diagnostics.loc[
+                diagnostics["model_id"].astype(str).eq("mamba_ssm_sequence_5seed")
+                & diagnostics.get("target_id", pd.Series(dtype=object)).astype(str).eq("jump_c2o"),
+                "status",
+            ]
+            if {"model_id", "target_id", "status"}.issubset(diagnostics.columns)
+            else pd.Series(dtype=object)
+        )
+        mamba_status = (
+            str(mamba_status_rows.iloc[0]) if not mamba_status_rows.empty else "unavailable"
+        )
+        sequence_status = (
+            "Current sequence diagnostics are populated for "
+            f"{len(trained_gate)} `jump_c2o` sequence/control rows. "
+        )
+        if best_gate is not None:
+            sequence_status += (
+                f"The best real-sequence `jump_c2o` gate AUC lift is "
+                f"{_label(best_gate[0])} at {_fmt(best_gate[1])}. "
+            )
+        sequence_status += (
+            f"No sequence row is headline eligible (`headline_eligible` rows={headline_rows}). "
+            "Official mamba-ssm status is "
+            f"`{mamba_status}` in this environment."
+        )
+        sequence_note = sequence_status
     sequence_target = (
         predictions.loc[predictions["target_id"].astype(str).eq("jump_c2o")].copy()
         if "target_id" in predictions
         else predictions.copy()
     )
-    if not sequence_target.empty and {
-        "forecast_mamba_ssm_sequence_5seed",
-        "forecast_mask_only_sequence",
-        "rvar_event",
-        "split",
-    }.issubset(sequence_target.columns):
+    if (
+        sequence_status == ""
+        and not sequence_target.empty
+        and {
+            "forecast_mamba_ssm_sequence_5seed",
+            "forecast_mask_only_sequence",
+            "rvar_event",
+            "split",
+        }.issubset(sequence_target.columns)
+    ):
         sequence_frame = sequence_target.loc[
             sequence_target["split"].eq("test"),
             [
@@ -5359,6 +6340,19 @@ def write_proxy_research_report(
     mask_auc = _value(ranking_main, "mask_only_sequence", "auc")
     mamba_net = _value(strategy_main, "mamba_ssm_sequence_5seed", "net_pnl_usd")
     mask_net = _value(strategy_main, "mask_only_sequence", "net_pnl_usd")
+    sequence_comparison_bullet = (
+        f"Official mamba-ssm 5-seed `jump_c2o` AUC is {_fmt(mamba_auc)} versus "
+        f"mask-only AUC {_fmt(mask_auc)}; `day_c2c` net PnL is "
+        f"{_fmt(mamba_net, money=True)} versus {_fmt(mask_net, money=True)}."
+        if all(value is not None for value in (mamba_auc, mask_auc, mamba_net, mask_net))
+        else ""
+    )
+    if sequence_comparison_bullet == "" and not sequence_diagnostics.empty:
+        sequence_comparison_bullet = (
+            "Official mamba-ssm produced no test forecasts in this run; use "
+            "`sequence_model_fit_diagnostics.csv` to compare ridge-flat, BiGRU, "
+            "attention pooling, dilated CNN, mask-only, and time-shuffle rows."
+        )
     sequence_drop_rate = float(sequence_report.get("drop_rate", 0.0))
     if best_auc and best_top_decile:
         ranking_winner_text = (
@@ -5526,15 +6520,64 @@ def write_proxy_research_report(
                 columns={"tuning_profile": "tuning_protocol"}
             )
 
+    has_quote_diagnostics = bool(quote_summary.get("has_quote_diagnostics"))
+    if has_quote_diagnostics:
+        confidence_bands = cast(dict[str, int], quote_summary.get("confidence_bands", {}))
+        confidence_text = ", ".join(
+            f"{band}={count}" for band, count in sorted(confidence_bands.items())
+        )
+        quote_scope_text = (
+            "**Scope.** This report is a proxy-stage study using the currently available sample "
+            "from 2022 onward. It uses SEC filings for earnings-event identification and "
+            "Massive second aggregates/day aggregates for model features and proxy strategy "
+            "marks. Targeted option quote windows are populated as analysis-only execution "
+            "diagnostics, but the model and PnL results are still not full-sample quote, OPRA, "
+            "or NBBO execution evidence."
+        )
+        quote_data_bullet = (
+            "- Targeted quote diagnostics: "
+            f"{_quote_summary_count_text(quote_summary, 'trigger_date_count')} trigger dates "
+            "expanded to "
+            f"{_quote_summary_count_text(quote_summary, 'expanded_date_count')} complete "
+            "event-window quote dates, "
+            f"{_quote_summary_count_text(quote_summary, 'event_count')} events, "
+            f"{_quote_summary_count_text(quote_summary, 'request_rows')} quote-window requests, "
+            f"{_quote_summary_count_text(quote_summary, 'quote_rows_matched')} matched quote rows, "
+            f"{_quote_summary_count_text(quote_summary, 'window_marks_rows')} marks, "
+            f"{_quote_summary_count_text(quote_summary, 'leg_rows')} leg rows, "
+            f"{_quote_summary_count_text(quote_summary, 'straddle_rows')} straddle rows, "
+            f"{_quote_summary_count_text(quote_summary, 'quote_ivar_rows')} quote-IVAR "
+            "diagnostic rows, and "
+            f"{_quote_summary_count_text(quote_summary, 'confidence_rows')} confidence rows "
+            f"({confidence_text})."
+        )
+        quote_prediction_bullet = (
+            "- Locked-test predictions include "
+            f"{_quote_summary_count_text(quote_summary, 'test_high_medium_target_rows')} "
+            "high/medium "
+            "quote-confidence target rows across "
+            f"{_quote_summary_count_text(quote_summary, 'test_high_medium_events')} "
+            "unique events; "
+            "these rows support stratified diagnostics, not headline execution claims."
+        )
+    else:
+        quote_scope_text = (
+            "**Scope.** This report is a proxy-stage study using the currently available sample "
+            "from 2022 onward. It uses SEC filings for earnings-event identification and "
+            "Massive second aggregates/day aggregates for market-data proxies. No quote, "
+            "bid/ask, OPRA, or NBBO data are used."
+        )
+        quote_data_bullet = "- Targeted quote diagnostics are not populated in this artifact set."
+        quote_prediction_bullet = (
+            "- Locked-test predictions have no high/medium quote-confidence target rows."
+        )
+
     lines = [
         "# Earnings Event Variance Mispricing",
         "",
         "## Intro",
         "",
-        "**Scope.** This report is a proxy-stage study using the currently available sample "
-        "from 2022 onward. It uses SEC filings for earnings-event identification and "
-        "Massive second aggregates/day aggregates for market-data proxies. No quote, "
-        "bid/ask, OPRA, or NBBO data are used.",
+        quote_scope_text,
         "",
         "This is a proxy-stage report based on no_nbbo_trade_proxy data.",
         "Results are not paper-grade execution evidence.",
@@ -5581,6 +6624,8 @@ def write_proxy_research_report(
         "- Daily sequence: 20 trading days of close-trade-implied option-surface summaries.",
         "- Hybrid sequence: 31 steps, with 19 prior daily proxy-surface states and 12 "
         "entry-day five-minute trade-aggregate proxy bins.",
+        quote_data_bullet,
+        quote_prediction_bullet,
         (
             f"- Sequence coverage: {sequence_report.get('eligible_events', 'NA')} "
             f"eligible events out of {sequence_report.get('total_events', 'NA')}; "
@@ -5917,7 +6962,7 @@ def write_proxy_research_report(
             ),
             (
                 "Persistence across higher multipliers is the relevant robustness check "
-                "because true bid/ask costs are unavailable."
+                "because full-sample bid/ask or NBBO costs are unavailable."
             ),
         ],
     )
@@ -5933,12 +6978,12 @@ def write_proxy_research_report(
         lines,
         [
             (
-                "The snapshot keeps the main tuned tabular contenders and official "
-                "mamba-ssm 5-seed at multipliers 0, 1, 3, and 5."
+                "The snapshot keeps the main tuned tabular contenders at multipliers "
+                "0, 1, 3, and 5; sequence rows appear only when the sequence suite is run."
             ),
             (
                 "Use this as a stress-test table rather than an execution-cost estimate; "
-                "bid/ask costs are unavailable in the current route."
+                "full-sample bid/ask or NBBO costs are unavailable in the current route."
             ),
         ],
     )
@@ -5965,11 +7010,7 @@ def write_proxy_research_report(
     _append_bullets(
         lines,
         [
-            (
-                f"Official mamba-ssm 5-seed `jump_c2o` AUC is {_fmt(mamba_auc)} versus "
-                f"mask-only AUC {_fmt(mask_auc)}; `day_c2c` net PnL is "
-                f"{_fmt(mamba_net, money=True)} versus {_fmt(mask_net, money=True)}."
-            ),
+            sequence_comparison_bullet,
             "Sequence models are diagnostic-grade unless they pass common-row, bootstrap, "
             "simple-sequence-baseline, and premium-space economics gates.",
             (
@@ -6028,7 +7069,11 @@ def write_proxy_research_report(
                 "- The sample starts in 2022 because older options day-aggregate coverage is "
                 "not available under the current data entitlement."
             ),
-            "- There are no quote or NBBO data. The results are not execution-grade.",
+            (
+                "- Targeted quote diagnostics are populated for a bounded slice, but "
+                "full-sample quote/NBBO execution data are not yet available. The results "
+                "are not execution-grade."
+            ),
             (
                 f"- The sequence sample has selection risk because {sequence_drop_rate:.1%} of "
                 "events fail the V1 sequence coverage rule."
@@ -6040,12 +7085,13 @@ def write_proxy_research_report(
             "",
             "1. Keep LightGBM and XGBoost as the main proxy-stage models.",
             (
-                "2. Treat sequence/Mamba-SSM as a diagnostic experiment until sequence "
-                "coverage and surface quality improve."
+                "2. Treat sequence/Mamba-SSM as a diagnostic experiment until the "
+                "sequence rows pass common-row/control/bootstrap/economics gates."
             ),
             (
-                "3. Run a robustness pass focused on liquidity, DTE, BMO/AMC, and "
-                "ticker concentration."
+                "3. Use `robustness_summary.csv` for liquidity, DTE, VIX-regime, "
+                "BMO/AMC, and ticker concentration diagnostics; keep small-cell "
+                "strategy splits exploratory."
             ),
             (
                 "4. If paper-grade execution evidence is required, add licensed quote/NBBO "
@@ -6069,6 +7115,79 @@ def build_base_feature_matrix(config: ProjectConfig) -> pd.DataFrame:
     panel = read_table(panel_path)
     straddles = read_table(straddle_path) if straddle_path.exists() else None
     return build_model_feature_matrix(panel, straddle_diagnostics=straddles)
+
+
+QUOTE_EXECUTION_CONFIDENCE_COLUMNS = [
+    "event_id",
+    "quote_execution_route",
+    "required_quote_marks",
+    "ok_quote_marks",
+    "missing_quote_marks",
+    "invalid_quote_marks",
+    "stale_quote_marks",
+    "wide_spread_marks",
+    "max_quote_age_seconds",
+    "median_spread_over_mid",
+    "execution_confidence_score",
+    "execution_confidence_band",
+    "paper_grade",
+]
+QUOTE_IVAR_EVENT_COLUMNS = [
+    "event_id",
+    "quote_ivar_method",
+    "quote_ivar_claim_scope",
+    "expiry_candidate_count",
+    "quote_mid_ivar_event",
+    "quote_ask_ivar_event",
+    "quote_mid_ivar_failure_reason",
+    "quote_ask_ivar_failure_reason",
+    "paper_grade_quote_ivar_mid",
+    "paper_grade_quote_ivar_ask",
+]
+
+
+def merge_quote_execution_diagnostics(
+    features: pd.DataFrame, config: ProjectConfig
+) -> pd.DataFrame:
+    """Attach quote-execution diagnostics as analysis-only columns."""
+    out = ensure_event_id(features)
+    quote_root = config.gold_data_dir / "quote_execution"
+    confidence_path = quote_root / "quote_execution_confidence.parquet"
+    if confidence_path.exists():
+        confidence = read_table(confidence_path)
+        if not confidence.empty and "event_id" in confidence.columns:
+            keep = [column for column in QUOTE_EXECUTION_CONFIDENCE_COLUMNS if column in confidence]
+            confidence = confidence[keep].drop_duplicates("event_id").copy()
+            if "paper_grade" in confidence.columns:
+                confidence = confidence.rename(
+                    columns={"paper_grade": "quote_execution_paper_grade"}
+                )
+            drop_cols = [column for column in confidence.columns if column != "event_id"]
+            out = out.drop(columns=[column for column in drop_cols if column in out]).merge(
+                confidence,
+                on="event_id",
+                how="left",
+            )
+    if "execution_confidence_score" in out.columns:
+        out["execution_confidence_score"] = pd.to_numeric(
+            out["execution_confidence_score"], errors="coerce"
+        )
+    if "execution_confidence_band" in out.columns:
+        out["execution_confidence_band"] = out["execution_confidence_band"].fillna("missing")
+
+    quote_ivar_path = quote_root / "quote_ivar_event.parquet"
+    if quote_ivar_path.exists():
+        quote_ivar = read_table(quote_ivar_path)
+        if not quote_ivar.empty and "event_id" in quote_ivar.columns:
+            keep = [column for column in QUOTE_IVAR_EVENT_COLUMNS if column in quote_ivar]
+            quote_ivar = quote_ivar[keep].drop_duplicates("event_id").copy()
+            drop_cols = [column for column in quote_ivar.columns if column != "event_id"]
+            out = out.drop(columns=[column for column in drop_cols if column in out]).merge(
+                quote_ivar,
+                on="event_id",
+                how="left",
+            )
+    return out
 
 
 NORMALIZED_FEATURE_BASE_COLUMNS = [
@@ -6396,6 +7515,7 @@ def run_research_features(
         features = features.drop(
             columns=[column for column in keep if column != "event_id" and column in features]
         ).merge(market_second[keep].drop_duplicates("event_id"), on="event_id", how="left")
+    features = merge_quote_execution_diagnostics(features, config)
     if "universe_rank" in features.columns:
         rank = pd.to_numeric(features["universe_rank"], errors="coerce")
         features["liquidity_bucket"] = pd.qcut(
@@ -6597,16 +7717,92 @@ def _write_tuning_artifacts(
     }
 
 
+def _load_reusable_tuning_state(
+    out_dir: Path,
+    *,
+    tuning_profile: TuningProfile,
+    tuning_seed: int,
+    feature_schema_version: str,
+) -> tuple[TuningState, bool, str | None]:
+    selected_path = out_dir / "tuning_selected_params.json"
+    if not selected_path.exists():
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "missing_tuning_selected_params",
+        )
+    try:
+        payload = json.loads(selected_path.read_text())
+    except json.JSONDecodeError:
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "invalid_tuning_selected_params_json",
+        )
+    if str(payload.get("tuning_profile")) != tuning_profile:
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "tuning_profile_mismatch",
+        )
+    if int(payload.get("tuning_seed", -1)) != int(tuning_seed):
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "tuning_seed_mismatch",
+        )
+    if str(payload.get("feature_schema_version")) != feature_schema_version:
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "feature_schema_version_mismatch",
+        )
+    selected = payload.get("selected_params")
+    if not isinstance(selected, dict) or not selected:
+        return (
+            TuningState(profile=tuning_profile, seed=tuning_seed),
+            False,
+            "missing_selected_params",
+        )
+    trials_path = out_dir / "tuning_trials.csv"
+    trial_records: list[dict[str, object]] = []
+    if trials_path.exists():
+        trials = pd.read_csv(trials_path)
+        if "feature_schema_version" in trials.columns:
+            trials = trials.loc[
+                trials["feature_schema_version"].astype(str).eq(feature_schema_version)
+            ]
+        if "tuning_profile" in trials.columns:
+            trials = trials.loc[trials["tuning_profile"].astype(str).eq(tuning_profile)]
+        drop_columns = [
+            column
+            for column in ("feature_schema_version", "tuning_profile")
+            if column in trials.columns
+        ]
+        trial_records = trials.drop(columns=drop_columns).to_dict(orient="records")
+    return (
+        TuningState(
+            profile=tuning_profile,
+            seed=tuning_seed,
+            selected_params=cast(dict[str, dict[str, object]], selected),
+            trial_records=trial_records,
+        ),
+        True,
+        str(selected_path),
+    )
+
+
 def run_research_models(
     config: ProjectConfig,
     *,
     sequence_suite: str = "all",
     mamba_backend: str = "mamba_ssm",
-    mamba_seeds: Sequence[int] = (17,),
+    mamba_seeds: Sequence[int] = TUNING_SEQUENCE_ENSEMBLE_SEEDS,
     bootstrap_iter: int = 200,
     tuning_profile: TuningProfile = "tuned_phase1",
     tuning_seed: int = 17,
     feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    reuse_tuning_params: bool = False,
 ) -> ProxyResearchResult:
     feature_schema_version = validate_feature_schema_version(feature_schema_version)
     paths = research_paths(config)
@@ -6660,10 +7856,21 @@ def run_research_models(
     if tuning_profile not in TUNING_PROFILES:
         raise ValueError(f"unsupported tuning_profile: {tuning_profile}")
     model_ids = _model_ids_for_sequence_suite(sequence_suite, tuning_profile=tuning_profile)
-    tuning_state = TuningState(profile=tuning_profile, seed=tuning_seed)
+    if reuse_tuning_params:
+        tuning_state, reused_tuning_params, tuning_reuse_source = _load_reusable_tuning_state(
+            paths.modeling_artifacts_dir,
+            tuning_profile=tuning_profile,
+            tuning_seed=tuning_seed,
+            feature_schema_version=feature_schema_version,
+        )
+    else:
+        tuning_state = TuningState(profile=tuning_profile, seed=tuning_seed)
+        reused_tuning_params = False
+        tuning_reuse_source = None
     for target_id in _target_ids_for_sequence_suite(sequence_suite):
         if target_id not in available_targets:
             continue
+        print(f"[research] target start: {target_id}", flush=True)
         target_frame = prepare_target_frame(features, target_id=target_id)
         predictions_one, diagnostics_one = run_proxy_model_suite(
             target_frame,
@@ -6676,7 +7883,10 @@ def run_research_models(
             mamba_seeds=mamba_seeds,
             tuning_state=tuning_state,
             target_id=target_id,
+            log_progress=True,
+            progress_prefix=f"target={target_id}",
         )
+        print(f"[research] target end: {target_id}", flush=True)
         predictions_one["target_id"] = target_id
         predictions_one["feature_schema_version"] = feature_schema_version
         diagnostics_one["target_id"] = target_id
@@ -6735,6 +7945,9 @@ def run_research_models(
             "bootstrap_iter": bootstrap_iter,
             "tuning_profile": tuning_profile,
             "tuning_seed": tuning_seed,
+            "reuse_tuning_params": reuse_tuning_params,
+            "reused_tuning_params": reused_tuning_params,
+            "tuning_reuse_source": tuning_reuse_source,
             "feature_schema_version": feature_schema_version,
             "feature_matrix_manifest": feature_manifest,
             "event_model_feature_count": len(event_features),
@@ -6765,11 +7978,12 @@ def run_research_report(config: ProjectConfig) -> ProxyResearchResult:
         reports_dir=paths.modeling_reports_dir,
         figure_paths=figure_paths,
     )
+    completion_outputs = build_completion_gap_audit(paths)
     return ProxyResearchResult(
         ok=True,
         stage="report",
-        outputs={"proxy_research_report": str(report_path), **figure_paths},
-        diagnostics={"figures": len(figure_paths)},
+        outputs={"proxy_research_report": str(report_path), **figure_paths, **completion_outputs},
+        diagnostics={"figures": len(figure_paths), "completion_gap_audit": True},
     )
 
 
@@ -6782,11 +7996,12 @@ def run_proxy_research_package(
     allow_high_sequence_risk: bool = False,
     sequence_suite: str = "all",
     mamba_backend: str = "mamba_ssm",
-    mamba_seeds: Sequence[int] = (17,),
+    mamba_seeds: Sequence[int] = TUNING_SEQUENCE_ENSEMBLE_SEEDS,
     bootstrap_iter: int = 200,
     tuning_profile: TuningProfile = "tuned_phase1",
     tuning_seed: int = 17,
     feature_schema_version: str = DEFAULT_FEATURE_SCHEMA_VERSION,
+    reuse_tuning_params: bool = False,
 ) -> dict[str, object]:
     feature_schema_version = validate_feature_schema_version(feature_schema_version)
     if stage not in {"all", "sequence-audit", "features", "models", "report"}:
@@ -6839,6 +8054,7 @@ def run_proxy_research_package(
                 tuning_profile=tuning_profile,
                 tuning_seed=tuning_seed,
                 feature_schema_version=feature_schema_version,
+                reuse_tuning_params=reuse_tuning_params,
             )
         else:
             result = run_research_report(config)
@@ -6857,6 +8073,7 @@ def run_proxy_research_package(
         "bootstrap_iter": bootstrap_iter,
         "tuning_profile": tuning_profile,
         "tuning_seed": tuning_seed,
+        "reuse_tuning_params": reuse_tuning_params,
         "feature_schema_version": feature_schema_version,
         "steps": steps,
     }

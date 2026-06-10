@@ -48,8 +48,16 @@ from earnings_event_vol.models import (
     prediction_column_for_model,
     run_model_suite,
 )
-from earnings_event_vol.quote_execution import extract_quote_execution_panel
-from earnings_event_vol.research import remove_model_level_csv_artifacts, run_proxy_research_package
+from earnings_event_vol.quote_execution import (
+    QUOTE_SOURCE_FLAT_FILE,
+    QUOTE_SOURCE_REST,
+    extract_quote_execution_panel,
+)
+from earnings_event_vol.research import (
+    TUNING_SEQUENCE_ENSEMBLE_SEEDS,
+    remove_model_level_csv_artifacts,
+    run_proxy_research_package,
+)
 from earnings_event_vol.schemas import EarningsEvent, OptionRight, OptionSide, TradeLeg
 from earnings_event_vol.variance import (
     TotalVariancePoint,
@@ -222,6 +230,12 @@ def _quote_execution_panel(args: argparse.Namespace, config: ProjectConfig) -> i
         wide_spread_threshold=float(args.wide_spread_threshold),
         max_events=args.max_events,
         aws_executable=args.aws_executable,
+        quote_source=args.quote_source,
+        quote_cache_dir=args.quote_cache_dir,
+        rest_limit=args.quote_rest_limit,
+        quote_workers=args.quote_workers,
+        event_offset=args.event_offset,
+        batch_label=args.batch_label,
     )
     _print_json(report.as_dict())
     return 0 if report.ok else 1
@@ -445,6 +459,23 @@ def _data(args: argparse.Namespace, config: ProjectConfig) -> int:
         universe_top_n=args.universe_top_n,
         universe_trailing_months=args.universe_trailing_months,
         refresh_bronze=args.refresh_bronze,
+        quote_dates=[value.date() for value in _parse_dates(args.quote_date)],
+        quote_metadata_only=not args.quote_run,
+        quote_allow_all_dates=args.quote_allow_all_dates,
+        quote_chunksize=args.quote_chunksize,
+        quote_entry_lookback_seconds=args.quote_entry_lookback_seconds,
+        quote_exit_lookback_seconds=args.quote_exit_lookback_seconds,
+        quote_stale_seconds=args.quote_stale_seconds,
+        quote_wide_spread_threshold=args.quote_wide_spread_threshold,
+        quote_aws_executable=args.quote_aws_executable,
+        quote_source=args.quote_source,
+        quote_cache_dir=args.quote_cache_dir,
+        quote_rest_limit=args.quote_rest_limit,
+        quote_workers=args.quote_workers,
+        quote_event_offset=args.quote_event_offset,
+        quote_batch_label=args.quote_batch_label,
+        quote_merge_batch_labels=parse_text_list(args.quote_merge_batches),
+        quote_merge_include_canonical=not args.quote_merge_exclude_canonical,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -625,6 +656,7 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
         tuning_profile=args.tuning_profile,
         tuning_seed=args.tuning_seed,
         feature_schema_version=args.feature_schema_version,
+        reuse_tuning_params=args.reuse_tuning_params,
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
@@ -759,7 +791,31 @@ def build_parser() -> argparse.ArgumentParser:
     quote_exec.add_argument("--stale-seconds", type=int, default=60)
     quote_exec.add_argument("--wide-spread-threshold", type=float, default=0.25)
     quote_exec.add_argument("--max-events", type=int)
+    quote_exec.add_argument(
+        "--event-offset",
+        type=int,
+        default=0,
+        help="Skip this many ordered events before quote request construction.",
+    )
     quote_exec.add_argument("--aws-executable", default="aws")
+    quote_exec.add_argument(
+        "--quote-source",
+        choices=[QUOTE_SOURCE_REST, QUOTE_SOURCE_FLAT_FILE],
+        default=QUOTE_SOURCE_REST,
+        help=(
+            "Quote ingestion route for live runs; local --quotes-csv still uses "
+            "the CSV fixture route."
+        ),
+    )
+    quote_exec.add_argument("--quote-cache-dir", type=Path)
+    quote_exec.add_argument("--quote-rest-limit", type=int, default=50_000)
+    quote_exec.add_argument(
+        "--quote-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for targeted Massive quote REST windows; cache is still reused.",
+    )
+    quote_exec.add_argument("--batch-label", help="Optional label recorded in the report.")
 
     validate_calendar = subparsers.add_parser("validate-calendar", help="Validate earnings timing.")
     validate_calendar.add_argument("--input", type=Path, required=True)
@@ -829,6 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "all",
             "fixture-audit",
+            "lake-quality-audit",
             "massive-probe",
             "market-covariates",
             "market-second-covariates",
@@ -839,6 +896,8 @@ def build_parser() -> argparse.ArgumentParser:
             "contract-reference-validation",
             "event-window-panel",
             "trade-proxy-panel",
+            "quote-execution-panel",
+            "quote-execution-merge",
         ],
         default="all",
     )
@@ -851,7 +910,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_STATIC_TICKERS),
         help="Ticker list; accepts repeated, comma-separated, or space-separated values.",
     )
-    data.add_argument("--start", default="2022-12-01")
+    data.add_argument("--start", default="2013-01-01")
     data.add_argument("--end", default="2025-12-31")
     data.add_argument("--dates", nargs="*", default=[])
     data.add_argument("--options-day-aggs", type=Path)
@@ -885,6 +944,70 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["option_vwap", "option_close"],
         default="option_vwap",
         help="Trade-proxy option price field from second aggregates.",
+    )
+    data.add_argument(
+        "--quote-date",
+        action="append",
+        help="Restrict quote execution extraction to one date or a comma-separated date list.",
+    )
+    data.add_argument(
+        "--quote-run",
+        action="store_true",
+        help="Stream targeted Massive quotes_v1 rows instead of metadata-only quote planning.",
+    )
+    data.add_argument(
+        "--quote-allow-all-dates",
+        action="store_true",
+        help="Allow a quote stream over every requested event date; use only for controlled runs.",
+    )
+    data.add_argument("--quote-chunksize", type=int, default=250_000)
+    data.add_argument("--quote-entry-lookback-seconds", type=int, default=900)
+    data.add_argument("--quote-exit-lookback-seconds", type=int, default=900)
+    data.add_argument("--quote-stale-seconds", type=int, default=60)
+    data.add_argument("--quote-wide-spread-threshold", type=float, default=0.25)
+    data.add_argument("--quote-aws-executable", default="aws")
+    data.add_argument(
+        "--quote-source",
+        choices=[QUOTE_SOURCE_REST, QUOTE_SOURCE_FLAT_FILE],
+        default=QUOTE_SOURCE_REST,
+        help="Quote ingestion route for --quote-run.",
+    )
+    data.add_argument("--quote-cache-dir", type=Path)
+    data.add_argument("--quote-rest-limit", type=int, default=50_000)
+    data.add_argument(
+        "--quote-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for targeted Massive quote REST windows when --quote-run is used.",
+    )
+    data.add_argument(
+        "--quote-event-offset",
+        type=int,
+        default=0,
+        help="Skip this many ordered events before quote request construction.",
+    )
+    data.add_argument(
+        "--quote-batch-label",
+        help=(
+            "Write quote-execution outputs to batch-specific artifact/lake paths "
+            "instead of overwriting canonical quote-execution lake outputs."
+        ),
+    )
+    data.add_argument(
+        "--quote-merge-batch",
+        dest="quote_merge_batches",
+        action="append",
+        default=[],
+        help=(
+            "Batch label to consolidate into canonical quote-execution outputs; "
+            "repeat or pass comma/space-separated labels. If omitted, existing "
+            "batch directories are discovered."
+        ),
+    )
+    data.add_argument(
+        "--quote-merge-exclude-canonical",
+        action="store_true",
+        help="When stage=quote-execution-merge, consolidate only batch shards.",
     )
 
     build_features = subparsers.add_parser(
@@ -938,7 +1061,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sequence diagnostics to run; use none to skip sequence models.",
     )
     research.add_argument("--mamba-backend", choices=["mamba_ssm"], default="mamba_ssm")
-    research.add_argument("--mamba-seeds", default="17")
+    research.add_argument(
+        "--mamba-seeds",
+        default=",".join(str(seed) for seed in TUNING_SEQUENCE_ENSEMBLE_SEEDS),
+    )
     research.add_argument("--bootstrap-iter", type=int, default=200)
     research.add_argument(
         "--tuning-profile",
@@ -947,6 +1073,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     research.add_argument("--tuning-seed", type=int, default=17)
+    research.add_argument(
+        "--reuse-tuning-params",
+        action="store_true",
+        help=(
+            "Reuse existing locked tuning_selected_params when schema/profile/seed match; "
+            "intended for fast artifact refreshes, not full canonical retuning."
+        ),
+    )
     research.add_argument(
         "--feature-schema-version",
         choices=list(FEATURE_SCHEMA_VERSIONS),

@@ -85,6 +85,42 @@ def _parquet_is_usable(path: Path, *, required_columns: set[str]) -> bool:
     return required_columns.issubset(set(schema.names()))
 
 
+def _bool_column(frame: pd.DataFrame, column: str, default: bool = False) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(default, index=frame.index)
+    return frame[column].fillna(default).astype(bool)
+
+
+def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(pd.NA, index=frame.index, dtype="Float64")
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def _contract_reference_proxy_mask(contracts: pd.DataFrame) -> pd.Series:
+    validated = _bool_column(contracts, "contract_reference_validated")
+    status = (
+        contracts["contract_reference_status"].astype(str)
+        if "contract_reference_status" in contracts.columns
+        else pd.Series("", index=contracts.index)
+    )
+    discovery_status = (
+        contracts["contract_discovery_status_pre_reference"].astype(str)
+        if "contract_discovery_status_pre_reference" in contracts.columns
+        else contracts.get("contract_discovery_status", pd.Series("", index=contracts.index))
+        .fillna("")
+        .astype(str)
+    )
+    adjusted = _bool_column(contracts, "contract_reference_has_adjusted_deliverable")
+    option_multiplier = _numeric_column(contracts, "option_multiplier")
+    contract_size = _numeric_column(contracts, "contract_size")
+    standard_size = option_multiplier.eq(100) | contract_size.eq(100)
+    reference_missing = status.isin({"missing_reference", "not_requested"})
+    discovery_standard = discovery_status.eq("ok")
+    fallback = reference_missing & discovery_standard & standard_size & ~adjusted
+    return validated | fallback
+
+
 def _safe_partition_value(value: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in value)
 
@@ -792,15 +828,20 @@ def build_trade_proxy_panel(
         keep_events = windows["event_id"].head(max_events).tolist()
         windows = windows.loc[windows["event_id"].isin(keep_events)].copy()
         contracts = contracts.loc[contracts["event_id"].isin(keep_events)].copy()
-    eligible_for_quote_pool = contracts["eligible_for_quote_pool"].astype(bool)
-    ivar_support_only = (
-        contracts["is_ivar_support_only"].astype(bool)
-        if "is_ivar_support_only" in contracts
-        else pd.Series(False, index=contracts.index)
-    )
+    validated_reference = _bool_column(contracts, "contract_reference_validated")
+    reference_proxy_usable = _contract_reference_proxy_mask(contracts)
+    contracts["contract_reference_proxy_usable"] = reference_proxy_usable
+    contracts["contract_reference_proxy_source"] = "excluded"
+    contracts.loc[validated_reference, "contract_reference_proxy_source"] = "validated_reference"
+    contracts.loc[
+        reference_proxy_usable & ~validated_reference,
+        "contract_reference_proxy_source",
+    ] = "missing_reference_standard_contract_fallback"
+    reference_proxy_counts = Counter(contracts["contract_reference_proxy_source"].astype(str))
+    eligible_for_quote_pool = _bool_column(contracts, "eligible_for_quote_pool")
+    ivar_support_only = _bool_column(contracts, "is_ivar_support_only")
     contracts = contracts.loc[
-        (eligible_for_quote_pool | ivar_support_only)
-        & contracts["contract_reference_validated"].astype(bool)
+        (eligible_for_quote_pool | ivar_support_only) & reference_proxy_usable
     ].copy()
     contracts = contracts.merge(
         windows[["event_id", "event_entry_timestamp", "s_before", "s_after", "rvar_event"]],
@@ -827,9 +868,11 @@ def build_trade_proxy_panel(
     iv_estimates = attach_trade_proxy_local_iv(proxy_prices, windows)
     ivar_inputs = build_trade_proxy_ivar_inputs(iv_estimates, windows)
     panel = extract_trade_proxy_event_panel(ivar_inputs, windows)
-    trade_iv_estimates = iv_estimates.loc[
-        iv_estimates["eligible_for_quote_pool"].astype(bool)
-    ].copy()
+    trade_iv_estimates = (
+        iv_estimates.loc[iv_estimates["eligible_for_quote_pool"].astype(bool)].copy()
+        if "eligible_for_quote_pool" in iv_estimates.columns
+        else iv_estimates.iloc[0:0].copy()
+    )
     selected_straddles = build_proxy_straddle_diagnostics(
         trade_iv_estimates,
         windows,
@@ -901,6 +944,14 @@ def build_trade_proxy_panel(
     )
     report["pipeline_params"] = params
     report["second_agg_buffer_minutes"] = second_agg_buffer_minutes
+    report["contract_reference_proxy_source_counts"] = {
+        str(key): int(value) for key, value in reference_proxy_counts.items()
+    }
+    report["contract_reference_proxy_policy"] = (
+        "validated references are preferred; missing_reference/not_requested contracts are "
+        "allowed only when the discovery-stage contract was standard, size is 100, and no "
+        "adjusted deliverable was observed"
+    )
     report["bronze_second_aggregate_cache"] = {
         "dataset": "options_second_aggs",
         "root": str(config.bronze_data_dir / "massive" / "options_second_aggs"),

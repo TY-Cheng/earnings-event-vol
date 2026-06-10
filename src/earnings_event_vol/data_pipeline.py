@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pandas as pd
@@ -52,6 +53,11 @@ from earnings_event_vol.massive import (
     massive_flat_file_manifest,
     option_flat_file_key,
     underlying_flat_file_key,
+)
+from earnings_event_vol.quote_execution import (
+    QUOTE_SOURCE_FLAT_FILE,
+    QUOTE_SOURCE_REST,
+    extract_quote_execution_panel,
 )
 from earnings_event_vol.trade_proxy import (
     ENTRY_PRICE_METHOD_PRECLOSE_WINDOW_VWAP,
@@ -101,6 +107,7 @@ DEFAULT_TRADE_PROXY_HAIRCUT_FRACTION = 0.10
 SUPPORTED_DATA_STAGES = {
     "all",
     "fixture-audit",
+    "lake-quality-audit",
     "massive-probe",
     "options-day-aggs-bulk",
     "market-covariates",
@@ -111,6 +118,8 @@ SUPPORTED_DATA_STAGES = {
     "event-window-panel",
     "contract-reference-validation",
     "trade-proxy-panel",
+    "quote-execution-panel",
+    "quote-execution-merge",
 }
 
 ACTIVE_PROXY_DATA_DAG = (
@@ -121,6 +130,7 @@ ACTIVE_PROXY_DATA_DAG = (
     "event-window-panel",
     "contract-reference-validation",
     "trade-proxy-panel",
+    "quote-execution-panel",
 )
 
 
@@ -262,6 +272,142 @@ def _read_universe_source(path: Path) -> pd.DataFrame:
 def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pl.from_pandas(frame).write_parquet(path, compression="zstd")
+
+
+def _write_parquet_from_csv(csv_path: Path, parquet_path: Path) -> int:
+    frame = pd.read_csv(csv_path)
+    _write_parquet(parquet_path, frame)
+    return int(len(frame))
+
+
+QUOTE_EXECUTION_DATASET_FILES: dict[str, tuple[str, str, str]] = {
+    "bronze_quote_window_requests": (
+        "bronze",
+        "quote_window_requests.parquet",
+        "quote_window_requests.csv",
+    ),
+    "bronze_quote_window_quotes": (
+        "bronze",
+        "quote_window_quotes.parquet",
+        "quote_window_quotes.csv",
+    ),
+    "silver_quote_window_marks": (
+        "silver",
+        "quote_window_marks.parquet",
+        "quote_window_marks.csv",
+    ),
+    "silver_quote_execution_legs": (
+        "silver",
+        "quote_execution_legs.parquet",
+        "quote_execution_legs.csv",
+    ),
+    "gold_quote_straddle_execution": (
+        "gold",
+        "quote_straddle_execution.parquet",
+        "quote_straddle_execution.csv",
+    ),
+    "gold_quote_ivar_event": (
+        "gold",
+        "quote_ivar_event.parquet",
+        "quote_ivar_event.csv",
+    ),
+    "gold_quote_iv_surface": (
+        "gold",
+        "quote_iv_surface.parquet",
+        "quote_iv_surface.csv",
+    ),
+    "gold_quote_iv_surface_summary": (
+        "gold",
+        "quote_iv_surface_summary.parquet",
+        "quote_iv_surface_summary.csv",
+    ),
+    "gold_quote_surface_ivar_event": (
+        "gold",
+        "quote_surface_ivar_event.parquet",
+        "quote_surface_ivar_event.csv",
+    ),
+    "gold_quote_execution_confidence": (
+        "gold",
+        "quote_execution_confidence.parquet",
+        "quote_execution_confidence.csv",
+    ),
+}
+
+QUOTE_EXECUTION_DEDUPE_KEYS: dict[str, tuple[str, ...]] = {
+    "bronze_quote_window_requests": (
+        "event_id",
+        "options_ticker",
+        "window_label",
+        "window_start",
+        "window_end",
+    ),
+    "bronze_quote_window_quotes": (
+        "event_id",
+        "options_ticker",
+        "window_label",
+        "quote_timestamp_et",
+        "bid",
+        "ask",
+    ),
+    "silver_quote_window_marks": ("event_id", "options_ticker", "window_label"),
+    "silver_quote_execution_legs": ("event_id", "options_ticker", "window_label"),
+    "gold_quote_straddle_execution": ("event_id", "expiration", "strike"),
+    "gold_quote_ivar_event": ("event_id",),
+    "gold_quote_iv_surface": ("event_id", "options_ticker", "expiration", "strike", "right"),
+    "gold_quote_iv_surface_summary": ("event_id", "expiration", "strike"),
+    "gold_quote_surface_ivar_event": ("event_id",),
+    "gold_quote_execution_confidence": ("event_id",),
+}
+
+
+def _normalize_quote_batch_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+    normalized = str(label).strip()
+    if not normalized:
+        return None
+    if not all(ch.isalnum() or ch in {"_", "-"} for ch in normalized):
+        raise ValueError("quote_batch_label must contain only letters, numbers, '_' or '-'.")
+    return normalized
+
+
+def _quote_execution_lake_paths(
+    config: ProjectConfig, *, batch_label: str | None = None
+) -> dict[str, Path]:
+    normalized_batch_label = _normalize_quote_batch_label(batch_label)
+    roots = {
+        "bronze": config.bronze_data_dir / "massive" / "quotes_v1_target_windows",
+        "silver": config.silver_data_dir / "quote_execution",
+        "gold": config.gold_data_dir / "quote_execution",
+    }
+    if normalized_batch_label is not None:
+        batch_partition = f"batch={normalized_batch_label}"
+        roots = {layer: root / "batches" / batch_partition for layer, root in roots.items()}
+    return {
+        dataset_id: roots[layer] / parquet_name
+        for dataset_id, (layer, parquet_name, _csv_name) in QUOTE_EXECUTION_DATASET_FILES.items()
+    }
+
+
+def _quote_execution_artifact_paths(
+    out_root: Path, *, batch_label: str | None = None
+) -> dict[str, Path]:
+    normalized_batch_label = _normalize_quote_batch_label(batch_label)
+    root = out_root / "quote_execution_panel"
+    if normalized_batch_label is not None:
+        root = root / "batches" / normalized_batch_label
+    return {
+        dataset_id: root / csv_name
+        for dataset_id, (_layer, _parquet_name, csv_name) in QUOTE_EXECUTION_DATASET_FILES.items()
+    }
+
+
+def _quote_execution_artifact_root(out_root: Path, *, batch_label: str | None = None) -> Path:
+    normalized_batch_label = _normalize_quote_batch_label(batch_label)
+    root = out_root / "quote_execution_panel"
+    if normalized_batch_label is not None:
+        root = root / "batches" / normalized_batch_label
+    return root
 
 
 def _market_covariates_step(
@@ -2055,6 +2201,508 @@ def _frame_value_counts(frame: pd.DataFrame, column: str) -> dict[str, int]:
     return {str(key): int(value) for key, value in counts.items()}
 
 
+def _parquet_row_count(path: Path) -> int | None:
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    try:
+        return int(pl.scan_parquet(str(path)).select(pl.len()).collect().item())
+    except Exception:
+        return None
+
+
+def _extract_date_bounds(
+    frame: pd.DataFrame,
+    candidate_columns: Sequence[str],
+) -> tuple[str | None, date | None, date | None, int]:
+    for column in candidate_columns:
+        if column not in frame.columns:
+            continue
+        values = pd.to_datetime(frame[column], errors="coerce", utc=True)
+        valid = values.dropna()
+        if valid.empty:
+            continue
+        return (
+            column,
+            valid.min().date(),
+            valid.max().date(),
+            int(valid.notna().sum()),
+        )
+    return None, None, None, 0
+
+
+def _target_coverage_status(
+    *,
+    exists: bool,
+    first_date: date | None,
+    last_date: date | None,
+    target_start: date,
+    target_end: date,
+    available_partitions: int | None = None,
+    expected_partitions: int | None = None,
+) -> tuple[str, str | None, float | None]:
+    if not exists:
+        return "missing", "dataset_path_missing", 0.0
+    if expected_partitions is None or expected_partitions <= 0 or available_partitions is None:
+        partition_coverage = None
+    else:
+        partition_coverage = float(available_partitions / max(1, expected_partitions))
+    if first_date is None or last_date is None:
+        return "exists_no_date_bounds", "no_auditable_date_column", partition_coverage
+    if first_date <= target_start and last_date >= target_end:
+        if partition_coverage is not None and partition_coverage < 0.95:
+            return (
+                "span_ok_partition_gap",
+                "date_span_covers_target_but_partitions_incomplete",
+                partition_coverage,
+            )
+        return "target_span_covered", None, partition_coverage
+    missing: list[str] = []
+    if first_date > target_start:
+        missing.append("history_starts_after_target")
+    if last_date < target_end:
+        missing.append("history_ends_before_target")
+    return "target_span_incomplete", ",".join(missing), partition_coverage
+
+
+def _lake_dataset_row(
+    *,
+    dataset_id: str,
+    layer: str,
+    path: Path,
+    target_start: date,
+    target_end: date,
+    date_columns: Sequence[str],
+    required_for_2013_2025: bool,
+    paper_grade_requirement: str,
+    note: str,
+    partitioned_by_date: bool = False,
+    expected_weekday_partitions: int | None = None,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    exists = path.exists()
+    row_count: int | None = None
+    event_count: int | None = None
+    ticker_count: int | None = None
+    partition_count: int | None = None
+    first_date: date | None = None
+    last_date: date | None = None
+    date_column: str | None = None
+    date_non_null_rows = 0
+    year_rows: list[dict[str, object]] = []
+    read_status = "missing" if not exists else "ok"
+    read_error: str | None = None
+
+    if exists and partitioned_by_date:
+        files = sorted(path.rglob("*.parquet")) if path.is_dir() else [path]
+        partition_dates = sorted(
+            {value for file in files if (value := _date_partition_value(file)) is not None}
+        )
+        partition_count = len(partition_dates)
+        if partition_dates:
+            first_date = partition_dates[0]
+            last_date = partition_dates[-1]
+            date_column = "date_partition"
+        available_by_year = Counter(value.year for value in partition_dates)
+        expected_by_year = Counter(value.year for value in _weekday_dates(target_start, target_end))
+        for year in range(target_start.year, target_end.year + 1):
+            expected = int(expected_by_year.get(year, 0))
+            available = int(available_by_year.get(year, 0))
+            year_rows.append(
+                {
+                    "dataset_id": dataset_id,
+                    "year": year,
+                    "available_rows_or_partitions": available,
+                    "expected_weekday_partitions": expected,
+                    "coverage_share": float(available / max(1, expected)) if expected else None,
+                }
+            )
+    elif exists:
+        try:
+            if path.suffix == ".parquet":
+                row_count = _parquet_row_count(path)
+                frame = pd.read_parquet(path)
+            elif path.suffix == ".csv":
+                frame = pd.read_csv(path)
+                row_count = int(len(frame))
+            else:
+                frame = pd.DataFrame()
+                read_status = "exists_unread_date_not_applicable"
+            if not frame.empty:
+                if row_count is None:
+                    row_count = int(len(frame))
+                date_column, first_date, last_date, date_non_null_rows = _extract_date_bounds(
+                    frame,
+                    date_columns,
+                )
+                if "event_id" in frame.columns:
+                    event_count = int(frame["event_id"].nunique(dropna=True))
+                if "ticker" in frame.columns:
+                    ticker_count = int(frame["ticker"].nunique(dropna=True))
+                if date_column is not None:
+                    dates = pd.to_datetime(frame[date_column], errors="coerce", utc=True).dropna()
+                    counts = Counter(int(value.year) for value in dates)
+                    for year in range(target_start.year, target_end.year + 1):
+                        year_rows.append(
+                            {
+                                "dataset_id": dataset_id,
+                                "year": year,
+                                "available_rows_or_partitions": int(counts.get(year, 0)),
+                                "expected_weekday_partitions": None,
+                                "coverage_share": None,
+                            }
+                        )
+        except Exception as exc:
+            read_status = "read_failed"
+            read_error = safe_exception_text(exc)
+
+    expected_partitions = expected_weekday_partitions if partitioned_by_date else None
+    coverage_status, gap_reason, partition_coverage = _target_coverage_status(
+        exists=exists,
+        first_date=first_date,
+        last_date=last_date,
+        target_start=target_start,
+        target_end=target_end,
+        available_partitions=partition_count,
+        expected_partitions=expected_partitions,
+    )
+    row = {
+        "dataset_id": dataset_id,
+        "layer": layer,
+        "path": str(path),
+        "exists": bool(exists),
+        "read_status": read_status,
+        "read_error": read_error,
+        "row_count": row_count,
+        "event_count": event_count,
+        "ticker_count": ticker_count,
+        "partition_count": partition_count,
+        "date_column": date_column,
+        "date_non_null_rows": date_non_null_rows,
+        "first_date": first_date.isoformat() if first_date else None,
+        "last_date": last_date.isoformat() if last_date else None,
+        "target_start": target_start.isoformat(),
+        "target_end": target_end.isoformat(),
+        "target_coverage_status": coverage_status,
+        "gap_reason": gap_reason,
+        "required_for_2013_2025": bool(required_for_2013_2025),
+        "paper_grade_requirement": paper_grade_requirement,
+        "expected_weekday_partitions": expected_partitions,
+        "partition_coverage_share": partition_coverage,
+        "note": note,
+    }
+    return row, pd.DataFrame(year_rows)
+
+
+def _lake_quality_audit_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+    target_start: date,
+    target_end: date,
+) -> DataPipelineStep:
+    out = out_root / "lake_quality_audit"
+    coverage_path = out / "lake_dataset_coverage.csv"
+    year_path = out / "lake_year_coverage.csv"
+    report_path = out / "lake_quality_report.json"
+    outputs = (coverage_path, year_path, report_path)
+    params = {
+        "stage": "lake-quality-audit",
+        "target_start": target_start.isoformat(),
+        "target_end": target_end.isoformat(),
+        "data_dir": str(config.data_dir),
+        "artifacts_dir": str(config.artifacts_dir),
+    }
+    if not force and _complete_with_params(
+        outputs,
+        params_path=report_path,
+        expected_params=params,
+    ):
+        return DataPipelineStep(
+            "lake-quality-audit",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    expected_weekdays = len(_weekday_dates(target_start, target_end))
+    dataset_specs = [
+        {
+            "dataset_id": "bronze_options_day_aggs",
+            "layer": "bronze",
+            "path": config.bronze_data_dir / "massive" / "options_day_aggs",
+            "date_columns": ("source_date", "date", "quote_date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "historical option chain daily aggregates for universe, contract discovery, "
+                "proxy IV surfaces"
+            ),
+            "note": (
+                "Partition-level audit; row counts intentionally skipped to keep the audit fast."
+            ),
+            "partitioned_by_date": True,
+            "expected_weekday_partitions": expected_weekdays,
+        },
+        {
+            "dataset_id": "bronze_underlying_day_aggs",
+            "layer": "bronze",
+            "path": config.bronze_data_dir / "massive" / "underlying_day_aggs",
+            "date_columns": ("source_date", "date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "underlying daily bars for event returns and universe construction"
+            ),
+            "note": (
+                "Partition-level audit; row counts intentionally skipped to keep the audit fast."
+            ),
+            "partitioned_by_date": True,
+            "expected_weekday_partitions": expected_weekdays,
+        },
+        {
+            "dataset_id": "bronze_quote_target_windows",
+            "layer": "bronze",
+            "path": config.bronze_data_dir
+            / "massive"
+            / "quotes_v1_target_windows"
+            / "quote_window_quotes.parquet",
+            "date_columns": ("quote_date", "quote_timestamp_et"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "matched targeted quote rows for quote-aware execution diagnostics"
+            ),
+            "note": "Target-window normalized quote subset only; not full-day raw quote storage.",
+        },
+        {
+            "dataset_id": "silver_earnings_calendar",
+            "layer": "silver",
+            "path": config.silver_data_dir / "earnings_calendar" / "main_sample.parquet",
+            "date_columns": ("announcement_date", "entry_date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "SEC/text-validated event calendar over the target study window"
+            ),
+            "note": "Main-sample events after dynamic universe and timing filters.",
+        },
+        {
+            "dataset_id": "silver_event_windows",
+            "layer": "silver",
+            "path": config.silver_data_dir / "event_windows" / "event_windows.parquet",
+            "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "event-aligned entry/exit windows and contract candidates",
+            "note": "One event row per retained earnings event.",
+        },
+        {
+            "dataset_id": "silver_contract_candidates",
+            "layer": "silver",
+            "path": config.silver_data_dir / "contracts" / "event_contract_candidates.parquet",
+            "date_columns": ("entry_date", "announcement_date", "quote_date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "validated option candidate contracts for every retained event"
+            ),
+            "note": "Contract-level candidate table after DTE and reference validation gates.",
+        },
+        {
+            "dataset_id": "silver_trade_proxy_prices",
+            "layer": "silver",
+            "path": config.silver_data_dir / "trade_proxy" / "trade_proxy_option_prices.parquet",
+            "date_columns": ("entry_date", "quote_date", "timestamp_et", "event_entry_timestamp"),
+            "required_for_2013_2025": False,
+            "paper_grade_requirement": (
+                "diagnostic no-NBBO trade-proxy entry marks, not quote execution"
+            ),
+            "note": "Useful for proxy research, insufficient for bid/ask or NBBO claims.",
+        },
+        {
+            "dataset_id": "silver_quote_window_marks",
+            "layer": "silver",
+            "path": config.silver_data_dir / "quote_execution" / "quote_window_marks.parquet",
+            "date_columns": ("quote_date", "quote_timestamp_et", "window_start"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "selected bid/ask quote marks for every event leg/window",
+            "note": "Bounded quote slice should be nonzero; full sample remains the target.",
+        },
+        {
+            "dataset_id": "silver_quote_execution_legs",
+            "layer": "silver",
+            "path": config.silver_data_dir / "quote_execution" / "quote_execution_legs.parquet",
+            "date_columns": ("quote_date", "quote_timestamp_et", "window_start"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "leg-level bid/ask execution diagnostics",
+            "note": "Bounded quote slice should be nonzero; full sample remains the target.",
+        },
+        {
+            "dataset_id": "gold_trade_proxy_event_panel",
+            "layer": "gold",
+            "path": config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet",
+            "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
+            "required_for_2013_2025": False,
+            "paper_grade_requirement": (
+                "no-NBBO proxy event panel; paper-grade execution requires quote/NBBO replacement"
+            ),
+            "note": "Current canonical modeling input is explicitly a no-NBBO trade proxy.",
+        },
+        {
+            "dataset_id": "gold_feature_matrix",
+            "layer": "gold",
+            "path": config.gold_data_dir / "modeling" / "feature_matrix.parquet",
+            "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "modeling features over the final target event sample",
+            "note": "Analysis-only quote fields must remain excluded from model features.",
+        },
+        {
+            "dataset_id": "gold_quote_straddle_execution",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_straddle_execution.parquet",
+            "date_columns": (
+                "entry_quote_date",
+                "exit_quote_date",
+                "quote_date",
+                "entry_date",
+                "announcement_date",
+                "exit_date",
+            ),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "straddle-level bid/ask execution diagnostics",
+            "note": "Bounded quote slice should be nonzero; full sample remains the target.",
+        },
+        {
+            "dataset_id": "gold_quote_ivar_event",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_ivar_event.parquet",
+            "date_columns": ("entry_date", "announcement_date", "quote_date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "quote-based event IVAR or explicitly diagnostic quote premium proxy"
+            ),
+            "note": "Current quote-IVAR remains a diagnostic premium-total-variance proxy.",
+        },
+        {
+            "dataset_id": "gold_quote_iv_surface",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_iv_surface.parquet",
+            "date_columns": ("entry_date", "announcement_date", "expiration"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "bounded quote-derived leg-level Black-Scholes IV diagnostics"
+            ),
+            "note": (
+                "Bounded targeted diagnostic; not a complete historical NBBO-equivalent surface."
+            ),
+        },
+        {
+            "dataset_id": "gold_quote_iv_surface_summary",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_iv_surface_summary.parquet",
+            "date_columns": ("entry_date", "announcement_date", "expiration"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "call-put quote-IV surface-pair diagnostics",
+            "note": (
+                "Pairs entry-window quote IVs by event, expiry, and strike for bounded diagnostics."
+            ),
+        },
+        {
+            "dataset_id": "gold_quote_surface_ivar_event",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_surface_ivar_event.parquet",
+            "date_columns": ("entry_date", "announcement_date", "expiration_1", "expiration_2"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": "event-IVAR extracted from quote-IV total variance pairs",
+            "note": (
+                "Surface-IVAR diagnostic over bounded targeted quotes; full historical coverage "
+                "and NBBO validation remain required."
+            ),
+        },
+        {
+            "dataset_id": "gold_quote_execution_confidence",
+            "layer": "gold",
+            "path": config.gold_data_dir / "quote_execution" / "quote_execution_confidence.parquet",
+            "date_columns": ("entry_date", "announcement_date", "quote_date"),
+            "required_for_2013_2025": True,
+            "paper_grade_requirement": (
+                "event-level execution-confidence bands over the final target event sample"
+            ),
+            "note": "Used for quote-confidence stratified strategy and casebook diagnostics.",
+        },
+    ]
+    rows: list[dict[str, object]] = []
+    year_frames: list[pd.DataFrame] = []
+    for spec in dataset_specs:
+        row, years = _lake_dataset_row(
+            dataset_id=str(spec["dataset_id"]),
+            layer=str(spec["layer"]),
+            path=cast(Path, spec["path"]),
+            target_start=target_start,
+            target_end=target_end,
+            date_columns=cast(Sequence[str], spec["date_columns"]),
+            required_for_2013_2025=bool(spec["required_for_2013_2025"]),
+            paper_grade_requirement=str(spec["paper_grade_requirement"]),
+            note=str(spec["note"]),
+            partitioned_by_date=bool(spec.get("partitioned_by_date", False)),
+            expected_weekday_partitions=cast(int | None, spec.get("expected_weekday_partitions")),
+        )
+        rows.append(row)
+        if not years.empty:
+            year_frames.append(years)
+
+    coverage = pd.DataFrame(rows)
+    year_coverage = (
+        pd.concat(year_frames, ignore_index=True)
+        if year_frames
+        else pd.DataFrame(
+            columns=[
+                "dataset_id",
+                "year",
+                "available_rows_or_partitions",
+                "expected_weekday_partitions",
+                "coverage_share",
+            ]
+        )
+    )
+    out.mkdir(parents=True, exist_ok=True)
+    coverage.to_csv(coverage_path, index=False)
+    year_coverage.to_csv(year_path, index=False)
+    required = coverage.loc[coverage["required_for_2013_2025"].astype(bool)].copy()
+    complete_statuses = {"target_span_covered"}
+    incomplete_required = required.loc[
+        ~required["target_coverage_status"].astype(str).isin(complete_statuses)
+    ]
+    quote_rows = coverage.loc[coverage["dataset_id"].astype(str).str.contains("quote")]
+    report = {
+        "pipeline_params": params,
+        "status": "ran",
+        "ok": bool(incomplete_required.empty),
+        "target_window": {"start": target_start.isoformat(), "end": target_end.isoformat()},
+        "datasets": int(len(coverage)),
+        "required_datasets": int(len(required)),
+        "incomplete_required_datasets": int(len(incomplete_required)),
+        "incomplete_required_dataset_ids": incomplete_required["dataset_id"].astype(str).tolist(),
+        "coverage_status_counts": _frame_value_counts(coverage, "target_coverage_status"),
+        "quote_dataset_rows": int(len(quote_rows)),
+        "paper_grade_execution_ready": False,
+        "paper_grade_execution_blocker": (
+            "requires full-window quote/NBBO or equivalent coverage and quote-IVAR beyond "
+            "the current bounded diagnostic slice"
+        ),
+        "outputs": {
+            "lake_dataset_coverage": str(coverage_path),
+            "lake_year_coverage": str(year_path),
+        },
+    }
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    return DataPipelineStep(
+        "lake-quality-audit",
+        "ran",
+        outputs,
+        metadata={
+            "ok": bool(report["ok"]),
+            "incomplete_required_datasets": int(report["incomplete_required_datasets"]),
+            "coverage_status_counts": report["coverage_status_counts"],
+        },
+    )
+
+
 def _apply_dynamic_universe_membership(
     calendar: pd.DataFrame,
     universe: pd.DataFrame,
@@ -2387,6 +3035,90 @@ def _contract_reference_validation_step(
             reason="no_candidate_option_tickers",
         )
 
+    if not refresh_bronze and reference_path.exists() and reference_path.stat().st_size > 0:
+        try:
+            reference_report = pd.read_parquet(reference_path)
+            if "options_ticker" in reference_report.columns and not reference_report.empty:
+                out.mkdir(parents=True, exist_ok=True)
+                reference_report = reference_report.drop_duplicates(
+                    "options_ticker", keep="last"
+                ).copy()
+                validated = apply_contract_reference_validation(candidates, reference_report)
+                _write_parquet(candidate_path, validated)
+                _write_parquet(reference_path, reference_report)
+                reference_report.to_csv(report_path, index=False)
+                fetch_counts = (
+                    reference_report["fetch_status"].astype(str).value_counts().to_dict()
+                    if "fetch_status" in reference_report
+                    else {}
+                )
+                status_counts = (
+                    reference_report["contract_reference_status"]
+                    .astype(str)
+                    .value_counts()
+                    .to_dict()
+                    if "contract_reference_status" in reference_report
+                    else {}
+                )
+                non_standard_rows = int(
+                    validated["contract_discovery_status"]
+                    .astype(str)
+                    .eq("non_standard_excluded")
+                    .sum()
+                )
+                proxy_usable_rows = int(
+                    validated.get(
+                        "contract_reference_proxy_usable",
+                        pd.Series(False, index=validated.index),
+                    )
+                    .fillna(False)
+                    .astype(bool)
+                    .sum()
+                )
+                manifest = {
+                    "pipeline_params": params,
+                    "status_counts": {str(key): int(value) for key, value in status_counts.items()},
+                    "fetch_status_counts": {
+                        str(key): int(value) for key, value in fetch_counts.items()
+                    },
+                    "candidate_rows": int(len(candidates)),
+                    "candidate_rows_after_validation": int(len(validated)),
+                    "reference_contracts_requested": int(len(reference_report)),
+                    "validated_contracts": int(
+                        reference_report["contract_reference_status"]
+                        .astype(str)
+                        .eq(REFERENCE_STATUS_VALIDATED)
+                        .sum()
+                    )
+                    if "contract_reference_status" in reference_report
+                    else 0,
+                    "proxy_usable_contract_rows": proxy_usable_rows,
+                    "non_standard_excluded_rows": non_standard_rows,
+                    "reused_reference_report": True,
+                    "outputs": [str(path) for path in outputs],
+                }
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+                )
+                return DataPipelineStep(
+                    "contract-reference-validation",
+                    "ran",
+                    outputs,
+                    metadata={
+                        "reference_contracts_requested": int(len(reference_report)),
+                        "status_counts": manifest["status_counts"],
+                        "fetch_status_counts": manifest["fetch_status_counts"],
+                        "proxy_usable_contract_rows": proxy_usable_rows,
+                        "non_standard_excluded_rows": non_standard_rows,
+                        "reused_reference_report": True,
+                    },
+                )
+        except Exception as exc:
+            _progress(
+                "contract-reference-validation: existing reference report could not be reused; "
+                f"falling back to fetch ({safe_exception_text(exc)})"
+            )
+
     _progress(
         "contract-reference-validation: "
         f"contracts={len(unique_tickers)} jobs={jobs} refresh_bronze={refresh_bronze}"
@@ -2449,6 +3181,15 @@ def _contract_reference_validation_step(
     non_standard_rows = int(
         validated["contract_discovery_status"].astype(str).eq("non_standard_excluded").sum()
     )
+    proxy_usable_rows = int(
+        validated.get(
+            "contract_reference_proxy_usable",
+            pd.Series(False, index=validated.index),
+        )
+        .fillna(False)
+        .astype(bool)
+        .sum()
+    )
     manifest = {
         "pipeline_params": params,
         "status_counts": {str(key): int(value) for key, value in status_counts.items()},
@@ -2464,6 +3205,7 @@ def _contract_reference_validation_step(
         )
         if "contract_reference_status" in reference_report
         else 0,
+        "proxy_usable_contract_rows": proxy_usable_rows,
         "non_standard_excluded_rows": non_standard_rows,
         "outputs": [str(path) for path in outputs],
     }
@@ -2476,7 +3218,515 @@ def _contract_reference_validation_step(
             "reference_contracts_requested": int(len(unique_tickers)),
             "status_counts": manifest["status_counts"],
             "fetch_status_counts": manifest["fetch_status_counts"],
+            "proxy_usable_contract_rows": proxy_usable_rows,
             "non_standard_excluded_rows": non_standard_rows,
+        },
+    )
+
+
+def _quote_execution_panel_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+    dates: Sequence[date],
+    max_events: int | None,
+    metadata_only: bool,
+    allow_all_dates: bool,
+    chunksize: int,
+    entry_lookback_seconds: int,
+    exit_lookback_seconds: int,
+    stale_seconds: int,
+    wide_spread_threshold: float,
+    aws_executable: str,
+    quote_source: str,
+    quote_cache_dir: Path | None,
+    rest_limit: int,
+    quote_workers: int,
+    event_offset: int,
+    batch_label: str | None,
+) -> DataPipelineStep:
+    contracts_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    windows_path = config.silver_data_dir / "event_windows" / "event_windows.parquet"
+    normalized_batch_label = _normalize_quote_batch_label(batch_label)
+    batch_mode = normalized_batch_label is not None
+    out = out_root / "quote_execution_panel"
+    if normalized_batch_label is not None:
+        out = out / "batches" / normalized_batch_label
+    report_path = out / "quote_execution_report.json"
+    manifest_path = out / "quote_execution_panel_manifest.json"
+    artifact_paths = {
+        "quote_window_requests_csv": out / "quote_window_requests.csv",
+        "quote_window_quotes_csv": out / "quote_window_quotes.csv",
+        "quote_window_marks_csv": out / "quote_window_marks.csv",
+        "quote_execution_legs_csv": out / "quote_execution_legs.csv",
+        "quote_straddle_execution_csv": out / "quote_straddle_execution.csv",
+        "quote_ivar_event_csv": out / "quote_ivar_event.csv",
+        "quote_iv_surface_csv": out / "quote_iv_surface.csv",
+        "quote_iv_surface_summary_csv": out / "quote_iv_surface_summary.csv",
+        "quote_surface_ivar_event_csv": out / "quote_surface_ivar_event.csv",
+        "quote_execution_confidence_csv": out / "quote_execution_confidence.csv",
+        "quote_execution_report": report_path,
+    }
+    bronze_quote_root = config.bronze_data_dir / "massive" / "quotes_v1_target_windows"
+    silver_quote_root = config.silver_data_dir / "quote_execution"
+    gold_quote_root = config.gold_data_dir / "quote_execution"
+    if normalized_batch_label is not None:
+        batch_partition = f"batch={normalized_batch_label}"
+        bronze_quote_root = bronze_quote_root / "batches" / batch_partition
+        silver_quote_root = silver_quote_root / "batches" / batch_partition
+        gold_quote_root = gold_quote_root / "batches" / batch_partition
+    lake_paths = {
+        "bronze_quote_window_requests": bronze_quote_root / "quote_window_requests.parquet",
+        "bronze_quote_window_quotes": bronze_quote_root / "quote_window_quotes.parquet",
+        "silver_quote_window_marks": silver_quote_root / "quote_window_marks.parquet",
+        "silver_quote_execution_legs": silver_quote_root / "quote_execution_legs.parquet",
+        "gold_quote_straddle_execution": gold_quote_root / "quote_straddle_execution.parquet",
+        "gold_quote_ivar_event": gold_quote_root / "quote_ivar_event.parquet",
+        "gold_quote_iv_surface": gold_quote_root / "quote_iv_surface.parquet",
+        "gold_quote_iv_surface_summary": gold_quote_root / "quote_iv_surface_summary.parquet",
+        "gold_quote_surface_ivar_event": gold_quote_root / "quote_surface_ivar_event.parquet",
+        "gold_quote_execution_confidence": gold_quote_root / "quote_execution_confidence.parquet",
+    }
+    outputs = (
+        contracts_path,
+        windows_path,
+        *artifact_paths.values(),
+        *lake_paths.values(),
+        manifest_path,
+    )
+    if not contracts_path.exists() or not windows_path.exists():
+        return DataPipelineStep(
+            "quote-execution-panel",
+            "blocked",
+            outputs,
+            reason="requires event_contract_candidates.parquet and event_windows.parquet",
+        )
+    if not metadata_only and not dates and not allow_all_dates:
+        out.mkdir(parents=True, exist_ok=True)
+        blocked_params: dict[str, object] = {
+            "stage": "quote-execution-panel",
+            "contracts": _path_signature(contracts_path),
+            "windows": _path_signature(windows_path),
+            "dates": [],
+            "max_events": max_events,
+            "event_offset": event_offset,
+            "metadata_only": metadata_only,
+            "allow_all_dates": allow_all_dates,
+            "quote_source": quote_source,
+            "quote_workers": quote_workers,
+            "quote_batch_label": normalized_batch_label,
+        }
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": blocked_params,
+                    "status": "blocked",
+                    "reason": "requires_quote_dates_or_allow_all_dates_for_quote_stream",
+                    "raw_full_day_files_written": False,
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        return DataPipelineStep(
+            "quote-execution-panel",
+            "blocked",
+            outputs,
+            reason="requires_quote_dates_or_allow_all_dates_for_quote_stream",
+        )
+
+    normalized_dates = tuple(sorted(dates))
+    normalized_cache_dir = (
+        quote_cache_dir
+        if quote_cache_dir is not None
+        else config.bronze_data_dir / "massive" / "quotes_v3_rest_target_windows" / "cache"
+    )
+    params: dict[str, object] = {
+        "stage": "quote-execution-panel",
+        "contracts": _path_signature(contracts_path),
+        "windows": _path_signature(windows_path),
+        "dates": [value.isoformat() for value in normalized_dates],
+        "max_events": max_events,
+        "event_offset": event_offset,
+        "metadata_only": metadata_only,
+        "allow_all_dates": allow_all_dates,
+        "chunksize": chunksize,
+        "entry_lookback_seconds": entry_lookback_seconds,
+        "exit_lookback_seconds": exit_lookback_seconds,
+        "stale_seconds": stale_seconds,
+        "wide_spread_threshold": wide_spread_threshold,
+        "quote_source": quote_source,
+        "quote_cache_dir": str(normalized_cache_dir),
+        "rest_limit": rest_limit,
+        "quote_workers": quote_workers,
+        "quote_batch_label": normalized_batch_label,
+    }
+    if not force and _complete_with_params(
+        outputs,
+        params_path=manifest_path,
+        expected_params=params,
+    ):
+        return DataPipelineStep(
+            "quote-execution-panel",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    try:
+        contracts = pd.read_parquet(contracts_path)
+        windows = pd.read_parquet(windows_path)
+        report = extract_quote_execution_panel(
+            config=config,
+            contracts=contracts,
+            windows=windows,
+            out_dir=out,
+            dates=normalized_dates,
+            metadata_only=metadata_only,
+            chunksize=chunksize,
+            entry_lookback_seconds=entry_lookback_seconds,
+            exit_lookback_seconds=exit_lookback_seconds,
+            stale_seconds=stale_seconds,
+            wide_spread_threshold=wide_spread_threshold,
+            max_events=max_events,
+            aws_executable=aws_executable,
+            quote_source=quote_source,
+            quote_cache_dir=normalized_cache_dir,
+            rest_limit=rest_limit,
+            quote_workers=quote_workers,
+            event_offset=event_offset,
+            batch_label=normalized_batch_label,
+        )
+        row_counts = {
+            "bronze_quote_window_requests": _write_parquet_from_csv(
+                artifact_paths["quote_window_requests_csv"],
+                lake_paths["bronze_quote_window_requests"],
+            ),
+            "bronze_quote_window_quotes": _write_parquet_from_csv(
+                artifact_paths["quote_window_quotes_csv"],
+                lake_paths["bronze_quote_window_quotes"],
+            ),
+            "silver_quote_window_marks": _write_parquet_from_csv(
+                artifact_paths["quote_window_marks_csv"],
+                lake_paths["silver_quote_window_marks"],
+            ),
+            "silver_quote_execution_legs": _write_parquet_from_csv(
+                artifact_paths["quote_execution_legs_csv"],
+                lake_paths["silver_quote_execution_legs"],
+            ),
+            "gold_quote_straddle_execution": _write_parquet_from_csv(
+                artifact_paths["quote_straddle_execution_csv"],
+                lake_paths["gold_quote_straddle_execution"],
+            ),
+            "gold_quote_ivar_event": _write_parquet_from_csv(
+                artifact_paths["quote_ivar_event_csv"],
+                lake_paths["gold_quote_ivar_event"],
+            ),
+            "gold_quote_iv_surface": _write_parquet_from_csv(
+                artifact_paths["quote_iv_surface_csv"],
+                lake_paths["gold_quote_iv_surface"],
+            ),
+            "gold_quote_iv_surface_summary": _write_parquet_from_csv(
+                artifact_paths["quote_iv_surface_summary_csv"],
+                lake_paths["gold_quote_iv_surface_summary"],
+            ),
+            "gold_quote_surface_ivar_event": _write_parquet_from_csv(
+                artifact_paths["quote_surface_ivar_event_csv"],
+                lake_paths["gold_quote_surface_ivar_event"],
+            ),
+            "gold_quote_execution_confidence": _write_parquet_from_csv(
+                artifact_paths["quote_execution_confidence_csv"],
+                lake_paths["gold_quote_execution_confidence"],
+            ),
+        }
+    except Exception as exc:
+        out.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": params,
+                    "status": "blocked",
+                    "reason": "quote_execution_panel_failed",
+                    "error": safe_exception_text(exc),
+                    "raw_full_day_files_written": False,
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        return DataPipelineStep(
+            "quote-execution-panel",
+            "blocked",
+            outputs,
+            reason="quote_execution_panel_failed",
+            metadata={"error": safe_exception_text(exc)},
+        )
+
+    manifest = {
+        "pipeline_params": params,
+        "status": "ran",
+        "report": report.as_dict(),
+        "lake_output_rows": row_counts,
+        "artifact_outputs": {key: str(path) for key, path in artifact_paths.items()},
+        "lake_outputs": {key: str(path) for key, path in lake_paths.items()},
+        "lake_policy": {
+            "bronze": "target-window request table plus matched normalized quote subset only",
+            "silver": "selected quote marks and leg-level bid/ask execution diagnostics",
+            "gold": (
+                "event/straddle execution diagnostics, diagnostic quote-IVAR proxy, "
+                "bounded quote-IV surface diagnostics, and execution confidence"
+            ),
+            "quote_source": quote_source,
+            "rest_cache": str(normalized_cache_dir),
+            "rest_workers": quote_workers,
+            "batch_mode": batch_mode,
+            "batch_label": normalized_batch_label,
+            "canonical_outputs_updated": not batch_mode,
+            "raw_full_day_quote_files_in_repo": False,
+        },
+        "raw_full_day_files_written": report.raw_full_day_files_written,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    complete = _complete(outputs)
+    return DataPipelineStep(
+        "quote-execution-panel",
+        "ran" if report.ok and complete else "blocked",
+        outputs,
+        reason=None if report.ok and complete else "quote_execution_outputs_missing",
+        metadata={
+            "route": report.route,
+            "metadata_only": report.metadata_only,
+            "request_rows": report.request_rows,
+            "event_count": report.event_count,
+            "quote_rows_scanned": report.quote_rows_scanned,
+            "quote_rows_matched": report.quote_rows_matched,
+            "event_offset": event_offset,
+            "quote_batch_label": normalized_batch_label,
+            "lake_output_rows": row_counts,
+        },
+    )
+
+
+def _discover_quote_batch_labels(config: ProjectConfig, out_root: Path) -> list[str]:
+    roots = [
+        config.bronze_data_dir / "massive" / "quotes_v1_target_windows" / "batches",
+        config.silver_data_dir / "quote_execution" / "batches",
+        config.gold_data_dir / "quote_execution" / "batches",
+        out_root / "quote_execution_panel" / "batches",
+    ]
+    labels: set[str] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            label = (
+                child.name.removeprefix("batch=") if child.name.startswith("batch=") else child.name
+            )
+            normalized = _normalize_quote_batch_label(label)
+            if normalized is not None:
+                labels.add(normalized)
+    return sorted(labels)
+
+
+def _dedupe_quote_execution_frame(dataset_id: str, frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.reset_index(drop=True)
+    keys = [key for key in QUOTE_EXECUTION_DEDUPE_KEYS[dataset_id] if key in frame.columns]
+    if keys:
+        return frame.drop_duplicates(keys, keep="last").reset_index(drop=True)
+    return frame.drop_duplicates(keep="last").reset_index(drop=True)
+
+
+def _merge_quote_execution_sources(
+    *,
+    config: ProjectConfig,
+    out_root: Path,
+    batch_labels: Sequence[str],
+    include_canonical: bool,
+) -> tuple[dict[str, pd.DataFrame], dict[str, list[Path]], dict[str, dict[str, int]]]:
+    source_paths: dict[str, list[Path]] = {
+        dataset_id: [] for dataset_id in QUOTE_EXECUTION_DATASET_FILES
+    }
+    source_rows: dict[str, dict[str, int]] = {
+        dataset_id: {} for dataset_id in QUOTE_EXECUTION_DATASET_FILES
+    }
+    merged: dict[str, pd.DataFrame] = {}
+    canonical_paths = _quote_execution_lake_paths(config)
+    batch_path_sets = {
+        label: _quote_execution_lake_paths(config, batch_label=label) for label in batch_labels
+    }
+    for dataset_id in QUOTE_EXECUTION_DATASET_FILES:
+        frames: list[pd.DataFrame] = []
+        if include_canonical and canonical_paths[dataset_id].exists():
+            path = canonical_paths[dataset_id]
+            frame = pd.read_parquet(path)
+            frames.append(frame)
+            source_paths[dataset_id].append(path)
+            source_rows[dataset_id]["canonical"] = int(len(frame))
+        for label in batch_labels:
+            path = batch_path_sets[label][dataset_id]
+            if not path.exists():
+                continue
+            frame = pd.read_parquet(path)
+            frames.append(frame)
+            source_paths[dataset_id].append(path)
+            source_rows[dataset_id][label] = int(len(frame))
+        if frames:
+            merged[dataset_id] = _dedupe_quote_execution_frame(
+                dataset_id, pd.concat(frames, ignore_index=True, sort=False)
+            )
+        else:
+            merged[dataset_id] = pd.DataFrame()
+    return merged, source_paths, source_rows
+
+
+def _quote_execution_merge_step(
+    config: ProjectConfig,
+    *,
+    out_root: Path,
+    force: bool,
+    batch_labels: Sequence[str],
+    include_canonical: bool,
+) -> DataPipelineStep:
+    normalized_labels = sorted(
+        {
+            label
+            for label in (_normalize_quote_batch_label(value) for value in batch_labels)
+            if label is not None
+        }
+    )
+    if not normalized_labels:
+        normalized_labels = _discover_quote_batch_labels(config, out_root)
+    artifact_root = _quote_execution_artifact_root(out_root)
+    manifest_path = artifact_root / "quote_execution_panel_manifest.json"
+    report_path = artifact_root / "quote_execution_report.json"
+    lake_paths = _quote_execution_lake_paths(config)
+    artifact_csv_paths = _quote_execution_artifact_paths(out_root)
+    outputs = (*lake_paths.values(), *artifact_csv_paths.values(), report_path, manifest_path)
+    if not normalized_labels and not include_canonical:
+        return DataPipelineStep(
+            "quote-execution-merge",
+            "blocked",
+            outputs,
+            reason="requires_quote_batch_labels_or_canonical_input",
+        )
+    merged, source_paths, source_rows = _merge_quote_execution_sources(
+        config=config,
+        out_root=out_root,
+        batch_labels=normalized_labels,
+        include_canonical=include_canonical,
+    )
+    input_signatures = {
+        dataset_id: [_path_signature(path) for path in paths]
+        for dataset_id, paths in source_paths.items()
+    }
+    params: dict[str, object] = {
+        "stage": "quote-execution-merge",
+        "batch_labels": normalized_labels,
+        "include_canonical": include_canonical,
+        "input_signatures": input_signatures,
+    }
+    has_any_input = any(paths for paths in source_paths.values())
+    if not has_any_input:
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "pipeline_params": params,
+                    "status": "blocked",
+                    "reason": "requires_existing_quote_execution_lake_sources",
+                    "raw_full_day_files_written": False,
+                },
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        return DataPipelineStep(
+            "quote-execution-merge",
+            "blocked",
+            outputs,
+            reason="requires_existing_quote_execution_lake_sources",
+        )
+    if not force and _complete_with_params(
+        outputs,
+        params_path=manifest_path,
+        expected_params=params,
+    ):
+        return DataPipelineStep(
+            "quote-execution-merge",
+            "skipped",
+            outputs,
+            reason="outputs_exist_params_match",
+        )
+
+    row_counts: dict[str, int] = {}
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    for dataset_id, frame in merged.items():
+        _write_parquet(lake_paths[dataset_id], frame)
+        artifact_csv_paths[dataset_id].parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(artifact_csv_paths[dataset_id], index=False)
+        row_counts[dataset_id] = int(len(frame))
+    final_input_signatures = {
+        dataset_id: [_path_signature(path) for path in paths]
+        for dataset_id, paths in source_paths.items()
+    }
+    final_params = {**params, "input_signatures": final_input_signatures}
+
+    confidence = merged["gold_quote_execution_confidence"]
+    event_count = (
+        int(confidence["event_id"].astype(str).nunique())
+        if not confidence.empty and "event_id" in confidence.columns
+        else 0
+    )
+    report = {
+        "ok": True,
+        "route": "quote_batch_consolidation",
+        "metadata_only": False,
+        "event_count": event_count,
+        "request_rows": row_counts["bronze_quote_window_requests"],
+        "quote_rows_scanned": 0,
+        "quote_rows_matched": row_counts["bronze_quote_window_quotes"],
+        "raw_full_day_files_written": False,
+        "dates": [],
+        "batch_labels": normalized_labels,
+        "include_canonical": include_canonical,
+        "output_paths": {key: str(path) for key, path in artifact_csv_paths.items()},
+    }
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    manifest = {
+        "pipeline_params": final_params,
+        "status": "ran",
+        "report": report,
+        "lake_output_rows": row_counts,
+        "source_rows": source_rows,
+        "artifact_outputs": {key: str(path) for key, path in artifact_csv_paths.items()},
+        "lake_outputs": {key: str(path) for key, path in lake_paths.items()},
+        "lake_policy": {
+            "batch_consolidation": True,
+            "batch_labels": normalized_labels,
+            "canonical_outputs_updated": True,
+            "raw_full_day_quote_files_in_repo": False,
+        },
+        "raw_full_day_files_written": False,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    complete = _complete(outputs)
+    return DataPipelineStep(
+        "quote-execution-merge",
+        "ran" if complete else "blocked",
+        outputs,
+        reason=None if complete else "quote_execution_merge_outputs_missing",
+        metadata={
+            "batch_labels": normalized_labels,
+            "include_canonical": include_canonical,
+            "event_count": event_count,
+            "lake_output_rows": row_counts,
         },
     )
 
@@ -2588,7 +3838,16 @@ def _dry_run_estimate(
     price_field: str,
     universe_top_n: int,
     universe_trailing_months: int,
+    quote_metadata_only: bool,
+    quote_source: str,
+    quote_rest_limit: int,
+    quote_workers: int,
+    quote_event_offset: int,
+    quote_batch_label: str | None,
+    quote_merge_batch_labels: Sequence[str],
+    quote_merge_include_canonical: bool,
 ) -> dict[str, object]:
+    normalized_quote_batch_label = _normalize_quote_batch_label(quote_batch_label)
     normalized_tickers = sorted({ticker.upper() for ticker in tickers if ticker.strip()})
     lookback_start = _universe_lookback_start(start_date, universe_trailing_months)
     month_count = (end_date.year - start_date.year) * 12 + end_date.month - start_date.month + 1
@@ -2637,6 +3896,20 @@ def _dry_run_estimate(
             "contracts": estimated_contracts,
             "contract_reference_rest_calls": estimated_contracts,
             "second_agg_rest_calls": estimated_contracts,
+            "quote_window_requests": estimated_contracts * 2,
+            "quote_rest_window_calls": (
+                0
+                if quote_metadata_only or quote_source != QUOTE_SOURCE_REST
+                else estimated_contracts * 2
+            ),
+            "quote_rest_workers": (
+                0 if quote_metadata_only or quote_source != QUOTE_SOURCE_REST else quote_workers
+            ),
+            "quote_flat_file_full_day_scans": (
+                0
+                if quote_metadata_only or quote_source != QUOTE_SOURCE_FLAT_FILE
+                else "requires_dates"
+            ),
             "bulk_day_agg_partitions": estimated_trading_days * 2 if active_proxy_dag else None,
         },
         "parameters": {
@@ -2647,6 +3920,16 @@ def _dry_run_estimate(
             "price_field": price_field,
             "universe_top_n": universe_top_n,
             "universe_trailing_months": universe_trailing_months,
+            "quote_metadata_only": quote_metadata_only,
+            "quote_source": quote_source,
+            "quote_rest_limit": quote_rest_limit,
+            "quote_workers": quote_workers,
+            "quote_event_offset": quote_event_offset,
+            "quote_batch_label": normalized_quote_batch_label,
+            "quote_batch_mode": normalized_quote_batch_label is not None,
+            "quote_merge_batch_labels": list(quote_merge_batch_labels),
+            "quote_merge_include_canonical": quote_merge_include_canonical,
+            "quote_ingestion_policy": "targeted_windows_no_full_day_raw_files",
         },
         "exclusion_estimate": exclusions,
         "writes_data_outputs": False,
@@ -2681,6 +3964,23 @@ def run_data_pipeline(
     universe_top_n: int = 50,
     universe_trailing_months: int = 6,
     refresh_bronze: bool = False,
+    quote_dates: Sequence[date] = (),
+    quote_metadata_only: bool = True,
+    quote_allow_all_dates: bool = False,
+    quote_chunksize: int = 250_000,
+    quote_entry_lookback_seconds: int = 900,
+    quote_exit_lookback_seconds: int = 900,
+    quote_stale_seconds: int = 60,
+    quote_wide_spread_threshold: float = 0.25,
+    quote_aws_executable: str = "aws",
+    quote_source: str = QUOTE_SOURCE_REST,
+    quote_cache_dir: Path | None = None,
+    quote_rest_limit: int = 50_000,
+    quote_workers: int = 1,
+    quote_event_offset: int = 0,
+    quote_batch_label: str | None = None,
+    quote_merge_batch_labels: Sequence[str] = (),
+    quote_merge_include_canonical: bool = True,
 ) -> dict[str, object]:
     normalized_stage = stage.strip().lower()
     if normalized_stage not in SUPPORTED_DATA_STAGES:
@@ -2695,6 +3995,30 @@ def run_data_pipeline(
         raise ValueError("universe_top_n must be positive.")
     if universe_trailing_months <= 0:
         raise ValueError("universe_trailing_months must be positive.")
+    if quote_chunksize <= 0:
+        raise ValueError("quote_chunksize must be positive.")
+    if quote_entry_lookback_seconds <= 0:
+        raise ValueError("quote_entry_lookback_seconds must be positive.")
+    if quote_exit_lookback_seconds <= 0:
+        raise ValueError("quote_exit_lookback_seconds must be positive.")
+    if quote_stale_seconds <= 0:
+        raise ValueError("quote_stale_seconds must be positive.")
+    if quote_wide_spread_threshold <= 0:
+        raise ValueError("quote_wide_spread_threshold must be positive.")
+    if quote_source not in {QUOTE_SOURCE_REST, QUOTE_SOURCE_FLAT_FILE}:
+        raise ValueError(f"unsupported quote_source: {quote_source}")
+    if quote_rest_limit <= 0:
+        raise ValueError("quote_rest_limit must be positive.")
+    if quote_workers <= 0:
+        raise ValueError("quote_workers must be positive.")
+    if quote_event_offset < 0:
+        raise ValueError("quote_event_offset must be non-negative.")
+    normalized_quote_batch_label = _normalize_quote_batch_label(quote_batch_label)
+    normalized_quote_merge_batch_labels = [
+        label
+        for label in (_normalize_quote_batch_label(value) for value in quote_merge_batch_labels)
+        if label is not None
+    ]
     if dry_run:
         return _dry_run_estimate(
             out_root=out_root,
@@ -2711,6 +4035,14 @@ def run_data_pipeline(
             price_field=price_field,
             universe_top_n=universe_top_n,
             universe_trailing_months=universe_trailing_months,
+            quote_metadata_only=quote_metadata_only,
+            quote_source=quote_source,
+            quote_rest_limit=quote_rest_limit,
+            quote_workers=quote_workers,
+            quote_event_offset=quote_event_offset,
+            quote_batch_label=normalized_quote_batch_label,
+            quote_merge_batch_labels=normalized_quote_merge_batch_labels,
+            quote_merge_include_canonical=quote_merge_include_canonical,
         )
 
     active_proxy_dag = normalized_stage == "all"
@@ -2718,11 +4050,21 @@ def run_data_pipeline(
     normalized_tickers = sorted({ticker.upper() for ticker in tickers if ticker.strip()})
     if not normalized_tickers:
         normalized_tickers = list(DEFAULT_STATIC_TICKERS)
+    normalized_quote_dates = tuple(quote_dates or dates)
 
     stage_force = force
     step_builders: dict[str, Callable[[], list[DataPipelineStep]]] = {
         "fixture-audit": lambda: [
             _fixture_audit_step(config, out_root=out_root, force=stage_force)
+        ],
+        "lake-quality-audit": lambda: [
+            _lake_quality_audit_step(
+                config,
+                out_root=out_root,
+                force=stage_force,
+                target_start=start_date,
+                target_end=end_date,
+            )
         ],
         "massive-probe": lambda: _massive_probe_steps(
             config,
@@ -2824,6 +4166,38 @@ def run_data_pipeline(
                 second_agg_buffer_minutes=second_agg_buffer_minutes,
                 price_field=price_field,
                 refresh_bronze=refresh_bronze,
+            )
+        ],
+        "quote-execution-panel": lambda: [
+            _quote_execution_panel_step(
+                config,
+                out_root=out_root,
+                force=stage_force,
+                dates=normalized_quote_dates,
+                max_events=max_events,
+                metadata_only=quote_metadata_only,
+                allow_all_dates=quote_allow_all_dates,
+                chunksize=quote_chunksize,
+                entry_lookback_seconds=quote_entry_lookback_seconds,
+                exit_lookback_seconds=quote_exit_lookback_seconds,
+                stale_seconds=quote_stale_seconds,
+                wide_spread_threshold=quote_wide_spread_threshold,
+                aws_executable=quote_aws_executable,
+                quote_source=quote_source,
+                quote_cache_dir=quote_cache_dir,
+                rest_limit=quote_rest_limit,
+                quote_workers=quote_workers,
+                event_offset=quote_event_offset,
+                batch_label=normalized_quote_batch_label,
+            )
+        ],
+        "quote-execution-merge": lambda: [
+            _quote_execution_merge_step(
+                config,
+                out_root=out_root,
+                force=stage_force,
+                batch_labels=normalized_quote_merge_batch_labels,
+                include_canonical=quote_merge_include_canonical,
             )
         ],
     }

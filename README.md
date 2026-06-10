@@ -40,12 +40,16 @@ market entry cost and transaction cost estimates.
 
 ## Current State
 
-Verified local state on 2026-05-12:
+Verified local state on 2026-06-11:
 
-- `just data` builds the active no-NBBO proxy data pipeline.
-- `just research` builds the canonical V5 proxy feature/model/report
-  package from the current trade-proxy event panel. The current paper-facing
-  snapshot uses the canonical tuned protocol.
+- `just data` builds the active no-NBBO proxy data pipeline with a 2013-2025
+  target window; pass `args="--start 2022-12-01 --end 2025-12-31"` for a
+  bounded current-cache rerun.
+- `just research-fast` remains the quick no-sequence smoke-refresh command. The
+  current verified artifact set was refreshed with `sequence_suite=all`, reusing
+  locked tuning parameters and keeping sequence rows diagnostic.
+- `just research` still builds the full V5 proxy feature/model/report package
+  from the current trade-proxy event panel, including sequence diagnostics.
 - `just mamba-install` installs the local CUDA Mamba wheels and `just
   mamba-doctor` verifies the official `mamba-ssm` runtime.
 - Current data range is `2022-12-01` through `2025-12-31`, because the observed
@@ -57,52 +61,78 @@ Verified local state on 2026-05-12:
 
 Latest proxy data artifacts:
 
-- Dynamic calendar: 1,054 SEC-first candidate rows; 810 BMO/AMC main-sample
-  candidates after universe and text-validation filters.
-- Trade-proxy panel: 810 events, 801 with the backward-compatible C2C
-  `rvar_event` alias, 693 with trade-proxy `IVAR_event`.
-- Proxy contracts: 12,038 candidates; 10,165 with usable pre-cutoff
-  second-aggregate prices.
-- Proxy straddle diagnostics: 779 rows; mean gross C2C primary exit-preclose
-  VWAP proxy PnL about -100.72 USD, mean haircut proxy PnL about -250.54 USD.
+- Dynamic calendar/event window panel: 816 BMO/AMC main-sample events after the
+  current restored SEC-first calendar and universe filters.
+- Trade-proxy panel: 816 events, 807 with the backward-compatible C2C
+  `rvar_event` alias, 705 with trade-proxy `IVAR_event`.
+- Event contract candidates: 23,845 total; 11,729 quote-pool contracts; 11,729
+  missing-reference standard-contract fallback rows allowed by the current
+  contract-reference policy.
+- Proxy entry-price status: 10,046 contracts with usable pre-cutoff
+  second-aggregate prices and 1,683 with no trade in the cutoff window.
+- Proxy straddle diagnostics: 789 rows; mean gross C2C primary exit-preclose
+  VWAP proxy PnL about -112.06 USD, mean exit-preclose VWAP proxy PnL about
+  -162.30 USD, and mean haircut proxy PnL about -289.80 USD.
+- Quote execution artifacts: a bounded targeted REST slice is populated with
+  `--quote-workers 8` and cache reuse. It covers 64 events with 1,642
+  quote-window requests, 1,226,559 matched quote rows, 1,642 window marks, 1,642
+  leg execution rows, 412 straddle rows, 64 quote-IVAR diagnostic rows, 821
+  quote-IV leg rows, 412 quote-IV surface-pair rows, 64 quote-surface IVAR
+  rows, and 64 confidence rows. The bounded surface has 821 finite
+  `quote_mid_iv` values, 412 finite quote total-variance rows, and 57 finite
+  surface-IVAR mid rows. Confidence bands are 55 high and 9 medium. No full-day
+  quote files are stored in the repo; full-sample quote/NBBO evidence is still
+  pending. Follow-on quote runs can use `--quote-event-offset N --max-events M
+  --quote-batch-label offsetN_sizeM` to write batch-specific lake/artifact paths
+  without overwriting the canonical 64-event slice, then
+  `--stage quote-execution-merge --quote-merge-batch offsetN_sizeM` to
+  consolidate verified shards into canonical quote diagnostics.
+- Lake quality audit: `lake-quality-audit` now writes 2013-2025 coverage gates.
+  The latest audit finds 17/17 audited lake datasets are span-incomplete for
+  the target window, including all 15 required paper-grade datasets. Options
+  day aggregates cover 2022-05-04 to 2025-12-31; underlying day aggregates cover
+  2016-05-04 to 2025-12-31; the main event/modeling sample still starts in
+  December 2022.
 
 Latest proxy modeling artifacts:
 
-- Feature matrix: 810 rows.
+- Feature matrix: 816 rows.
 - Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost, a
-  LightGBM/XGBoost rank-average ensemble, FT-Transformer, and the V5 sequence
-  diagnostic suite.
-- Current tuned protocol: the canonical tuned-only research protocol.
-  Hyperparameter selection uses train and locked-validation rows only, then
-  evaluates locked test rows once. Paired original tabular and single-seed
-  sequence rows are no longer emitted.
-- Full sequence diagnostic suite: ridge-flat sequence aggregates, 5-seed BiGRU,
-  5-seed official bidirectional `mamba-ssm`, attention pooling, non-causal
-  dilated CNN, mask-only, and deterministic time-shuffle controls.
-- Sequence audit: 678 eligible events out of 810 under the default path
-  coverage rule; flagged as high sequence-selection risk.
+  LightGBM/XGBoost rank-average ensemble, FT-Transformer, and the refreshed
+  sequence diagnostic suite.
+- Current fast tuned protocol: train/validation-locked tuning parameters are
+  reused, locked test rows are evaluated once, `sequence_suite=all`, and the
+  latest local model manifest uses `bootstrap_iter=200`. This refresh produced
+  2,448 prediction rows, 48 forecast metric rows, 48 ranking metric rows, 96
+  strategy metric rows, 4,830 IVAR defeat event rows, and 4,271 casebook event
+  rows. Locked-test predictions now include 24 high/medium quote-confidence
+  target rows across 8 unique events. The model manifest also writes a
+  21-row sequence diagnostic gate table, a 21-row incremental-value table, an
+  18-row robustness summary for DTE, liquidity, VIX-regime, timing, ticker, and
+  quote-confidence splits, plus quote-confidence summary artifacts for
+  prediction coverage, quote-IVAR, strategy, IVAR defeat, and casebook
+  diagnostics.
+- The sequence diagnostic suite was refreshed with explicit 5-seed sequence
+  ensembles. Ridge-flat, BiGRU 5-seed, official `mamba-ssm` 5-seed, attention
+  pooling, dilated CNN, mask-only, and time-shuffle rows all trained in the
+  external CUDA-enabled uv environment. Sequence rows remain diagnostic unless
+  the common-row/control/bootstrap/economics gates pass.
 - `FT-Transformer` refers to the validation-tuned tabular transformer
   specification.
-- The active canonical outputs use the default `fe_v2_sec_xbrl` schema, but
-  the same-code FE V1 versus FE V2 ablation is negative for FE V2. In FE V2,
-  the strongest `jump_c2o` AUC is the Goyal-Saretto-style spread at about
-  0.602, and the positive `day_c2c` ridge-flat sequence PnL of about 19,918
-  USD is diagnostic because the sequence gate does not pass.
-- The stronger current sell is the `fe_v1_legacy` same-code ablation:
-  LightGBM reaches `jump_c2o` AUC about 0.677, XGBoost has best `jump_c2o`
-  OOS R2 versus IVAR at about 0.375, and LightGBM leads the `day_c2c` headline
-  proxy strategy at about 53,664 USD net PnL. This is signal-screening
-  evidence, not a paper-grade executable trading result.
-- `reaction_o2c` is now included in the V5 proxy model artifacts as a
-  diagnostic target. Ridge-flat sequence aggregates lead O2C AUC at about
-  0.799; among the tabular rows, XGBoost leads at about 0.768. O2C uses
-  full-event `IVAR_event` only as a weak comparator and all O2C strategy rows
-  remain `pnl_headline_eligible=false`.
-- The full sequence diagnostic suite has not passed the common-row bootstrap
-  gate in the current proxy evidence: the 5-seed official `mamba-ssm` row has
-  `jump_c2o` AUC about 0.501 and negative `day_c2c` proxy PnL. Sequence rows
-  remain diagnostic and do not upgrade the claim.
+- In the refreshed FE V2 fast run, the strongest `jump_c2o` AUC is the
+  Goyal-Saretto-style spread at about 0.620, while the best `jump_c2o` OOS R2
+  versus IVAR is the LightGBM/XGBoost ensemble at about 0.236.
+- The refreshed `day_c2c` headline proxy economics remain negative across
+  tabular rows; the best net proxy PnL is still Goyal-Saretto-style spread at
+  about -1,948 USD. This weakens any direct executable-trading sell and
+  supports a more conservative signal-screening/market-efficiency framing.
+- `reaction_o2c` is included in the V5 proxy model artifacts as a diagnostic
+  target. In the current sequence refresh, ridge-flat sequence leads O2C AUC at
+  about 0.808, but O2C strategy rows remain `pnl_headline_eligible=false`.
+- The sequence gate does not upgrade the claim: for primary `jump_c2o`, all
+  real sequence rows, including official `mamba-ssm` 5-seed, fail the
+  control/bootstrap gate.
 
 ## Command Surface
 
@@ -116,6 +146,7 @@ just mamba-install
 just data args="--dry-run"
 just data
 just research
+just research-fast
 just research-report
 just docs
 ```
@@ -133,6 +164,7 @@ checks, `status`, and source probes.
 ```text
 options-day-aggs-bulk -> universe -> dynamic-calendar -> sec-companyfacts
   -> event-window-panel -> contract-reference-validation -> trade-proxy-panel
+  -> quote-execution-panel
 ```
 
 Default data parameters:
@@ -149,6 +181,12 @@ Default data parameters:
     C2O/C2C/O2C event returns, and exit spot;
   - targeted Massive option second aggregates from
     `/range/1/second/<date>/<date>` for the entry proxy.
+  - targeted Massive REST quote windows for quote execution diagnostics. The
+    pipeline does not store full-day raw quote files: bronze
+    stores quote-window requests and matched normalized quote subsets, silver
+    stores selected quote marks plus leg-level bid/ask execution diagnostics,
+    and gold stores straddle execution diagnostics plus event-level execution
+    confidence.
 - entry proxy window: keep only bars in the resolved pre-cutoff buffer,
   default 60 minutes before the event cutoff, then compute the true per-leg
   volume-weighted `option_vwap` over the final 900 seconds.
@@ -160,6 +198,15 @@ Default data parameters:
   the primary C2C exit proxy is same-contract option VWAP over the final
   15 minutes before the exit-date close. Same-contract option day-aggregate
   close is retained only as fallback/diagnostic.
+- `quote-execution-panel` defaults to metadata-only planning in the active
+  data DAG. Use `--stage quote-execution-panel --quote-run --quote-date
+  YYYY-MM-DD` for a bounded quote scan; full-date-range quote streaming
+  requires the explicit `--quote-allow-all-dates` guard. For resumable slices,
+  add `--quote-event-offset N --max-events M --quote-batch-label offsetN_sizeM`
+  so the run writes under `batches/batch=...` and leaves canonical outputs
+  untouched. After verifying one or more batch shards, run
+  `--stage quote-execution-merge --quote-merge-batch offsetN_sizeM` to update
+  the canonical quote lake and research-facing CSV/report artifacts.
 - SEC CompanyFacts is public XBRL financial-statement data. The active stage
   uses CIK-mapped CompanyFacts with conservative as-of gating:
   `acceptanceDateTime <= feature_asof_timestamp` when available, otherwise
@@ -215,12 +262,20 @@ Research package:
 - `artifacts/modeling/forecast_metrics.csv`
 - `artifacts/modeling/ranking_metrics.csv`
 - `artifacts/modeling/strategy_metrics.csv`
+- `artifacts/modeling/strategy_breakdowns.csv`
+- `artifacts/modeling/ivar_defeat_breakdowns.csv`
+- `artifacts/modeling/robustness_summary.csv`
 - `artifacts/modeling/model_fit_diagnostics.csv`
 - `artifacts/modeling/model_predictions.parquet`
 - `artifacts/modeling/sequence_v2_quality.csv`
 - `artifacts/modeling/common_row_pairwise_metrics.csv`
 - `artifacts/modeling/incremental_value_diagnostics.csv`
 - `artifacts/modeling/sequence_model_fit_diagnostics.csv`
+- `artifacts/modeling/completion_gap_audit.csv`
+- `artifacts/modeling/completion_gap_audit.json`
+- `artifacts/data_pipeline/lake_quality_audit/lake_dataset_coverage.csv`
+- `artifacts/data_pipeline/lake_quality_audit/lake_year_coverage.csv`
+- `artifacts/data_pipeline/lake_quality_audit/lake_quality_report.json`
 - `reports/modeling/proxy_research_report.md`
 - `reports/modeling/figures/`
 
