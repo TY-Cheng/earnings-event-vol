@@ -36,6 +36,18 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
+def _path_signature(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
 def _write_parquet(path: Path, frame: pd.DataFrame | pl.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pl_frame = pl.from_pandas(frame) if isinstance(frame, pd.DataFrame) else frame
@@ -509,7 +521,7 @@ def build_event_window_panel(
     panel_report = {
         "pipeline_params": {
             "stage": "event-window-panel",
-            "calendar": str(calendar_path),
+            "calendar": _path_signature(calendar_path),
             "dte_min": dte_min,
             "dte_max": dte_max,
             "ivar_support_dte_max": second_expiry_dte_max,

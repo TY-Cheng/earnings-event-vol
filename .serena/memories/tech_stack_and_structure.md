@@ -3,9 +3,10 @@
 - **Language**: Python `>=3.11,<3.14`
 - **Package manager**: `uv`
 - **Environment policy**: `.env` sets `UV_PROJECT_ENVIRONMENT` outside the
-  repo, currently `/home/tycheng/.venvs/earnings-event-vol`
+  repo. The path is machine-local and must not be assumed from the Mac checkout.
 - **Data policy**: `.env` sets a device-specific absolute `DATA_DIR` outside
-  the repo, currently `/home/tycheng/data/earnings-event-vol`
+  the repo. Each machine chooses its own data root; generated paths should come
+  from `.env`, not hardcoded local volumes.
 - **Task runner**: `just`
 - **Core libraries**: `numpy`, `pandas`, `polars`, `pyarrow`, `pydantic`,
   `scipy`, `scikit-learn`, `lightgbm`, `xgboost`, `optuna`, `torch`

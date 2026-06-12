@@ -90,6 +90,7 @@ BASE_OPTION_SURFACE_FEATURE_NAMES = [
     "surface_missing_rate",
     "option_volume_sum",
     "option_transactions_sum",
+    "call_put_volume_imbalance",
     "underlying_return_1d",
     "rv5",
 ]
@@ -266,7 +267,6 @@ class ResearchPaths:
     sequence_long_path: Path
     sequence_tensor_path: Path
     hybrid_sequence_long_path: Path
-    hybrid_sequence_tensor_path: Path
     hybrid_sequence_tensor_v2_path: Path
     predictions_path: Path
 
@@ -302,9 +302,6 @@ def research_paths(config: ProjectConfig) -> ResearchPaths:
         hybrid_sequence_long_path=config.silver_data_dir
         / "modeling"
         / "option_proxy_surface_hybrid_sequence_long.parquet",
-        hybrid_sequence_tensor_path=config.gold_data_dir
-        / "modeling"
-        / "hybrid_sequence_tensor.npz",
         hybrid_sequence_tensor_v2_path=config.gold_data_dir
         / "modeling"
         / "hybrid_sequence_tensor_v2.npz",
@@ -691,12 +688,26 @@ def _compute_daily_surface(
         options["ticker"].astype(str).str.upper().eq(ticker)
         & pd.to_numeric(options["dte"], errors="coerce").between(3, 45, inclusive="both")
     ].copy()
+    frame["option_volume"] = pd.to_numeric(frame["option_volume"], errors="coerce").fillna(0.0)
+    frame["option_transactions"] = pd.to_numeric(
+        frame["option_transactions"], errors="coerce"
+    ).fillna(0.0)
+    option_right = frame["right"].astype(str).str.lower()
+    call_volume_sum = float(frame.loc[option_right.eq("call"), "option_volume"].sum())
+    put_volume_sum = float(frame.loc[option_right.eq("put"), "option_volume"].sum())
+    total_side_volume = call_volume_sum + put_volume_sum
+    call_put_volume_imbalance = (
+        float((call_volume_sum - put_volume_sum) / total_side_volume)
+        if total_side_volume > 0
+        else np.nan
+    )
     if frame.empty:
         return {
             **base,
             **{feature: np.nan for feature in BASE_OPTION_SURFACE_FEATURE_NAMES},
             "option_volume_sum": 0.0,
             "option_transactions_sum": 0.0,
+            "call_put_volume_imbalance": np.nan,
             "valid_pair_count": 0,
             "surface_missing_rate": 1.0,
             "is_valid_sequence_day": False,
@@ -729,6 +740,7 @@ def _compute_daily_surface(
             **{feature: np.nan for feature in BASE_OPTION_SURFACE_FEATURE_NAMES},
             "option_volume_sum": float(frame["option_volume"].sum()),
             "option_transactions_sum": float(frame["option_transactions"].sum()),
+            "call_put_volume_imbalance": call_put_volume_imbalance,
             "valid_pair_count": valid_pair_count,
             "surface_missing_rate": 1.0,
             "is_valid_sequence_day": False,
@@ -795,6 +807,7 @@ def _compute_daily_surface(
         "surface_missing_rate": float(max(0.0, 1.0 - min(valid_pair_count, 10) / 10.0)),
         "option_volume_sum": float(frame["option_volume"].sum()),
         "option_transactions_sum": float(frame["option_transactions"].sum()),
+        "call_put_volume_imbalance": call_put_volume_imbalance,
         "is_valid_sequence_day": bool(valid_pair_count > 0 and np.isfinite(atm_iv_proxy)),
     }
 
@@ -1053,6 +1066,15 @@ def build_option_surface_sequence_long(
         )
     )
     long_rows = plan.merge(surface, on=["event_id", "ticker", "source_date"], how="left")
+    long_rows = long_rows.drop(
+        columns=[
+            "underlying_return_1d",
+            "rv5",
+            "spy_return_1d",
+            "qqq_return_1d",
+        ],
+        errors="ignore",
+    )
     long_rows = long_rows.merge(
         underlying_features[
             [
@@ -1934,7 +1956,12 @@ def research_prediction_column(model_id: str) -> str:
 
 
 def _numeric_matrix(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    return frame[list(columns)].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
+    matrix = frame[list(columns)].copy()
+    return (
+        matrix.apply(lambda column: pd.to_numeric(column.astype("object"), errors="coerce"))
+        .fillna(0.0)
+        .astype(float)
+    )
 
 
 def _target_to_log_rvar(
@@ -6833,7 +6860,7 @@ def write_proxy_research_report(
         "The question is whether models improve trading decisions around option-implied "
         "earnings event variance mispricing. The target system has three realized-variance "
         "labels: `jump_c2o` is the primary scientific target for close-to-open earnings "
-        "jump variance; `day_c2c` is the literature-compatible target and the only V1 "
+        "jump variance; `day_c2c` is the literature-compatible target and the current "
         "proxy-PnL headline; `reaction_o2c` is a diagnostic target for post-open digestion. "
         "The market baseline is implied event variance `IVAR_event`. C2C ex post "
         "mispricing is `RVAR_event_day_c2c - IVAR_event`; C2O is reported as "
@@ -6842,7 +6869,7 @@ def write_proxy_research_report(
         "not by forecast error alone.",
         "The unified option open anchor is same-contract option VWAP from 5 to 15 "
         "minutes after the regular-session open. It is the primary C2O exit proxy "
-        "and the O2C realized-decomposition entry proxy; O2C is not a V1 "
+        "and the O2C realized-decomposition entry proxy; O2C is not a "
         "model-driven strategy headline because no post-open residual-IV baseline is "
         "estimated.",
         "",
@@ -6917,7 +6944,7 @@ def write_proxy_research_report(
         "",
         f"Hyperparameters are selected on validation `{TUNING_SELECTION_TARGET_ID}`. "
         "Forecast/ranking tables still report `jump_c2o`, `day_c2c`, and diagnostic "
-        "`reaction_o2c`; strategy and PnL columns use `day_c2c`, the only V1 "
+        "`reaction_o2c`; strategy and PnL columns use `day_c2c`, the current "
         "proxy-PnL headline.",
         "",
         _markdown_table(summary, "_No summary metrics written._"),
@@ -7025,12 +7052,12 @@ def write_proxy_research_report(
             ),
             (
                 "The strategy layer evaluates premium-space C2C outcomes and proxy costs, "
-                "which is the intended V1 economic target for selling the project."
+                "which is the intended current economic target for selling the project."
             ),
             (
                 "O2C option PnL uses the same 5-15 minute open anchor as a realized "
                 "decomposition diagnostic, but it is not converted into an IVAR-based "
-                "strategy in V1."
+                "strategy headline."
             ),
             "These are still no-NBBO proxy economics, not paper-grade execution evidence.",
         ],
@@ -7061,7 +7088,7 @@ def write_proxy_research_report(
                 else "C2O 5-15 minute option-VWAP proxy strategy metrics were unavailable."
             ),
             (
-                "Interpret the 5-15 minute mark as the V1 C2O trade-aggregate comparison "
+                "Interpret the 5-15 minute mark as the C2O trade-aggregate comparison "
                 "against C2C; the intrinsic mark is not an option-price exit."
             ),
             "",
@@ -7323,7 +7350,7 @@ def write_proxy_research_report(
             ),
             (
                 f"- The sequence sample has selection risk because {sequence_drop_rate:.1%} of "
-                "events fail the V1 sequence coverage rule."
+                "events fail the sequence coverage rule."
             ),
             f"- `vix_regime_unavailable={sequence_report.get('vix_regime_unavailable', 'NA')}`.",
             "- The report is suitable for internal research discussion, not final paper claims.",
@@ -7360,8 +7387,22 @@ def build_base_feature_matrix(config: ProjectConfig) -> pd.DataFrame:
         / "trade_proxy_straddle_diagnostics.csv"
     )
     panel = read_table(panel_path)
+    panel = _filter_feature_eligible_event_panel(panel)
     straddles = read_table(straddle_path) if straddle_path.exists() else None
     return build_model_feature_matrix(panel, straddle_diagnostics=straddles)
+
+
+def _filter_feature_eligible_event_panel(panel: pd.DataFrame) -> pd.DataFrame:
+    if panel.empty:
+        return panel.copy()
+    if "event_entry_timestamp" in panel.columns:
+        entry_ts = pd.to_datetime(panel["event_entry_timestamp"], errors="coerce", utc=True)
+    else:
+        entry_ts = pd.Series(pd.NaT, index=panel.index, dtype="datetime64[ns, UTC]")
+    if "entry_date" in panel.columns:
+        entry_date_ts = pd.to_datetime(panel["entry_date"], errors="coerce", utc=True)
+        entry_ts = entry_ts.fillna(entry_date_ts)
+    return panel.loc[entry_ts.notna()].copy()
 
 
 QUOTE_EXECUTION_CONFIDENCE_COLUMNS = [
@@ -7664,6 +7705,172 @@ def build_runup_surface_proxy_features(long_rows: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_underlying_pre_event_runup_features(long_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "event_id",
+        "underlying_pre_event_return_5d",
+        "underlying_pre_event_return_10d",
+        "underlying_pre_event_rv5_last",
+        "underlying_pre_event_rv5_mean_5d",
+    ]
+    if long_rows.empty or "event_id" not in long_rows:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, object]] = []
+    for event_id, group in long_rows.sort_values("seq_index").groupby("event_id", dropna=False):
+        ordered = group.sort_values("seq_index")
+        return_source = (
+            ordered["underlying_return_1d"]
+            if "underlying_return_1d" in ordered
+            else pd.Series(index=ordered.index, dtype=float)
+        )
+        rv5_source = (
+            ordered["rv5"] if "rv5" in ordered else pd.Series(index=ordered.index, dtype=float)
+        )
+        returns = (
+            pd.to_numeric(return_source, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        rv5 = pd.to_numeric(rv5_source, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+        def compounded_tail_return(window: int, series: pd.Series = returns) -> float:
+            tail = series.tail(window)
+            if tail.empty:
+                return np.nan
+            return float(np.prod(1.0 + tail.to_numpy(dtype=float)) - 1.0)
+
+        rows.append(
+            {
+                "event_id": event_id,
+                "underlying_pre_event_return_5d": compounded_tail_return(5),
+                "underlying_pre_event_return_10d": compounded_tail_return(10),
+                "underlying_pre_event_rv5_last": float(rv5.iloc[-1]) if len(rv5) else np.nan,
+                "underlying_pre_event_rv5_mean_5d": float(rv5.tail(5).mean())
+                if len(rv5)
+                else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+SECTOR_SIC_GROUPS = (
+    "technology_communication",
+    "financials_real_estate",
+    "healthcare",
+    "consumer",
+    "energy_materials_industrials",
+    "other",
+)
+
+
+def _read_sec_company_metadata(config: ProjectConfig) -> pd.DataFrame:
+    path = config.silver_data_dir / "sec" / "company_metadata.parquet"
+    if not path.exists() or path.stat().st_size <= 0:
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def _coarse_group_from_sic(sic_value: object) -> str | None:
+    sic = pd.to_numeric(pd.Series([sic_value]), errors="coerce").iloc[0]
+    if pd.isna(sic):
+        return None
+    code = int(sic)
+    if 6000 <= code <= 6799:
+        return "financials_real_estate"
+    if 8000 <= code <= 8099 or 2830 <= code <= 2839:
+        return "healthcare"
+    if 5200 <= code <= 5999 or 7000 <= code <= 7999:
+        return "consumer"
+    if 1000 <= code <= 1799 or 2000 <= code <= 3999 or 4000 <= code <= 4999 or 4900 <= code <= 4999:
+        if 3570 <= code <= 3579 or 3660 <= code <= 3679 or 7370 <= code <= 7379:
+            return "technology_communication"
+        return "energy_materials_industrials"
+    if 4800 <= code <= 4899:
+        return "technology_communication"
+    return "other"
+
+
+def _coarse_group_from_text(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if any(
+        token in text
+        for token in (
+            "technology",
+            "software",
+            "semiconductor",
+            "computer",
+            "internet",
+            "communication",
+            "telecom",
+        )
+    ):
+        return "technology_communication"
+    if any(token in text for token in ("bank", "financial", "insurance", "real estate", "reit")):
+        return "financials_real_estate"
+    if any(
+        token in text
+        for token in ("health", "pharma", "biotech", "medical", "therapeutics", "drug")
+    ):
+        return "healthcare"
+    if any(
+        token in text
+        for token in ("retail", "consumer", "restaurant", "apparel", "media", "entertainment")
+    ):
+        return "consumer"
+    if any(
+        token in text
+        for token in ("energy", "oil", "gas", "mining", "industrial", "manufactur", "utility")
+    ):
+        return "energy_materials_industrials"
+    return None
+
+
+def merge_sector_sic_coarse_controls(features: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
+    out = features.copy()
+    metadata = _read_sec_company_metadata(config)
+    if not metadata.empty and "ticker" in metadata.columns and "ticker" in out.columns:
+        keep = [
+            column
+            for column in ["ticker", "sic", "sic_description", "entity_type", "category"]
+            if column in metadata.columns
+        ]
+        out = out.merge(
+            metadata[keep].drop_duplicates("ticker"),
+            on="ticker",
+            how="left",
+            suffixes=("", "_sec"),
+        )
+    candidate_columns = [
+        column
+        for column in ["sector", "sic", "sic_description", "entity_type", "category"]
+        if column in out.columns
+    ]
+    if not candidate_columns:
+        return out
+
+    groups: list[str | None] = []
+    for _, row in out.iterrows():
+        group = _coarse_group_from_text(row.get("sector"))
+        if group is None:
+            group = _coarse_group_from_text(row.get("sic_description"))
+        if group is None:
+            group = _coarse_group_from_sic(row.get("sic"))
+        if group is None:
+            group = _coarse_group_from_text(row.get("category"))
+        if group is None:
+            group = _coarse_group_from_text(row.get("entity_type"))
+        groups.append(group)
+    group_series = pd.Series(groups, index=out.index, dtype="object")
+    out["sector_sic_available"] = group_series.notna()
+    for group in SECTOR_SIC_GROUPS:
+        out[f"sector_sic_{group}"] = group_series.eq(group)
+    return out
+
+
 def run_research_sequence_audit(config: ProjectConfig) -> ProxyResearchResult:
     paths = research_paths(config)
     paths.modeling_artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -7728,6 +7935,9 @@ def run_research_features(
     runup = build_runup_surface_proxy_features(long_rows)
     if not runup.empty:
         features = features.merge(runup, on="event_id", how="left")
+    underlying_runup = build_underlying_pre_event_runup_features(long_rows)
+    if not underlying_runup.empty:
+        features = features.merge(underlying_runup, on="event_id", how="left")
     features["hybrid_sequence_too_sparse"] = bool(hybrid_report.get("hybrid_sequence_too_sparse"))
     market_covariates = _read_market_covariates(config)
     market_covariate_columns = 0
@@ -7747,6 +7957,7 @@ def run_research_features(
             columns=[column for column in _vix_columns_for_merge() if column in features.columns]
         ).merge(vix_features[merge_columns], on="event_id", how="left")
     features = merge_sec_xbrl_features(features, config)
+    features = merge_sector_sic_coarse_controls(features, config)
     market_second = _read_market_second_covariates(config)
     market_second_columns = 0
     if not market_second.empty and "event_id" in market_second.columns:
@@ -7824,14 +8035,6 @@ def run_research_features(
         market_second_columns=market_second_columns,
     )
     tensor_report = build_sequence_tensor(long_rows, features, out_path=paths.sequence_tensor_path)
-    hybrid_tensor_report = build_sequence_tensor(
-        hybrid_long,
-        features,
-        out_path=paths.hybrid_sequence_tensor_path,
-        feature_names=HYBRID_SEQUENCE_FEATURE_NAMES,
-        lookback_days=HYBRID_STEPS,
-        per_step_type_scaling=True,
-    )
     hybrid_tensor_v2_report = build_sequence_tensor(
         hybrid_long,
         features,
@@ -7863,7 +8066,6 @@ def run_research_features(
             "sequence_long": str(paths.sequence_long_path),
             "sequence_tensor": str(paths.sequence_tensor_path),
             "hybrid_sequence_long": str(paths.hybrid_sequence_long_path),
-            "hybrid_sequence_tensor": str(paths.hybrid_sequence_tensor_path),
             "hybrid_sequence_tensor_v2": str(paths.hybrid_sequence_tensor_v2_path),
             "feature_matrix": str(paths.feature_matrix_path),
             "feature_schema_report": str(feature_schema_report_path),
@@ -7891,7 +8093,6 @@ def run_research_features(
             **report,
             "hybrid": hybrid_report,
             "tensor": tensor_report,
-            "hybrid_tensor": hybrid_tensor_report,
             "hybrid_tensor_v2": hybrid_tensor_v2_report,
             "feature_rows": int(len(features)),
             "feature_schema_version": feature_schema_version,

@@ -1,7 +1,5 @@
 feature_schema:
   default_version: fe_v2_sec_xbrl
-  ablation_versions:
-    - fe_v1_legacy
   resolved_report: artifacts/modeling/feature_schema_report.csv
   transform_params: artifacts/modeling/feature_transform_params.json
   selector_rule: "only model_feature=true rows in the resolved report may enter trainable models"

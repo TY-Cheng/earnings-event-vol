@@ -3,7 +3,8 @@
 **Name**: earnings-event-vol
 
 **Repo root**:
-`/home/tycheng/projects/earnings-event-vol/earnings-event-vol`.
+Use the active checkout path on the current machine. The last Mac checkout was
+`/Users/tycheng/Library/CloudStorage/OneDrive-NationalUniversityofSingapore/earnings-event-vol/earnings-event-vol`.
 
 **Purpose**: reproducible empirical-research pipeline for U.S. single-name
 equity-option earnings event variance mispricing.
@@ -23,26 +24,30 @@ volatility forecasting.
 
 ## Target System
 
-- `day_c2c`: default hyperparameter-selection target, literature-compatible
-  target, and the only V1 proxy-PnL headline.
+- `day_c2c`: default hyperparameter-selection target and
+  literature-compatible target.
 - `jump_c2o`: primary scientific decomposition target, close-to-open earnings
   jump variance.
 - `reaction_o2c`: post-open digestion diagnostic.
 
 ## Current Data State
 
-- Current old proxy/modeling snapshot: 2022-12-01 through 2025-12-31.
-- Target rebuild/paper window: 2013-01-01 through 2026-06-05, pending
-  historical quote/NBBO or equivalent data.
+- Target rebuild/data window: 2016-10-01 through 2026-06-05.
 - Dynamic monthly top-50 liquid U.S. single-name option underlyings.
 - SEC EDGAR 8-K Item 2.02 discovery with SEC primary-document text validation.
 - SEC CompanyFacts XBRL fundamentals with conservative as-of gating.
 - Massive options day aggregates, underlying day aggregates, targeted option
   one-second trade aggregates, and targeted `quotes_v1` extraction support.
-- Current refreshed panel: 816 BMO/AMC events, 807 C2C RVAR rows, 705
-  trade-proxy IVAR rows, 23,845 event contract candidates, 11,729 quote-pool
-  contracts, 10,046 usable pre-cutoff proxy prices, and 789 proxy straddle
-  diagnostic rows.
+- The Mac checkout currently has a broader 2016-01-01 preflight event-window
+  panel: 3,072 events, 3,001 events with RVAR,
+  80,275 event contract candidates, and 40,709 quote-pool contract rows.
+- Contract-reference validation and trade-proxy panel have been rebuilt for
+  this preflight panel. Its trade-proxy panel has 3,072 events, 2,538
+  events with trade-proxy IVAR, 80,006 proxy-usable contract rows, and 55,580
+  contracts with usable pre-entry trade proxy marks.
+- Gold feature matrix in the preflight snapshot has 3,071 rows, 559 columns,
+  and 415 model features under `fe_v2_sec_xbrl`. Rebuild data/features for the
+  2016-10-01 main window before citing current-window model claims.
 
 ## Quote-Aware Evidence Modules
 
@@ -76,8 +81,7 @@ volatility forecasting.
 
 ## Feature Protocol
 
-- Default schema: `fe_v2_sec_xbrl`.
-- Ablation schema retained: `fe_v1_legacy`.
+- Default and only accepted schema: `fe_v2_sec_xbrl`.
 - Resolved allowlist: `artifacts/modeling/feature_schema_report.csv`.
 - Transform artifact: `artifacts/modeling/feature_transform_params.json`.
 - Execution confidence, quote diagnostics, quote-IVAR, and quote-IV surface fields are
@@ -127,26 +131,26 @@ remain historical only.
 
 Latest synchronized run:
 
-- Command shape: `research --stage models --sequence-suite all
-  --bootstrap-iter 0 --reuse-tuning-params`; report refresh is still pending.
-- Run shape: FE V2 tuned refresh with the active lightweight sequence
-  diagnostic suite. Mask-only/time-shuffle numeric rows need a model/report
-  rerun after the sequence-control runtime cleanup before they represent
-  current code. The populated snapshot also predates the switch to the
-  canonical `tuned_phase1_day_c2c_rank_log_rvar` log-target profile.
-- Manifest: `ok=true`, `stage=models`, `sequence_suite=all`,
-  `bootstrap_iter=0`, `reuse_tuning_params=true`.
-- Feature rows: 816.
-- Prediction rows: 2,448.
-- Forecast/ranking metrics after refresh: 42 rows each.
-- Strategy metrics after refresh: 84 rows.
+- Intended current command shape: main-window data rebuild through
+  contract-reference validation and trade-proxy panel, followed by
+  `research --stage features --feature-schema-version fe_v2_sec_xbrl` and
+  `data --stage lake-quality-audit`.
+- Broader preflight manifest: `ok=true`, `stage=features`,
+  `feature_schema_version=fe_v2_sec_xbrl`, `sequence_suite=all`,
+  `tuning_profile=tuned_phase1_day_c2c_rank_log_rvar`.
+- Broader preflight event-window rows: 3,072.
+- Broader preflight feature matrix rows: 3,071.
+- Broader preflight feature matrix columns: 559, with 415 model features.
+- Historical model/report snapshot rows: 816 feature rows and 2,448
+  prediction rows. Those forecast/ranking/strategy metrics predate the
+  refreshed feature matrix and are stale for current-code claims.
 - Current code rejects stale `jump_c2o`, raw-target, or old-profile tuning
   caches; rerun models/report for current-code log-target results.
 - Completion-gap audit: `completion_gap_audit.json` has `ok=false`,
   `paper_grade_ready=false`, with 8 complete rows, 2 diagnostic-only rows, and
   2 incomplete rows.
 
-Current key results:
+Historical model snapshot key results, not current target-window claims:
 
 - `jump_c2o`: the populated snapshot's old LightGBM/XGBoost ensemble row has
   best OOS R2 versus IVAR at 0.2374. Rerun models before citing the new
@@ -162,7 +166,7 @@ Current key results:
   at 0.8075.
 - O2C strategy rows are diagnostic only and `pnl_headline_eligible=false`.
 
-Current fresh interpretation artifacts:
+Broader preflight interpretation artifacts:
 
 - `ivar_defeat_events.csv`: 4,260 rows.
 - `ivar_defeat_metrics.csv`: 42 rows.
@@ -183,8 +187,8 @@ tuned models improve variance-level fit. The current fast refresh does not
 support positive headline C2C economics or executable trading performance.
 
 Do not claim paper-grade executable performance, full-spread tradability, NBBO
-evidence, FE V1 superiority, FE V2 improvement, sequence superiority, or that
-lower RMSE alone proves economic value.
+evidence, feature-schema improvement versus retired profiles, sequence
+superiority, or that lower RMSE alone proves economic value.
 
 ## Current Implementation Status
 
@@ -195,8 +199,14 @@ lower RMSE alone proves economic value.
 - `results_snapshot.md` is the paper-style Results and Discussion ledger.
 - Quote-aware execution confidence, IVAR defeat analysis, and casebook
   artifacts are implemented.
-- `just data` is green for the active data DAG.
-- `just research-fast` is green and refreshes the current fast result set.
+- `just data` was rebuilt through contract-reference validation,
+  trade-proxy panel, and lake-quality audit for the broader 2016-01-01
+  preflight window. Full main-window quote/NBBO-equivalent coverage remains
+  missing.
+- `research --stage features` rebuilt the broader preflight gold feature
+  matrix. Data/features/model/report outputs still need a 2016-10-01
+  main-window rerun; the local Mac LightGBM runtime segfaulted at
+  `lightgbm_tuned` during a no-sequence smoke run.
 
 ## Command Surface
 
@@ -210,7 +220,6 @@ Key commands:
 - `just data`
 - `just research-fast`
 - `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1_day_c2c_rank_log_rvar --feature-schema-version fe_v2_sec_xbrl"`
-- `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1_day_c2c_rank_log_rvar --feature-schema-version fe_v1_legacy"`
 - `just docs`
 
 ## Credential and Portability Policy

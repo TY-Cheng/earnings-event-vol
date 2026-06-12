@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pandas as pd
@@ -18,7 +18,9 @@ import polars as pl
 
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.contract_reference import (
+    CONTRACT_REFERENCE_FETCH_ROUTE_VERSION,
     CONTRACT_REFERENCE_SCHEMA_VERSION,
+    REFERENCE_STATUS_MISSING_REFERENCE,
     REFERENCE_STATUS_VALIDATED,
     apply_contract_reference_validation,
     fetch_massive_option_contract_reference,
@@ -76,8 +78,10 @@ from earnings_event_vol.universe import (
     eligible_equity_cache_matches_rule,
 )
 
-TARGET_WINDOW_START = date(2013, 1, 1)
+TARGET_WINDOW_START = date(2016, 10, 1)
 TARGET_WINDOW_END = date(2026, 6, 5)
+CONTRACT_REFERENCE_SUCCESS_GATE_MIN_FETCHES = 1000
+CONTRACT_REFERENCE_SUCCESS_GATE_MIN_VALIDATED = 1
 
 DEFAULT_STATIC_TICKERS: tuple[str, ...] = (
     "AAPL",
@@ -169,6 +173,26 @@ def _complete(paths: Sequence[Path]) -> bool:
     return bool(paths) and all(path.exists() and path.stat().st_size > 0 for path in paths)
 
 
+def _canonical_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_json_value(nested)
+            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, tuple | list):
+        return [_canonical_json_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return cast(Any, value).item()
+        except (TypeError, ValueError):
+            return str(value)
+    return value
+
+
 def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
     if not path.exists() or path.stat().st_size <= 0:
         return False
@@ -176,7 +200,10 @@ def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return bool(payload.get("pipeline_params") == dict(expected))
+    return bool(
+        _canonical_json_value(payload.get("pipeline_params"))
+        == _canonical_json_value(dict(expected))
+    )
 
 
 def _complete_with_params(
@@ -542,6 +569,29 @@ def _submission_acceptance_lookup(payload: Mapping[str, object]) -> dict[str, st
     return out
 
 
+COMPANY_METADATA_COLUMNS = [
+    "ticker",
+    "cik",
+    "sic",
+    "sic_description",
+    "entity_type",
+    "category",
+]
+
+
+def _normalize_company_metadata_payload(
+    *, ticker: str, cik: int | None, payload: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "ticker": ticker,
+        "cik": int(cik) if cik is not None else pd.NA,
+        "sic": payload.get("sic"),
+        "sic_description": payload.get("sicDescription"),
+        "entity_type": payload.get("entityType"),
+        "category": payload.get("category"),
+    }
+
+
 def _normalize_companyfacts_payload(
     *,
     ticker: str,
@@ -600,9 +650,10 @@ def _sec_companyfacts_step(
     out = out_root / "sec_companyfacts"
     raw_dir = config.bronze_data_dir / "sec" / "companyfacts"
     silver_path = config.silver_data_dir / "sec" / "companyfacts.parquet"
+    metadata_path = config.silver_data_dir / "sec" / "company_metadata.parquet"
     diagnostics_path = out / "sec_companyfacts_diagnostics.csv"
     manifest_path = out / "sec_companyfacts_manifest.json"
-    outputs = (silver_path, diagnostics_path, manifest_path)
+    outputs = (silver_path, metadata_path, diagnostics_path, manifest_path)
     if not calendar_path.exists():
         return DataPipelineStep(
             "sec-companyfacts",
@@ -633,6 +684,7 @@ def _sec_companyfacts_step(
     out.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     rows: list[pd.DataFrame] = []
+    metadata_rows: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
     try:
         with httpx.Client(timeout=config.massive_request_timeout_seconds) as client:
@@ -648,6 +700,13 @@ def _sec_companyfacts_step(
             last_request_at = 0.0
             for ticker in tickers:
                 cik = ticker_map.get(ticker)
+                metadata_rows.append(
+                    _normalize_company_metadata_payload(
+                        ticker=ticker,
+                        cik=cik,
+                        payload=submissions.get(ticker, {}),
+                    )
+                )
                 if cik is None:
                     diagnostics.append({"ticker": ticker, "status": "missing_cik"})
                     continue
@@ -708,6 +767,7 @@ def _sec_companyfacts_step(
     except Exception as exc:
         error = safe_exception_text(exc)
         _write_parquet(silver_path, pd.DataFrame(columns=["ticker", "cik", "feature_concept"]))
+        _write_parquet(metadata_path, pd.DataFrame(columns=COMPANY_METADATA_COLUMNS))
         pd.DataFrame([{"status": "http_or_parse_degraded", "error": error}]).to_csv(
             diagnostics_path, index=False
         )
@@ -739,6 +799,11 @@ def _sec_companyfacts_step(
         _write_parquet(silver_path, facts)
     else:
         _write_parquet(silver_path, pd.DataFrame(columns=["ticker", "cik", "feature_concept"]))
+    metadata = pd.DataFrame(metadata_rows, columns=COMPANY_METADATA_COLUMNS)
+    if not metadata.empty:
+        metadata["cik"] = pd.to_numeric(metadata["cik"], errors="coerce").astype("Int64")
+        metadata["sic"] = pd.to_numeric(metadata["sic"], errors="coerce").astype("Int64")
+    _write_parquet(metadata_path, metadata)
     diag = pd.DataFrame(diagnostics)
     diag.to_csv(diagnostics_path, index=False)
     mapped_rows = (
@@ -762,6 +827,7 @@ def _sec_companyfacts_step(
         "request_interval_seconds": 0.125,
         "outputs": {
             "companyfacts": str(silver_path),
+            "company_metadata": str(metadata_path),
             "diagnostics": str(diagnostics_path),
         },
     }
@@ -1489,6 +1555,9 @@ def _download_error_status(result: MassiveCommandResult) -> str:
     if result.returncode in {124, 127}:
         return "failed"
     text = f"{result.stderr}\n{result.stdout}".lower()
+    access_denied_markers = ("forbidden", "403", "accessdenied", "access denied")
+    if any(marker in text for marker in access_denied_markers):
+        return "access_denied_flat_file"
     missing_markers = ("nosuchkey", "not found", "404", "does not exist", "not exist")
     return "missing_flat_file" if any(marker in text for marker in missing_markers) else "failed"
 
@@ -2387,7 +2456,6 @@ def _lake_dataset_row(
         "target_coverage_status": coverage_status,
         "gap_reason": gap_reason,
         "required_for_target_window": bool(required_for_target_window),
-        "required_for_2013_2025": bool(required_for_target_window),
         "paper_grade_requirement": paper_grade_requirement,
         "expected_weekday_partitions": expected_partitions,
         "partition_coverage_share": partition_coverage,
@@ -2906,7 +2974,7 @@ def _event_window_panel_step(
     second_expiry_dte_max = max(dte_max + 14, 28)
     params = {
         "stage": "event-window-panel",
-        "calendar": str(effective_calendar_path),
+        "calendar": _path_signature(effective_calendar_path),
         "dte_min": dte_min,
         "dte_max": dte_max,
         "ivar_support_dte_max": second_expiry_dte_max,
@@ -2983,7 +3051,7 @@ def _contract_reference_validation_step(
 
     params = {
         "stage": "contract-reference-validation",
-        "candidate_path": str(candidate_path),
+        "candidate_path": _path_signature(candidate_path),
         "max_contracts": max_contracts,
         "refresh_bronze": refresh_bronze,
         "schema_version": CONTRACT_REFERENCE_SCHEMA_VERSION,
@@ -2993,23 +3061,6 @@ def _contract_reference_validation_step(
         "contract_reference_validated",
         "contract_reference_source_dataset",
     }
-    if (
-        not force
-        and not refresh_bronze
-        and _complete_with_params(
-            outputs,
-            params_path=manifest_path,
-            expected_params=params,
-        )
-        and _parquet_has_columns(candidate_path, required_candidate_columns)
-    ):
-        return DataPipelineStep(
-            "contract-reference-validation",
-            "skipped",
-            outputs,
-            reason="outputs_exist_params_match",
-        )
-
     candidates = pd.read_parquet(candidate_path)
     if "options_ticker" not in candidates.columns:
         return DataPipelineStep(
@@ -3039,6 +3090,38 @@ def _contract_reference_validation_step(
             reason="no_candidate_option_tickers",
         )
 
+    if (
+        not force
+        and not refresh_bronze
+        and _complete_with_params(
+            outputs,
+            params_path=manifest_path,
+            expected_params=params,
+        )
+        and _parquet_has_columns(candidate_path, required_candidate_columns)
+    ):
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            requested_count = int(manifest_payload.get("reference_contracts_requested", -1))
+            manifest_fetch_route_version = str(
+                manifest_payload.get("contract_reference_fetch_route_version", "")
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            requested_count = -1
+            manifest_fetch_route_version = ""
+        if (
+            requested_count >= len(unique_tickers)
+            and manifest_fetch_route_version == CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
+        ):
+            return DataPipelineStep(
+                "contract-reference-validation",
+                "skipped",
+                outputs,
+                reason="outputs_exist_params_match",
+            )
+
+    existing_reference_rows: list[dict[str, object]] = []
+    tickers_to_fetch = unique_tickers
     if not refresh_bronze and reference_path.exists() and reference_path.stat().st_size > 0:
         try:
             reference_report = pd.read_parquet(reference_path)
@@ -3047,75 +3130,127 @@ def _contract_reference_validation_step(
                 reference_report = reference_report.drop_duplicates(
                     "options_ticker", keep="last"
                 ).copy()
-                validated = apply_contract_reference_validation(candidates, reference_report)
-                _write_parquet(candidate_path, validated)
-                _write_parquet(reference_path, reference_report)
-                reference_report.to_csv(report_path, index=False)
-                fetch_counts = (
-                    reference_report["fetch_status"].astype(str).value_counts().to_dict()
-                    if "fetch_status" in reference_report
-                    else {}
-                )
-                status_counts = (
-                    reference_report["contract_reference_status"]
+                reference_status = reference_report.get(
+                    "contract_reference_status",
+                    pd.Series("", index=reference_report.index),
+                ).astype(str)
+                fetch_route_version = reference_report.get(
+                    "contract_reference_fetch_route_version",
+                    pd.Series(pd.NA, index=reference_report.index),
+                ).astype(str)
+                stale_missing_reference = reference_status.eq(
+                    REFERENCE_STATUS_MISSING_REFERENCE
+                ) & fetch_route_version.ne(CONTRACT_REFERENCE_FETCH_ROUTE_VERSION)
+                reusable_reference_report = reference_report.loc[~stale_missing_reference].copy()
+                covered_tickers = set(
+                    reusable_reference_report["options_ticker"]
+                    .dropna()
                     .astype(str)
-                    .value_counts()
-                    .to_dict()
-                    if "contract_reference_status" in reference_report
-                    else {}
+                    .str.strip()
+                    .str.upper()
                 )
-                non_standard_rows = int(
-                    validated["contract_discovery_status"]
-                    .astype(str)
-                    .eq("non_standard_excluded")
-                    .sum()
-                )
-                proxy_usable_rows = int(
-                    validated.get(
-                        "contract_reference_proxy_usable",
-                        pd.Series(False, index=validated.index),
+                missing_tickers = [
+                    option_ticker
+                    for option_ticker in unique_tickers
+                    if option_ticker not in covered_tickers
+                ]
+                if not missing_tickers:
+                    validated = apply_contract_reference_validation(
+                        candidates, reusable_reference_report
                     )
-                    .fillna(False)
-                    .astype(bool)
-                    .sum()
-                )
-                manifest = {
-                    "pipeline_params": params,
-                    "status_counts": {str(key): int(value) for key, value in status_counts.items()},
-                    "fetch_status_counts": {
-                        str(key): int(value) for key, value in fetch_counts.items()
-                    },
-                    "candidate_rows": int(len(candidates)),
-                    "candidate_rows_after_validation": int(len(validated)),
-                    "reference_contracts_requested": int(len(reference_report)),
-                    "validated_contracts": int(
-                        reference_report["contract_reference_status"]
+                    _write_parquet(candidate_path, validated)
+                    _write_parquet(reference_path, reusable_reference_report)
+                    reusable_reference_report.to_csv(report_path, index=False)
+                    final_params = {
+                        **params,
+                        "candidate_path": _path_signature(candidate_path),
+                    }
+                    fetch_counts = (
+                        reusable_reference_report["fetch_status"]
                         .astype(str)
-                        .eq(REFERENCE_STATUS_VALIDATED)
+                        .value_counts()
+                        .to_dict()
+                        if "fetch_status" in reusable_reference_report
+                        else {}
+                    )
+                    status_counts = (
+                        reusable_reference_report["contract_reference_status"]
+                        .astype(str)
+                        .value_counts()
+                        .to_dict()
+                        if "contract_reference_status" in reusable_reference_report
+                        else {}
+                    )
+                    non_standard_rows = int(
+                        validated["contract_discovery_status"]
+                        .astype(str)
+                        .eq("non_standard_excluded")
                         .sum()
                     )
-                    if "contract_reference_status" in reference_report
-                    else 0,
-                    "proxy_usable_contract_rows": proxy_usable_rows,
-                    "non_standard_excluded_rows": non_standard_rows,
-                    "reused_reference_report": True,
-                    "outputs": [str(path) for path in outputs],
-                }
-                manifest_path.write_text(
-                    json.dumps(manifest, indent=2, default=str), encoding="utf-8"
-                )
-                return DataPipelineStep(
-                    "contract-reference-validation",
-                    "ran",
-                    outputs,
-                    metadata={
-                        "reference_contracts_requested": int(len(reference_report)),
-                        "status_counts": manifest["status_counts"],
-                        "fetch_status_counts": manifest["fetch_status_counts"],
+                    proxy_usable_rows = int(
+                        validated.get(
+                            "contract_reference_proxy_usable",
+                            pd.Series(False, index=validated.index),
+                        )
+                        .fillna(False)
+                        .astype(bool)
+                        .sum()
+                    )
+                    manifest = {
+                        "pipeline_params": final_params,
+                        "status_counts": {
+                            str(key): int(value) for key, value in status_counts.items()
+                        },
+                        "fetch_status_counts": {
+                            str(key): int(value) for key, value in fetch_counts.items()
+                        },
+                        "candidate_rows": int(len(candidates)),
+                        "candidate_rows_after_validation": int(len(validated)),
+                        "contract_reference_fetch_route_version": (
+                            CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
+                        ),
+                        "target_reference_contracts": int(len(unique_tickers)),
+                        "reference_contracts_requested": int(len(reusable_reference_report)),
+                        "stale_reference_contracts_ignored": int(stale_missing_reference.sum()),
+                        "validated_contracts": int(
+                            reusable_reference_report["contract_reference_status"]
+                            .astype(str)
+                            .eq(REFERENCE_STATUS_VALIDATED)
+                            .sum()
+                        )
+                        if "contract_reference_status" in reusable_reference_report
+                        else 0,
                         "proxy_usable_contract_rows": proxy_usable_rows,
                         "non_standard_excluded_rows": non_standard_rows,
                         "reused_reference_report": True,
-                    },
+                        "missing_reference_contracts_fetched": 0,
+                        "outputs": [str(path) for path in outputs],
+                    }
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+                    )
+                    return DataPipelineStep(
+                        "contract-reference-validation",
+                        "ran",
+                        outputs,
+                        metadata={
+                            "reference_contracts_requested": int(len(reusable_reference_report)),
+                            "target_reference_contracts": int(len(unique_tickers)),
+                            "stale_reference_contracts_ignored": int(stale_missing_reference.sum()),
+                            "status_counts": manifest["status_counts"],
+                            "fetch_status_counts": manifest["fetch_status_counts"],
+                            "proxy_usable_contract_rows": proxy_usable_rows,
+                            "non_standard_excluded_rows": non_standard_rows,
+                            "reused_reference_report": True,
+                            "missing_reference_contracts_fetched": 0,
+                        },
+                    )
+                existing_reference_rows = reusable_reference_report.to_dict("records")
+                tickers_to_fetch = missing_tickers
+                _progress(
+                    "contract-reference-validation: existing reference report covers "
+                    f"{len(covered_tickers)}/{len(unique_tickers)} contracts; "
+                    f"fetching {len(tickers_to_fetch)} missing contracts"
                 )
         except Exception as exc:
             _progress(
@@ -3125,12 +3260,14 @@ def _contract_reference_validation_step(
 
     _progress(
         "contract-reference-validation: "
-        f"contracts={len(unique_tickers)} jobs={jobs} refresh_bronze={refresh_bronze}"
+        f"contracts={len(unique_tickers)} fetch={len(tickers_to_fetch)} "
+        f"jobs={jobs} refresh_bronze={refresh_bronze}"
     )
     out.mkdir(parents=True, exist_ok=True)
     cache_root = config.bronze_data_dir / "massive" / "options_contract_reference"
-    rows: list[dict[str, object]] = []
+    rows: list[dict[str, object]] = list(existing_reference_rows)
     completed = 0
+    quality_gate: dict[str, object] | None = None
     with (
         httpx.Client(timeout=config.massive_request_timeout_seconds) as client,
         ThreadPoolExecutor(max_workers=max(1, jobs)) as executor,
@@ -3144,7 +3281,7 @@ def _contract_reference_validation_step(
                 cache_root=cache_root,
                 refresh_bronze=refresh_bronze,
             ): option_ticker
-            for option_ticker in unique_tickers
+            for option_ticker in tickers_to_fetch
         }
         for future in as_completed(futures):
             option_ticker = futures[future]
@@ -3159,19 +3296,52 @@ def _contract_reference_validation_step(
                 }
             rows.append(row)
             completed += 1
-            if completed == len(unique_tickers) or completed % 25 == 0:
-                counts = Counter(str(item.get("fetch_status")) for item in rows)
+            if completed == len(tickers_to_fetch) or completed % 25 == 0:
+                fetched_rows = rows[len(existing_reference_rows) :]
+                counts = Counter(str(item.get("fetch_status")) for item in fetched_rows)
                 _progress(
                     "contract-reference-validation progress: "
-                    f"{completed}/{len(unique_tickers)} "
+                    f"{completed}/{len(tickers_to_fetch)} "
                     + ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
                 )
+                validated_fetches = sum(
+                    str(item.get("contract_reference_status")) == REFERENCE_STATUS_VALIDATED
+                    for item in fetched_rows
+                )
+                if (
+                    completed >= CONTRACT_REFERENCE_SUCCESS_GATE_MIN_FETCHES
+                    and validated_fetches < CONTRACT_REFERENCE_SUCCESS_GATE_MIN_VALIDATED
+                ):
+                    quality_gate = {
+                        "name": "contract_reference_success_rate_gate",
+                        "status": "failed",
+                        "fetched_rows": int(completed),
+                        "validated_rows": int(validated_fetches),
+                        "min_fetched_rows": CONTRACT_REFERENCE_SUCCESS_GATE_MIN_FETCHES,
+                        "min_validated_rows": CONTRACT_REFERENCE_SUCCESS_GATE_MIN_VALIDATED,
+                    }
+                    _progress(
+                        "contract-reference-validation quality gate failed: "
+                        f"{validated_fetches} validated references in {completed} fetched rows"
+                    )
+                    for pending in futures:
+                        pending.cancel()
+                    break
 
-    reference_report = pd.DataFrame(rows).sort_values("options_ticker").reset_index(drop=True)
+    reference_report = (
+        pd.DataFrame(rows)
+        .drop_duplicates("options_ticker", keep="last")
+        .sort_values("options_ticker")
+        .reset_index(drop=True)
+    )
     validated = apply_contract_reference_validation(candidates, reference_report)
     _write_parquet(candidate_path, validated)
     _write_parquet(reference_path, reference_report)
     reference_report.to_csv(report_path, index=False)
+    final_params = {
+        **params,
+        "candidate_path": _path_signature(candidate_path),
+    }
     fetch_counts = (
         reference_report["fetch_status"].astype(str).value_counts().to_dict()
         if "fetch_status" in reference_report
@@ -3195,12 +3365,19 @@ def _contract_reference_validation_step(
         .sum()
     )
     manifest = {
-        "pipeline_params": params,
+        "pipeline_params": final_params,
         "status_counts": {str(key): int(value) for key, value in status_counts.items()},
         "fetch_status_counts": {str(key): int(value) for key, value in fetch_counts.items()},
         "candidate_rows": int(len(candidates)),
         "candidate_rows_after_validation": int(len(validated)),
-        "reference_contracts_requested": int(len(unique_tickers)),
+        "contract_reference_fetch_route_version": CONTRACT_REFERENCE_FETCH_ROUTE_VERSION,
+        "target_reference_contracts": int(len(unique_tickers)),
+        "reference_contracts_requested": int(len(reference_report)),
+        "existing_reference_contracts_reused": int(len(existing_reference_rows)),
+        "missing_reference_contracts_fetched": int(
+            len(reference_report) - len(existing_reference_rows)
+        ),
+        "quality_gate": quality_gate,
         "validated_contracts": int(
             reference_report["contract_reference_status"]
             .astype(str)
@@ -3214,16 +3391,24 @@ def _contract_reference_validation_step(
         "outputs": [str(path) for path in outputs],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    status = "blocked" if quality_gate is not None else "ran"
     return DataPipelineStep(
         "contract-reference-validation",
-        "ran",
+        status,
         outputs,
+        reason="contract_reference_success_rate_gate_failed" if quality_gate is not None else None,
         metadata={
-            "reference_contracts_requested": int(len(unique_tickers)),
+            "target_reference_contracts": int(len(unique_tickers)),
+            "reference_contracts_requested": int(len(reference_report)),
             "status_counts": manifest["status_counts"],
             "fetch_status_counts": manifest["fetch_status_counts"],
             "proxy_usable_contract_rows": proxy_usable_rows,
             "non_standard_excluded_rows": non_standard_rows,
+            "existing_reference_contracts_reused": int(len(existing_reference_rows)),
+            "missing_reference_contracts_fetched": int(
+                len(reference_report) - len(existing_reference_rows)
+            ),
+            "quality_gate": quality_gate,
         },
     )
 
@@ -3754,6 +3939,12 @@ def _trade_proxy_panel_step(
     )
     params = {
         "stage": "trade-proxy-panel",
+        "windows": _path_signature(
+            config.silver_data_dir / "event_windows" / "event_windows.parquet"
+        ),
+        "contracts": _path_signature(
+            config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+        ),
         "max_events": max_events,
         "max_contracts": max_contracts,
         "lookback_seconds": lookback_seconds,

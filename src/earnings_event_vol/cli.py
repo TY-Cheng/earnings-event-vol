@@ -1068,7 +1068,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--feature-schema-version",
         choices=list(FEATURE_SCHEMA_VERSIONS),
         default=DEFAULT_FEATURE_SCHEMA_VERSION,
-        help="Feature schema/allowlist version; defaults to the current FE V2 schema.",
+        help="Feature schema/allowlist version; defaults to the current fe_v2_sec_xbrl schema.",
     )
 
     leakage_audit = subparsers.add_parser("leakage-audit", help="Audit feature leakage.")

@@ -1,20 +1,26 @@
 # Current State and Caveats
 
-Last synchronized: 2026-06-12 after switching the canonical tuning contract to
-the log-target profile and dual-output LightGBM/XGBoost ensemble, without
-running a full retune.
+Last synchronized: 2026-06-13 after switching the main target window to
+2016-10-01 through 2026-06-05. The Mac checkout has a broader 2016-01-01
+preflight data/feature snapshot, but the full main-window data/feature/model
+package still needs to be rerun.
 
-Actual repo root is `/home/tycheng/projects/earnings-event-vol/earnings-event-vol`; the outer `/home/tycheng/projects/earnings-event-vol` is only the workspace wrapper.
+Current Mac checkout root is `/Users/tycheng/Library/CloudStorage/OneDrive-NationalUniversityofSingapore/earnings-event-vol/earnings-event-vol`; the outer `/Users/tycheng/Library/CloudStorage/OneDrive-NationalUniversityofSingapore/earnings-event-vol` is only the local workspace wrapper. Other machines should use their active checkout path and machine-local `.env`.
 
 ## Local Execution Status
 
-- Current local `DATA_DIR` is `/home/tycheng/data/earnings-event-vol`.
-- `.env` is machine-local and ignored. It should keep `UV_PROJECT_ENVIRONMENT=/home/tycheng/.venvs/earnings-event-vol` and device-specific absolute data/secret paths outside the repo.
-- Previous `just check` status: passed on 2026-06-12 with 153 tests, mypy
-  clean, MkDocs strict build clean, doc-figure sync check clean, source-probe
-  ok, and coverage 95.03%. Cleanup verification reran ruff, targeted tests,
-  and MkDocs strict build; full `just check` was not rerun after cleanup.
-- Data command defaults target 2013-01-01 through 2026-06-05, but current populated lake coverage is incomplete for that paper target.
+- `DATA_DIR`, `UV_PROJECT_ENVIRONMENT`, and secret-file paths are
+  machine-local `.env` settings. Do not hardcode the Mac paths in portable
+  commands or docs.
+- The most recent Mac verification resolved `DATA_DIR` to
+  `/Volumes/ExternalSSD/data/earnings-event-vol`; this is an example of the
+  local `.env`, not a required project path.
+- Current `just check` status: passed on 2026-06-13 with 175 tests, coverage
+  95.13%, ruff format/check clean, mypy clean, MkDocs strict build clean, CLI
+  `status` clean, and `source-probe all` clean.
+- Data command defaults now target 2016-10-01 through 2026-06-05. The broader
+  2016-01-01 Mac materialization is a preflight snapshot only after the
+  target-window switch.
 - Active research code no longer writes `mamba_seeds`/`mamba_backend`,
   no longer exposes `bigru_sequence_5seed` or `mamba_ssm_sequence_5seed`, and
   no longer imports or instantiates a BiGRU sequence encoder.
@@ -39,30 +45,69 @@ The paper-facing question is whether models improve trading decisions around opt
 
 Target system:
 
-- `day_c2c`: default hyperparameter-selection target, literature-compatible
-  target, and the only V1 proxy-PnL headline.
+- `day_c2c`: default hyperparameter-selection target and
+  literature-compatible target.
 - `jump_c2o`: primary scientific decomposition target, close-to-open earnings
   jump variance.
 - `reaction_o2c`: post-open digestion diagnostic.
 
 ## Current Data and Execution Grade
 
-- Current proxy/modeling window: 2022-12-01 through 2025-12-31.
-- Target rebuild/paper window: 2013-01-01 through 2026-06-05, pending historical quote/NBBO or equivalent data.
-- Current feature/event panel: 816 BMO/AMC main-sample events.
+- Target rebuild/data window: 2016-10-01 through 2026-06-05.
+- The broader Mac preflight snapshot shows bronze options day aggregates
+  covering the prior broad window. Bronze underlying day aggregates cover
+  2016-06-13 through 2026-06-05, so the main window starts after the known
+  2016-H1 underlying entitlement gap.
+- The broader Mac preflight snapshot has 5,785 in-universe dynamic-calendar
+  rows and 3,072 main-sample proxy-timing candidates after SEC primary-document
+  text validation.
+- The broader preflight event-window panel has 3,072 events, 3,001 events with
+  RVAR, 80,275 candidate contract rows, and 40,709 quote-pool contract rows.
+- Preflight contract-reference validation covers 79,903 unique option tickers:
+  79,634 validated and 269 `missing_reference`; unknown deliverables are not
+  proxy-usable, and the preflight candidate panel has 40,643 eligible quote-pool
+  rows and 17,577 main-DTE rows after reference gating.
+- Trade-proxy panel has been rebuilt for the preflight event-window panel:
+  3,072 events, 3,001 with RVAR, 2,538 with trade-proxy IVAR, 80,006
+  reference-usable proxy contract rows, 55,580 contracts with usable
+  pre-entry trade proxy marks, and 24,426 with no trade in the cutoff window.
+- Main second-aggregate cache in the broader preflight refresh has 79,920
+  files, with 70,825 written and 9,095 cache hits. Exit-preclose and post-open
+  caches each have 5,400 files, with 4,134 written and 1,266 hits.
+- Preflight gold feature matrix and `feature_schema_report.csv` have been
+  refreshed:
+  3,071 feature rows, 559 total columns, and 415 model features under
+  `fe_v2_sec_xbrl`. One LCID non-trading-day event without entry/exit timestamp
+  is filtered before feature construction.
+- Full model/report outputs have not yet been rebuilt against a refreshed
+  2016-10-01 main-window feature matrix. A local no-sequence model smoke rerun
+  against the broader preflight matrix reached
+  `lightgbm_tuned` and then segfaulted in the Mac LightGBM runtime even with
+  single-thread environment variables. A separate minimal LightGBM fit succeeds,
+  so the blocker appears tied to the current research training path and this
+  Mac runtime combination rather than a total LightGBM import failure. Rerun
+  models/report on a stable CPU/GPU environment before citing current PnL or
+  selected parameters.
 - Panel grade remains `no_nbbo_trade_proxy`; `paper_grade=false` for canonical model economics.
-- Full historical lake-quality audit is implemented and populated at `artifacts/data_pipeline/lake_quality_audit/`. Latest audit: `ok=false`; 17/17 audited datasets are `target_span_incomplete`; all 15 required paper-grade datasets are incomplete for the target window.
-- Options day aggregates cover 2022-05-04 to 2025-12-31. Underlying day aggregates cover 2016-05-04 to 2025-12-31. Main event/modeling sample starts in December 2022.
+- Full historical lake-quality audit is implemented and populated at
+  `artifacts/data_pipeline/lake_quality_audit/`. For the main 2016-10-01
+  window, the expected remaining paper-grade blocker is full historical
+  bid/ask/NBBO-equivalent quote coverage.
 
 ## Quote Execution State
 
-Bounded quote extraction is populated, but it is not full-sample paper-grade NBBO evidence.
+Bounded quote extraction below is from the older proxy snapshot unless
+explicitly refreshed after the 2016-10-01 main-window event panel. It is not
+full-sample paper-grade NBBO evidence.
 
-- Route: targeted Massive REST quote windows with cache under `/home/tycheng/data/earnings-event-vol/bronze/massive/quotes_v3_rest_target_windows/cache`.
+- Route: targeted Massive REST quote windows with cache under the active
+  `DATA_DIR`, usually `bronze/massive/quotes_v3_rest_target_windows/cache`.
 - Targeted REST quote extraction supports `--quote-workers` / `quote_workers` for bounded parallel window fetches while preserving the cache and no-full-day-file policy.
 - Targeted quote extraction also supports resumable batch slices with `--quote-event-offset`, `--max-events`, and `--quote-batch-label`; batch-labeled runs write under `batches/batch=...` and do not overwrite the canonical bounded quote slice. Use `quote-execution-merge` with `--quote-merge-batch` after shard verification to consolidate batches into canonical quote lake/research artifacts.
 - No full-day quote files are stored in the repo.
-- Bronze normalized targeted quotes: `/home/tycheng/data/earnings-event-vol/bronze/massive/quotes_v1_target_windows/quote_window_quotes.parquet` has 10,921,438 rows after canonical plus `offset64_size64`, `offset128_size64`, `offset192_size64`, `offset256_size64`, `offset320_size16`, `offset336_size16`, `offset352_size16`, `offset368_size16`, `offset384_size16`, `offset400_size16`, `offset416_size16`, `offset432_size16`, `offset448_size16`, `offset464_size16`, `offset480_size16`, and `offset496_size16` consolidation.
+- Older bronze normalized targeted quotes had 10,921,438 rows after bounded
+  shard consolidation; do not treat those counts as refreshed for the current
+  2016-10-01 main-window event panel.
 - Quote requests: 14,366 rows, 502 events.
 - Quote marks: 14,366 rows, 502 events.
 - Quote execution legs: 14,366 rows, 502 events.
@@ -76,8 +121,7 @@ Bounded quote extraction is populated, but it is not full-sample paper-grade NBB
 
 ## Model and Feature Status
 
-- Default feature schema: `fe_v2_sec_xbrl`.
-- Ablation schema retained: `fe_v1_legacy`.
+- Default and only accepted feature schema: `fe_v2_sec_xbrl`.
 - Model-feature allowlist is `artifacts/modeling/feature_schema_report.csv`.
 - Execution-confidence, quote-IVAR, and quote-IV surface diagnostics are evaluation fields, not model features.
 - Implemented models: market IVAR, last-four RVAR, last-four IVAR,
@@ -96,9 +140,9 @@ Bounded quote extraction is populated, but it is not full-sample paper-grade NBB
   `best_iteration < 25`, `tree_method="hist"`, controlled `n_jobs`, and
   best-trial selection by the penalized objective. The 0.01 penalty is a soft
   discouragement, not a hard veto.
-- Current populated numeric snapshot predates the log-target profile and
-  forecast-ensemble dual-output code change; rerun models before citing new
-  selected params, new ensemble rows, IVAR-defeat rows, or casebook rows.
+- Current populated model metrics predate the refreshed 2016-10-01
+  main-window feature matrix; rerun models before citing selected params,
+  ensemble rows, IVAR-defeat rows, casebook rows, or strategy PnL.
 - Current diagnostics are 15 sequence gate rows and 15 incremental-value rows.
   Sequence rows remain diagnostic; primary `jump_c2o`
   sequence rows must beat controls and bootstrap gates before any headline
@@ -108,6 +152,9 @@ Bounded quote extraction is populated, but it is not full-sample paper-grade NBB
 
 Fresh analysis artifacts include:
 
+- `feature_schema_report.csv`: refreshed for `fe_v2_sec_xbrl` with 415 model
+  features, including sequence call/put volume imbalance aggregates,
+  own-underlying pre-event return/RV run-up, and SEC SIC coarse controls.
 - `quote_confidence_prediction_coverage.csv`: 30 rows with high/medium/low/missing bands across train/validation/test.
 - `quote_confidence_strategy_summary.csv`: 72 rows.
 - `quote_confidence_ivar_defeat_summary.csv`: 126 rows.
@@ -130,12 +177,12 @@ target-window coverage.
 
 ## Next Execution Path
 
-1. Expand quote extraction from bounded diagnostic slice to the final required sample if quote/NBBO or equivalent coverage is available; use batch-labeled offset/size slices to preserve cache reuse and avoid overwriting canonical artifacts, then consolidate verified shards with `quote-execution-merge`.
-2. Expand bounded quote-IV surface diagnostics to full historical/NBBO-equivalent coverage if the paper needs quote-derived IVAR as more than bounded diagnostic evidence.
-3. Re-run models/report under `tuned_phase1_day_c2c_rank_log_rvar` if
+1. Re-run models/report under `tuned_phase1_day_c2c_rank_log_rvar` if
    current-code metrics are needed, then keep sequence diagnostics framed as
    failed-gate diagnostics unless future runs beat controls and economics
    gates.
+2. Expand quote extraction from bounded diagnostic slice to the final required sample if quote/NBBO or equivalent coverage is available; use batch-labeled offset/size slices to preserve cache reuse and avoid overwriting canonical artifacts, then consolidate verified shards with `quote-execution-merge`.
+3. Expand bounded quote-IV surface diagnostics to full historical/NBBO-equivalent coverage if the paper needs quote-derived IVAR as more than bounded diagnostic evidence.
 4. Re-run full canonical research only after final data/quote coverage decisions.
 5. Keep docs/results synchronized only from verified artifacts.
 6. Re-run `just check` before handoff or commit.

@@ -101,7 +101,6 @@ from earnings_event_vol.events import (
     validate_calendar_frame,
 )
 from earnings_event_vol.features import (
-    FEATURE_SCHEMA_V1_LEGACY,
     FEATURE_SCHEMA_V2_SEC_XBRL,
     add_rolling_earnings_history,
     add_train_fit_normalized_features,
@@ -198,10 +197,12 @@ from earnings_event_vol.research import (
     TUNING_SELECTION_TARGET_ID,
     TuningState,
     _best_completed_trial,
+    _filter_feature_eligible_event_panel,
     _latest_xbrl_values_for_event,
     _load_reusable_tuning_state,
     _log_rvar_to_variance,
     _model_ids_for_sequence_suite,
+    _numeric_matrix,
     _sequence_losses,
     _target_ids_for_sequence_suite,
     _target_to_log_rvar,
@@ -216,9 +217,11 @@ from earnings_event_vol.research import (
     build_robustness_summary_table,
     build_sequence_tensor,
     build_sequence_v2_quality,
+    build_underlying_pre_event_runup_features,
     enrich_feature_matrix_for_research,
     hybrid_sequence_coverage_by_event,
     inference_table,
+    merge_sector_sic_coarse_controls,
     o2c_scale_diagnostic,
     prepare_target_frame,
     proxy_surface_distribution_audit,
@@ -801,8 +804,8 @@ def test_earnings_calendar_candidates_from_sec_and_massive_fixture_dirs(
 
     assert len(frame) == 3
     assert "8-K/A" not in set(frame["form_type"])
-    assert report["main_sample_candidate_rows"] == 0
-    assert report["timing_counts"] == {"UNKNOWN": 3}
+    assert report["main_sample_candidate_rows"] == 2
+    assert report["timing_counts"] == {"AMC": 1, "BMO": 2}
     assert report["acceptance_inferred_timing_counts"] == {"AMC": 1, "BMO": 2}
     assert (
         frame.loc[frame["source_id"] == "0001628280-26-022956", "text_validation_status"].iloc[0]
@@ -811,7 +814,7 @@ def test_earnings_calendar_candidates_from_sec_and_massive_fixture_dirs(
     validated_calendar = validate_calendar_frame(
         frame[["ticker", "announcement_date", "announcement_timing", "source"]]
     )
-    assert int(validated_calendar["is_main_sample_timing"].sum()) == 0
+    assert int(validated_calendar["is_main_sample_timing"].sum()) == 3
 
 
 def test_earnings_calendar_http_fetch_path_uses_official_and_massive_sources(
@@ -890,9 +893,10 @@ def test_earnings_calendar_http_fetch_path_uses_official_and_massive_sources(
             http_client=client,
         )
 
-    assert frame["announcement_timing"].tolist() == ["UNKNOWN"]
+    assert frame["announcement_timing"].tolist() == ["AMC"]
     assert frame["acceptance_inferred_timing"].tolist() == ["AMC"]
-    assert frame["is_main_sample_candidate"].tolist() == [False]
+    assert frame["is_main_sample_candidate"].tolist() == [True]
+    assert frame["timing_confidence"].tolist() == ["proxy_sec_acceptance_timestamp"]
     assert frame["text_validation_source"].tolist() == ["sec_primary_document_text"]
     assert report["validation_route"] == "sec_edgar_http+sec_primary_document_text"
     assert report["massive_8k_fetch_failed"] == 0
@@ -966,7 +970,7 @@ def test_earnings_calendar_uses_massive_only_as_auxiliary_fallback(
 
     assert frame["text_validation_source"].tolist() == ["massive_8k_text_fallback"]
     assert frame["text_validation_aux_status"].tolist() == ["validated_earnings_release"]
-    assert frame["is_main_sample_candidate"].tolist() == [False]
+    assert frame["is_main_sample_candidate"].tolist() == [True]
     assert report["validation_route"] == (
         "sec_edgar_http+sec_primary_document_text+massive_8k_text_http_auxiliary"
     )
@@ -1974,9 +1978,14 @@ def test_contract_reference_helpers_parse_cache_and_fallback_endpoint(
         .as_posix()
         .endswith("options_ticker=O_ABC260213C00100000/reference.json")
     )
-    assert (
+    assert pd.isna(
         contract_reference.extract_contract_reference_fields("O:ABC", {})[
             "contract_reference_has_adjusted_deliverable"
+        ]
+    )
+    assert (
+        contract_reference.extract_contract_reference_fields("O:ABC", {})[
+            "contract_reference_deliverable_known"
         ]
         is False
     )
@@ -2011,7 +2020,7 @@ def test_contract_reference_helpers_parse_cache_and_fallback_endpoint(
     parsed_query = urllib.parse.parse_qs(urllib.parse.urlparse(fallback_url).query)
     assert parsed_query["ticker"] == ["O:ABC260213C00100000"]
     assert parsed_query["expired"] == ["true"]
-    assert parsed_query["as_of"] == ["2026-02-13"]
+    assert parsed_query["expiration_date"] == ["2026-02-13"]
     assert Path(str(fetched.cache_path)).exists()
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
@@ -2027,9 +2036,14 @@ def test_contract_reference_helpers_parse_cache_and_fallback_endpoint(
 def test_contract_reference_handles_missing_parse_and_failed_fetch(
     tmp_path: Path,
 ) -> None:
-    assert (
+    assert pd.isna(
         contract_reference.extract_contract_reference_fields("O:ABC", None)[
             "contract_reference_has_adjusted_deliverable"
+        ]
+    )
+    assert (
+        contract_reference.extract_contract_reference_fields("O:ABC", None)[
+            "contract_reference_deliverable_known"
         ]
         is False
     )
@@ -2066,7 +2080,20 @@ def test_contract_reference_handles_missing_parse_and_failed_fetch(
     cache_root = tmp_path / "cache"
     missing_cache = contract_reference.contract_reference_cache_path(cache_root, "O:MISS")
     missing_cache.parent.mkdir(parents=True)
-    missing_cache.write_text('{"results": []}', encoding="utf-8")
+    missing_cache.write_text(
+        json.dumps(
+            {
+                "results": [],
+                "_contract_reference_fetch_route_version": (
+                    contract_reference.CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_missing_cache = contract_reference.contract_reference_cache_path(cache_root, "O:STALE")
+    stale_missing_cache.parent.mkdir(parents=True)
+    stale_missing_cache.write_text('{"results": []}', encoding="utf-8")
     parse_cache = contract_reference.contract_reference_cache_path(cache_root, "O:PARSE")
     parse_cache.parent.mkdir(parents=True)
     parse_cache.write_text('{"results": {"ticker": "O:PARSE"}}', encoding="utf-8")
@@ -2097,6 +2124,24 @@ def test_contract_reference_handles_missing_parse_and_failed_fetch(
     assert missing.contract_reference_status == "missing_reference"
     assert parse_failed.contract_reference_status == "parse_failed"
     assert failed.contract_reference_status == "fetch_failed"
+
+    def stale_cache_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.rstrip("/") != "/v3/reference/options/contracts":
+            return httpx.Response(404, json={"status": "NOT_FOUND"})
+        return httpx.Response(
+            200,
+            json={"results": [{"ticker": "O:STALE", "shares_per_contract": 100}]},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(stale_cache_handler)) as client:
+        refreshed_stale = contract_reference.fetch_massive_option_contract_reference(
+            client,
+            config,
+            options_ticker="O:STALE",
+            cache_root=cache_root,
+        )
+    assert refreshed_stale.fetch_status == "downloaded"
+    assert refreshed_stale.contract_reference_status == "validated"
 
     def secret_error_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -2134,6 +2179,11 @@ def test_contract_reference_handles_missing_parse_and_failed_fetch(
 
 
 def test_contract_reference_validation_empty_and_invalid_reports() -> None:
+    assert contract_reference._coerce_bool_value(pd.NA, default=True) is True
+    assert contract_reference._coerce_bool_value(" yes ", default=False) is True
+    assert contract_reference._coerce_bool_value("no", default=True) is False
+    assert contract_reference._is_missing_value([1, 2]) is False
+
     candidates = pd.DataFrame({"options_ticker": ["O:ABC260213C00100000"]})
 
     empty = apply_contract_reference_validation(candidates, pd.DataFrame())
@@ -2187,12 +2237,125 @@ def test_contract_reference_validation_empty_and_invalid_reports() -> None:
                 "options_ticker": ["O:ABC260213C00100000"],
                 "contract_reference_status": ["missing_reference"],
                 "contract_reference_has_adjusted_deliverable": [False],
+                "contract_reference_deliverable_known": [True],
             }
         ),
     )
     assert bool(missing_reference_standard["contract_reference_validated"].iloc[0]) is False
     assert bool(missing_reference_standard["contract_reference_proxy_usable"].iloc[0]) is True
     assert bool(missing_reference_standard["eligible_for_quote_pool"].iloc[0]) is True
+    missing_reference_unknown_deliverable = apply_contract_reference_validation(
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213P00100000"],
+                "contract_discovery_status": ["ok"],
+                "eligible_for_quote_pool": [True],
+                "is_main_dte_5_14": [True],
+                "is_robustness_dte_3_21": [True],
+                "option_multiplier": [100],
+                "contract_size": [100],
+            }
+        ),
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213P00100000"],
+                "contract_reference_status": ["missing_reference"],
+                "contract_reference_has_adjusted_deliverable": [pd.NA],
+                "contract_reference_deliverable_known": [False],
+            }
+        ),
+    )
+    assert (
+        bool(missing_reference_unknown_deliverable["contract_reference_proxy_usable"].iloc[0])
+        is False
+    )
+    assert bool(missing_reference_unknown_deliverable["eligible_for_quote_pool"].iloc[0]) is False
+    stale_reference_columns = apply_contract_reference_validation(
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_discovery_status": ["ok"],
+                "eligible_for_quote_pool": [False],
+                "option_multiplier": [100],
+                "contract_size": [100],
+                "contract_reference_status": ["fetch_failed"],
+                "contract_reference_validated": [False],
+                "contract_reference_proxy_usable": [False],
+            }
+        ),
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_reference_status": ["missing_reference"],
+                "contract_reference_has_adjusted_deliverable": [False],
+                "contract_reference_deliverable_known": [True],
+            }
+        ),
+    )
+    assert stale_reference_columns["contract_reference_status"].tolist() == ["missing_reference"]
+    assert bool(stale_reference_columns["contract_reference_proxy_usable"].iloc[0]) is True
+    rerun_polluted_candidates = apply_contract_reference_validation(
+        pd.DataFrame(
+            {
+                "options_ticker": [
+                    "O:ABC260213C00100000",
+                    "O:ABC260227C00100000",
+                ],
+                "dte": [8, 22],
+                "contract_discovery_status": [
+                    "contract_reference_unvalidated_excluded",
+                    "ivar_support_only",
+                ],
+                "contract_discovery_status_pre_reference": [
+                    "contract_reference_unvalidated_excluded",
+                    "ivar_support_only",
+                ],
+                "eligible_for_quote_pool": [False, False],
+                "is_main_dte_5_14": [False, False],
+                "is_robustness_dte_3_21": [False, False],
+                "is_ivar_support_only": [False, True],
+                "option_multiplier": [100, 100],
+                "contract_size": [100, 100],
+            }
+        ),
+        pd.DataFrame(
+            {
+                "options_ticker": [
+                    "O:ABC260213C00100000",
+                    "O:ABC260227C00100000",
+                ],
+                "contract_reference_status": ["validated", "validated"],
+                "contract_reference_shares_per_contract": [100, 100],
+            }
+        ),
+    )
+    assert rerun_polluted_candidates["contract_discovery_status"].tolist() == [
+        "ok",
+        "ivar_support_only",
+    ]
+    assert rerun_polluted_candidates["eligible_for_quote_pool"].tolist() == [True, False]
+    assert rerun_polluted_candidates["is_main_dte_5_14"].tolist() == [True, False]
+    assert rerun_polluted_candidates["is_robustness_dte_3_21"].tolist() == [True, False]
+    rerun_minimal_flags = apply_contract_reference_validation(
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_discovery_status": ["contract_reference_unvalidated_excluded"],
+                "is_ivar_support_only": [False],
+                "option_multiplier": [100],
+                "contract_size": [100],
+            }
+        ),
+        pd.DataFrame(
+            {
+                "options_ticker": ["O:ABC260213C00100000"],
+                "contract_reference_status": ["validated"],
+                "contract_reference_shares_per_contract": [100],
+            }
+        ),
+    )
+    assert rerun_minimal_flags["contract_discovery_status"].tolist() == ["ok"]
+    assert bool(rerun_minimal_flags["contract_reference_proxy_usable"].iloc[0]) is True
     failed_minimal = apply_contract_reference_validation(
         pd.DataFrame(
             {
@@ -2338,7 +2501,11 @@ def test_contract_reference_validation_reuses_existing_reference_report(
             "options_ticker": ["O:AAA260213C00100000"],
             "fetch_status": ["hit"],
             "contract_reference_status": ["missing_reference"],
+            "contract_reference_fetch_route_version": [
+                contract_reference.CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
+            ],
             "contract_reference_has_adjusted_deliverable": [False],
+            "contract_reference_deliverable_known": [True],
         }
     )
     pl.from_pandas(candidates).write_parquet(candidate_path)
@@ -2366,6 +2533,163 @@ def test_contract_reference_validation_reuses_existing_reference_report(
     assert bool(validated["contract_reference_proxy_usable"].iloc[0]) is True
     assert bool(validated["eligible_for_quote_pool"].iloc[0]) is True
     assert step.metadata["reused_reference_report"] is True
+
+
+def test_contract_reference_validation_fetches_missing_existing_reference_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        load_project_config(),
+        silver_data_dir=tmp_path / "silver",
+        bronze_data_dir=tmp_path / "bronze",
+    )
+    candidate_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    reference_path = config.silver_data_dir / "contracts" / "contract_reference_validation.parquet"
+    candidate_path.parent.mkdir(parents=True)
+    candidates = pd.DataFrame(
+        {
+            "event_id": ["evt1", "evt1"],
+            "options_ticker": ["O:AAA260213C00100000", "O:AAA260213P00100000"],
+            "option_multiplier": [100, 100],
+            "contract_size": [100, 100],
+            "contract_discovery_status": ["ok", "ok"],
+            "eligible_for_quote_pool": [True, True],
+        }
+    )
+    existing_reference = pd.DataFrame(
+        {
+            "options_ticker": ["O:AAA260213C00100000"],
+            "fetch_status": ["hit"],
+            "contract_reference_status": ["missing_reference"],
+            "contract_reference_fetch_route_version": [
+                contract_reference.CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
+            ],
+            "contract_reference_has_adjusted_deliverable": [False],
+            "contract_reference_deliverable_known": [True],
+        }
+    )
+    pl.from_pandas(candidates).write_parquet(candidate_path)
+    pl.from_pandas(existing_reference).write_parquet(reference_path)
+
+    fetched: list[str] = []
+
+    def fake_fetch(
+        client: httpx.Client,
+        config: object,
+        *,
+        options_ticker: str,
+        cache_root: Path,
+        refresh_bronze: bool = False,
+    ) -> contract_reference.ContractReferenceFetchResult:
+        del client, config, cache_root, refresh_bronze
+        fetched.append(options_ticker)
+        return contract_reference.ContractReferenceFetchResult(
+            options_ticker=options_ticker,
+            fetch_status="downloaded",
+            contract_reference_status="missing_reference",
+            payload={},
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.fetch_massive_option_contract_reference",
+        fake_fetch,
+    )
+
+    step = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=1,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+
+    assert step.status == "ran"
+    assert fetched == ["O:AAA260213P00100000"]
+    assert step.metadata["existing_reference_contracts_reused"] == 1
+    assert step.metadata["missing_reference_contracts_fetched"] == 1
+    merged = pd.read_parquet(reference_path)
+    assert sorted(merged["options_ticker"].tolist()) == [
+        "O:AAA260213C00100000",
+        "O:AAA260213P00100000",
+    ]
+    validated = pd.read_parquet(candidate_path)
+    assert validated["contract_reference_proxy_usable"].tolist() == [True, False]
+    assert validated["eligible_for_quote_pool"].tolist() == [True, False]
+
+
+def test_contract_reference_validation_blocks_when_success_gate_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(data_pipeline, "CONTRACT_REFERENCE_SUCCESS_GATE_MIN_FETCHES", 3)
+    monkeypatch.setattr(data_pipeline, "CONTRACT_REFERENCE_SUCCESS_GATE_MIN_VALIDATED", 1)
+    config = replace(
+        load_project_config(),
+        silver_data_dir=tmp_path / "silver",
+        bronze_data_dir=tmp_path / "bronze",
+    )
+    candidate_path = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    candidate_path.parent.mkdir(parents=True)
+    candidates = pd.DataFrame(
+        {
+            "event_id": ["evt1", "evt1", "evt1"],
+            "options_ticker": [
+                "O:AAA260213C00100000",
+                "O:AAA260213P00100000",
+                "O:AAA260220C00100000",
+            ],
+            "option_multiplier": [100, 100, 100],
+            "contract_size": [100, 100, 100],
+            "contract_discovery_status": ["ok", "ok", "ok"],
+            "eligible_for_quote_pool": [True, True, True],
+        }
+    )
+    pl.from_pandas(candidates).write_parquet(candidate_path)
+
+    def fake_fetch(
+        client: httpx.Client,
+        config: object,
+        *,
+        options_ticker: str,
+        cache_root: Path,
+        refresh_bronze: bool = False,
+    ) -> contract_reference.ContractReferenceFetchResult:
+        del client, config, cache_root, refresh_bronze
+        return contract_reference.ContractReferenceFetchResult(
+            options_ticker=options_ticker,
+            fetch_status="missing_reference",
+            contract_reference_status="missing_reference",
+            payload={"results": []},
+        )
+
+    monkeypatch.setattr(
+        "earnings_event_vol.data_pipeline.fetch_massive_option_contract_reference",
+        fake_fetch,
+    )
+
+    step = data_pipeline._contract_reference_validation_step(
+        config,
+        out_root=tmp_path / "artifacts",
+        force=False,
+        jobs=1,
+        max_contracts=None,
+        refresh_bronze=False,
+    )
+
+    assert step.status == "blocked"
+    assert step.reason == "contract_reference_success_rate_gate_failed"
+    assert step.metadata["quality_gate"] == {
+        "name": "contract_reference_success_rate_gate",
+        "status": "failed",
+        "fetched_rows": 3,
+        "validated_rows": 0,
+        "min_fetched_rows": 3,
+        "min_validated_rows": 1,
+    }
+    validated = pd.read_parquet(candidate_path)
+    assert validated["contract_reference_proxy_usable"].tolist() == [False, False, False]
 
 
 def test_contract_reference_validation_pipeline_step_blocks_without_candidates(
@@ -3112,6 +3436,24 @@ def test_bulk_day_aggs_bronze_statuses_and_refresh(tmp_path: Path) -> None:
     )
     assert missing["status"] == "missing_flat_file"
 
+    def access_denied_runner(
+        command: Sequence[str], env: Mapping[str, str], timeout: float
+    ) -> MassiveCommandResult:
+        return MassiveCommandResult(
+            returncode=254,
+            stdout="",
+            stderr="An error occurred (403) when calling the HeadObject operation: Forbidden",
+        )
+
+    access_denied = data_pipeline._ensure_bulk_day_agg_partition(
+        config,
+        dataset="underlying_day_aggs",
+        date_value=date(2025, 1, 9),
+        refresh_bronze=False,
+        runner=access_denied_runner,
+    )
+    assert access_denied["status"] == "access_denied_flat_file"
+
     def failed_runner(
         command: Sequence[str], env: Mapping[str, str], timeout: float
     ) -> MassiveCommandResult:
@@ -3156,6 +3498,27 @@ def test_data_pipeline_completion_and_bulk_helper_edges(tmp_path: Path) -> None:
     assert data_pipeline._complete_with_params(
         [output], params_path=manifest, expected_params={"x": 1}
     )
+    canonical_expected = {
+        "as_of": date(2026, 2, 5),
+        "path": tmp_path / "lake",
+        "windows": ("0_5", "5_15"),
+        "nested": {"b": 2, "a": (1, 2)},
+    }
+    manifest.write_text(
+        json.dumps(
+            {
+                "pipeline_params": {
+                    "as_of": "2026-02-05",
+                    "path": str(tmp_path / "lake"),
+                    "windows": ["0_5", "5_15"],
+                    "nested": {"a": [1, 2], "b": 2},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert data_pipeline._json_params_match(manifest, canonical_expected)
+    assert trade_proxy_panel_script._json_params_match(manifest, canonical_expected)
 
     manifest.write_text(
         json.dumps(
@@ -3324,7 +3687,6 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
     )
     assert missing_row["target_coverage_status"] == "missing"
     assert missing_row["required_for_target_window"] is True
-    assert missing_row["required_for_2013_2025"] is True
     assert missing_years.empty
 
     partitioned = tmp_path / "partitioned"
@@ -4125,7 +4487,7 @@ def test_event_window_panel_step_uses_dynamic_calendar_outputs(
                 {
                     "pipeline_params": {
                         "stage": "event-window-panel",
-                        "calendar": str(calendar),
+                        "calendar": data_pipeline._path_signature(calendar),
                         "dte_min": 3,
                         "dte_max": 21,
                         "ivar_support_dte_max": 35,
@@ -4197,7 +4559,7 @@ def test_data_pipeline_event_window_panel_stage_uses_lake_outputs_and_max_events
                 {
                     "pipeline_params": {
                         "stage": "event-window-panel",
-                        "calendar": str(calendar),
+                        "calendar": data_pipeline._path_signature(calendar),
                         "dte_min": 3,
                         "dte_max": 21,
                         "ivar_support_dte_max": 35,
@@ -4533,9 +4895,16 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
     config = replace(
         load_project_config(),
         repo_root=tmp_path,
+        silver_data_dir=tmp_path / "data" / "silver",
         gold_data_dir=tmp_path / "data" / "gold",
     )
     out_root = tmp_path / "artifacts" / "data_pipeline"
+    windows = config.silver_data_dir / "event_windows" / "event_windows.parquet"
+    contracts = config.silver_data_dir / "contracts" / "event_contract_candidates.parquet"
+    windows.parent.mkdir(parents=True, exist_ok=True)
+    contracts.parent.mkdir(parents=True, exist_ok=True)
+    windows.write_text("windows-placeholder", encoding="utf-8")
+    contracts.write_text("contracts-placeholder", encoding="utf-8")
     captured: dict[str, object] = {}
 
     def fake_run(
@@ -4557,6 +4926,8 @@ def test_data_pipeline_trade_proxy_panel_stage_uses_single_entrypoint(
                 {
                     "pipeline_params": {
                         "stage": "trade-proxy-panel",
+                        "windows": data_pipeline._path_signature(windows),
+                        "contracts": data_pipeline._path_signature(contracts),
                         "max_events": 2,
                         "max_contracts": 12,
                         "lookback_seconds": 600,
@@ -4664,7 +5035,7 @@ def test_trade_proxy_panel_requires_contract_reference_validation(tmp_path: Path
 def test_trade_proxy_reference_proxy_mask_allows_standard_missing_reference() -> None:
     contracts = pd.DataFrame(
         {
-            "contract_reference_validated": [True, False, False, False, False, False],
+            "contract_reference_validated": [True, False, False, False, False, False, False],
             "contract_reference_status": [
                 "validated",
                 "missing_reference",
@@ -4672,12 +5043,14 @@ def test_trade_proxy_reference_proxy_mask_allows_standard_missing_reference() ->
                 "missing_reference",
                 "fetch_failed",
                 "not_requested",
+                "missing_reference",
             ],
             "contract_discovery_status_pre_reference": [
                 "ok",
                 "ok",
                 "ok",
                 "non_standard_excluded",
+                "ok",
                 "ok",
                 "ok",
             ],
@@ -4688,9 +5061,19 @@ def test_trade_proxy_reference_proxy_mask_allows_standard_missing_reference() ->
                 False,
                 False,
                 False,
+                pd.NA,
             ],
-            "option_multiplier": [100, 100, 100, 100, 100, pd.NA],
-            "contract_size": [100, 100, 100, 100, 100, 100],
+            "contract_reference_deliverable_known": [
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                False,
+            ],
+            "option_multiplier": [100, 100, 100, 100, 100, pd.NA, 100],
+            "contract_size": [100, 100, 100, 100, 100, 100, 100],
         }
     )
 
@@ -4701,6 +5084,7 @@ def test_trade_proxy_reference_proxy_mask_allows_standard_missing_reference() ->
         False,
         False,
         True,
+        False,
     ]
 
 
@@ -5055,12 +5439,16 @@ def test_sec_companyfacts_stage_writes_silver_and_diagnostics(
         assert request_interval_seconds == pytest.approx(0.125)
         return {
             "AAPL": {
+                "sic": "3571",
+                "sicDescription": "Electronic Computers",
+                "entityType": "operating",
+                "category": "large accelerated filer",
                 "filings": {
                     "recent": {
                         "accessionNumber": ["0000320193-25-000001"],
                         "acceptanceDateTime": ["2025-01-03T20:00:00.000Z"],
                     }
-                }
+                },
             }
         }
 
@@ -5107,6 +5495,10 @@ def test_sec_companyfacts_stage_writes_silver_and_diagnostics(
     assert facts.loc[0, "cik"] == 320193
     assert facts.loc[0, "feature_concept"] == "assets"
     assert facts.loc[0, "acceptance_datetime"] == "2025-01-03T20:00:00.000Z"
+    metadata = pd.read_parquet(config.silver_data_dir / "sec" / "company_metadata.parquet")
+    assert metadata.loc[0, "ticker"] == "AAPL"
+    assert metadata.loc[0, "sic"] == 3571
+    assert metadata.loc[0, "sic_description"] == "Electronic Computers"
     diagnostics = pd.read_csv(out_root / "sec_companyfacts" / "sec_companyfacts_diagnostics.csv")
     assert diagnostics.loc[0, "status"] == "fetched"
     manifest = json.loads(
@@ -5134,11 +5526,13 @@ def test_sec_companyfacts_missing_calendar_and_payload_edges(tmp_path: Path) -> 
     calendar_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{"ticker": "AAA"}]).to_csv(calendar_path, index=False)
     silver_path = config.silver_data_dir / "sec" / "companyfacts.parquet"
+    metadata_path = config.silver_data_dir / "sec" / "company_metadata.parquet"
     diagnostics_path = out_root / "sec_companyfacts" / "sec_companyfacts_diagnostics.csv"
     manifest_path = out_root / "sec_companyfacts" / "sec_companyfacts_manifest.json"
     silver_path.parent.mkdir(parents=True, exist_ok=True)
     diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     silver_path.write_text("cached", encoding="utf-8")
+    metadata_path.write_text("cached", encoding="utf-8")
     diagnostics_path.write_text("ticker,status\nAAA,cached\n", encoding="utf-8")
     manifest_path.write_text(
         json.dumps(
@@ -6120,8 +6514,13 @@ def test_massive_second_aggregates_fetch_uses_encoded_contract_and_api_key(
         massive_api_key_file=secret,
         massive_base_url="https://api.massive.test",
         massive_request_timeout_seconds=12.0,
+        massive_requests_per_minute=600,
     )
     captured: dict[str, object] = {}
+    throttled: list[int | None] = []
+    monkeypatch.setattr(
+        "earnings_event_vol.trade_proxy.throttle_requests_per_minute", throttled.append
+    )
 
     class FakeResponse:
         def raise_for_status(self) -> None:
@@ -6155,6 +6554,7 @@ def test_massive_second_aggregates_fetch_uses_encoded_contract_and_api_key(
     assert "O%3AABC260213C00100000" in str(captured["url"])
     assert cast(dict[str, object], captured["params"])["apiKey"] == "secret-key"
     assert captured["timeout"] == 12.0
+    assert throttled == [600]
 
     retry_calls = {"count": 0}
 
@@ -6478,6 +6878,26 @@ def test_leakage_audit_blocks_late_asof_and_vendor_forecasts() -> None:
     assert "same_event_return" in result.blocked_columns
     assert "gross_proxy_pnl_usd" in result.blocked_columns
     assert "exit_option_value_usd" in result.blocked_columns
+
+
+def test_leakage_audit_allows_point_in_time_prior_history() -> None:
+    frame = pd.DataFrame(
+        {
+            "ticker": ["ABC"],
+            "feature_asof_timestamp": [datetime(2026, 2, 5, 15, 59)],
+            "event_entry_timestamp": [datetime(2026, 2, 5, 16, 0)],
+            "prior_day_c2c_rvar_median": [0.02],
+            "prior_jump_c2o_rv_iv_spread_median": [0.01],
+            "prior_guidance_revision": [1.0],
+        }
+    )
+
+    result = audit_feature_leakage(frame)
+
+    assert result.ok is False
+    assert "prior_day_c2c_rvar_median" not in result.blocked_columns
+    assert "prior_jump_c2o_rv_iv_spread_median" not in result.blocked_columns
+    assert "prior_guidance_revision" in result.blocked_columns
 
 
 def test_leakage_audit_flags_timezone_mismatch() -> None:
@@ -7746,15 +8166,6 @@ def test_feature_schema_versions_and_selector_branches() -> None:
         }
     )
 
-    legacy = build_feature_schema_report(frame, feature_schema_version=FEATURE_SCHEMA_V1_LEGACY)
-    legacy_selected = set(feature_columns_from_schema_report(legacy, frame=frame))
-    assert "ivar_event" in legacy_selected
-    assert "prior_day_c2c_rvar_median" not in legacy_selected
-    assert "xbrl_log_assets" not in legacy_selected
-    assert "event_month_sin" not in legacy_selected
-    assert "ivar_event_train_z" not in legacy_selected
-    assert "ticker_text" not in legacy_selected
-
     v2 = build_feature_schema_report(frame, feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL)
     v2_selected = set(
         feature_columns_from_schema_report(v2, frame=frame, include_sequence_aggregates=False)
@@ -7776,6 +8187,63 @@ def test_feature_schema_versions_and_selector_branches() -> None:
     assert "prior_text" not in v2_selected
     with pytest.raises(ValueError, match="feature schema report missing columns"):
         feature_columns_from_schema_report(pd.DataFrame({"feature_name": ["x"]}))
+
+
+def test_pre_event_volume_and_underlying_runup_features() -> None:
+    long_rows = pd.DataFrame(
+        {
+            "event_id": ["E1", "E1", "E1", "E1"],
+            "seq_index": [0, 1, 2, 3],
+            "call_put_volume_imbalance": [0.25, -0.10, 0.40, 0.20],
+            "underlying_return_1d": [0.01, 0.02, np.nan, -0.01],
+            "rv5": [0.001, 0.002, np.nan, 0.003],
+        }
+    )
+
+    runup = build_underlying_pre_event_runup_features(long_rows).set_index("event_id")
+    assert runup.loc["E1", "underlying_pre_event_return_5d"] == pytest.approx(
+        (1.01 * 1.02 * 0.99) - 1.0
+    )
+    assert runup.loc["E1", "underlying_pre_event_rv5_last"] == pytest.approx(0.003)
+
+    aggregates = aggregate_sequence_features(long_rows)
+    assert aggregates.loc[0, "seqagg_call_put_volume_imbalance_last"] == pytest.approx(0.20)
+    assert aggregates.loc[0, "seqagg_call_put_volume_imbalance_mean"] == pytest.approx(0.1875)
+
+
+def test_sector_sic_coarse_controls_and_schema_family(tmp_path: Path) -> None:
+    config = replace(load_project_config(), silver_data_dir=tmp_path / "silver")
+    sec_dir = config.silver_data_dir / "sec"
+    sec_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "ticker": ["AAPL", "JPM"],
+            "cik": [320193, 19617],
+            "sic": [3571, 6021],
+            "sic_description": ["Electronic Computers", "National Commercial Banks"],
+            "entity_type": ["operating", "operating"],
+            "category": ["large accelerated filer", "large accelerated filer"],
+        }
+    ).to_parquet(sec_dir / "company_metadata.parquet", index=False)
+    features = pd.DataFrame(
+        {
+            "event_id": ["A", "J", "T"],
+            "ticker": ["AAPL", "JPM", "TGT"],
+            "sector": [None, None, "Consumer Discretionary"],
+            "ivar_event": [0.01, 0.02, 0.03],
+        }
+    )
+
+    out = merge_sector_sic_coarse_controls(features, config)
+    assert bool(out.loc[out["ticker"].eq("AAPL"), "sector_sic_technology_communication"].iloc[0])
+    assert bool(out.loc[out["ticker"].eq("JPM"), "sector_sic_financials_real_estate"].iloc[0])
+    assert bool(out.loc[out["ticker"].eq("TGT"), "sector_sic_consumer"].iloc[0])
+    schema = build_feature_schema_report(out, feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL)
+    families = schema.set_index("feature_name")["family"]
+    assert families["sector_sic_consumer"] == "sector_sic_coarse_control"
+    selected = set(feature_columns_from_schema_report(schema, frame=out))
+    assert "sic" not in selected
+    assert "sector_sic_consumer" in selected
 
 
 def test_rolling_history_no_peeking_on_same_ticker_timestamps() -> None:
@@ -8349,6 +8817,25 @@ def test_completion_gap_audit_separates_quote_progress_from_paper_grade_gaps(
     assert "paper_grade_bid_ask_nbbo_execution" in summary["blocking_requirement_ids"]
 
 
+def test_research_paths_only_expose_hybrid_sequence_tensor_v2(tmp_path: Path) -> None:
+    config = replace(
+        load_project_config(),
+        data_dir=tmp_path / "data",
+        bronze_data_dir=tmp_path / "data" / "bronze",
+        silver_data_dir=tmp_path / "data" / "silver",
+        gold_data_dir=tmp_path / "data" / "gold",
+        artifacts_dir=tmp_path / "artifacts",
+        reports_dir=tmp_path / "reports",
+    )
+    paths = research_paths(config)
+
+    assert not hasattr(paths, "hybrid_sequence_tensor_path")
+    assert paths.hybrid_sequence_tensor_v2_path == (
+        config.gold_data_dir / "modeling" / "hybrid_sequence_tensor_v2.npz"
+    )
+    assert paths.hybrid_sequence_tensor_v2_path.name != "hybrid_sequence_tensor.npz"
+
+
 def test_robustness_summary_table_covers_dte_liquidity_and_vix_regime(tmp_path: Path) -> None:
     strategy_breakdowns = pd.DataFrame(
         {
@@ -8614,7 +9101,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     if "hybrid_sequence_eligible_v2_hybrid" in features:
         features["hybrid_sequence_eligible_v2"] = features["hybrid_sequence_eligible_v2_hybrid"]
     features["hybrid_sequence_too_sparse"] = False
-    hybrid_tensor_path = tmp_path / "hybrid_sequence_tensor.npz"
+    hybrid_tensor_path = tmp_path / "hybrid_sequence_tensor_v2.npz"
     hybrid_tensor_report = build_sequence_tensor(
         hybrid_long,
         features,
@@ -9356,6 +9843,33 @@ def test_feature_matrix_edge_cases_and_sequence_eligibility() -> None:
     assert bool(features["is_robustness_dte_3_21"].iloc[0]) is False
     assert "event_entry_timestamp" in features
     assert "feature_asof_timestamp" in features
+    filtered_panel = _filter_feature_eligible_event_panel(
+        pd.DataFrame(
+            {
+                "event_id": ["ok_ts", "ok_entry_date", "missing"],
+                "event_entry_timestamp": [
+                    "2025-01-01T16:00:00-05:00",
+                    pd.NA,
+                    pd.NA,
+                ],
+                "entry_date": [pd.NA, "2025-01-02", pd.NA],
+            }
+        )
+    )
+    assert filtered_panel["event_id"].tolist() == ["ok_ts", "ok_entry_date"]
+    assert _filter_feature_eligible_event_panel(pd.DataFrame()).empty
+    assert _filter_feature_eligible_event_panel(pd.DataFrame({"event_id": ["missing"]})).empty
+    numeric = _numeric_matrix(
+        pd.DataFrame(
+            {
+                "bool_feature": pd.Series([True, False, pd.NA], dtype="boolean"),
+                "numeric_feature": [1.5, pd.NA, "3.0"],
+            }
+        ),
+        ["bool_feature", "numeric_feature"],
+    )
+    assert numeric["bool_feature"].tolist() == [1.0, 0.0, 0.0]
+    assert numeric["numeric_feature"].tolist() == [1.5, 0.0, 3.0]
     with pytest.raises(ValueError, match="at most one row per event_id"):
         build_model_feature_matrix(
             panel.assign(event_id=["AAA_2025Q1"]),

@@ -6,7 +6,8 @@ hide:
 # Future Work
 
 Keep the first paper narrow. The current repo has a working no-NBBO proxy data
-and modeling package, but the headline paper still needs paper-grade data,
+and feature route, but the headline paper still needs a main-window
+2016-10-01 to 2026-06-05 data/feature/model/report rerun, paper-grade data,
 robustness, and inference.
 
 ## Before Paper Claims
@@ -21,13 +22,16 @@ Paper-grade market data:
 
 Full sample:
 
-- Extend from the current 2022-onward entitlement-backed proxy sample to the
-  target 2013-01-01 to 2026-06-05 sample.
+- Treat the 2016-10-01 to 2026-06-05 no-NBBO data and feature rebuild as the
+  current proxy baseline.
+- Keep the previous broader 2016-01-01 Mac materialization as a preflight
+  artifact only; do not cite it as the current main-window result after the
+  Oct-2016 target switch.
 - Preserve monthly top-50 liquid single-name universe construction.
 - Keep ETF, index, volatility, commodity trust, and other non-single-name
   symbols out of the main universe.
-- Re-run dynamic calendar, event panel, trade panel, feature matrix, models,
-  figures, and reports after the full data route is stable.
+- Re-run models, figures, reports, and robustness tables after the full data
+  and model runtime route is stable.
 
 Robustness and inference:
 
@@ -63,10 +67,9 @@ Sequence route:
   `tuning_selected_params.json`, and FT finite-prediction diagnostics so the
   curated snapshot cannot silently reintroduce old original-model rows into the
   current canonical tuned story.
-- Keep the same-code `fe_v1_legacy` versus `fe_v2_sec_xbrl` ablation table
-  current. The 2026-05-12 run is negative for FE V2, so future FE V2 changes
-  should be reported as diagnostics unless they improve locked-test ranking and
-  economics without touching test-driven selection.
+- Keep `feature_schema_report.csv` and the leakage audit synchronized with any
+  future feature changes; judge changes by validation/test ranking and
+  premium-space economics without touching test-driven selection.
 - Track SEC CompanyFacts coverage, CIK misses, acceptance-time mapping, and
   fallback-filed usage as first-class data-quality diagnostics.
 - Keep generated data under the external `DATA_DIR`, and keep reports and

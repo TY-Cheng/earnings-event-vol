@@ -14,6 +14,7 @@ import pandas as pd
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.events import NEW_YORK_TZ
 from earnings_event_vol.massive import read_secret_file
+from earnings_event_vol.rate_limit import throttle_requests_per_minute
 from earnings_event_vol.schemas import AnnouncementTiming
 
 CALENDAR_COLUMNS = [
@@ -190,7 +191,12 @@ def _normalize_sec_submission_block(
         ):
             continue
         inferred_timing = infer_timing_from_acceptance_timestamp(acceptance)
-        timing = AnnouncementTiming.UNKNOWN
+        timing = (
+            inferred_timing
+            if inferred_timing in {AnnouncementTiming.BMO, AnnouncementTiming.AMC}
+            else AnnouncementTiming.UNKNOWN
+        )
+        is_proxy_timing = timing in {AnnouncementTiming.BMO, AnnouncementTiming.AMC}
         rows.append(
             {
                 "ticker": ticker.upper(),
@@ -220,13 +226,17 @@ def _normalize_sec_submission_block(
                 "report_date": _recent_value(block, "reportDate", index),
                 "primary_document": _recent_value(block, "primaryDocument", index),
                 "primary_doc_description": _recent_value(block, "primaryDocDescription", index),
-                "timing_source": "sec_acceptance_timestamp_proxy_not_main_sample",
-                "timing_confidence": "proxy_inconclusive",
+                "timing_source": "sec_acceptance_timestamp_proxy"
+                if is_proxy_timing
+                else "sec_acceptance_timestamp_proxy_not_main_sample",
+                "timing_confidence": "proxy_sec_acceptance_timestamp"
+                if is_proxy_timing
+                else "proxy_inconclusive",
                 "text_validation_status": "pending_text_validation",
                 "text_validation_reason": "",
                 "text_validation_source": "",
                 "text_validation_aux_status": "",
-                "is_main_sample_timing": False,
+                "is_main_sample_timing": is_proxy_timing,
                 "is_validated_earnings_event": False,
                 "is_main_sample_candidate": False,
             }
@@ -321,11 +331,13 @@ def _get_json_with_retries(
     params: Mapping[str, str] | None = None,
     max_retries: int,
     backoff_seconds: float,
+    requests_per_minute: int | None = None,
 ) -> dict[str, Any]:
     attempts = max(1, max_retries + 1)
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
+            throttle_requests_per_minute(requests_per_minute)
             return _get_json(client, url, headers=headers, params=params)
         except httpx.HTTPStatusError as exc:
             if not _retryable_http_status(exc):
@@ -505,6 +517,7 @@ def fetch_massive_8k_text_payloads(
                         params=params,
                         max_retries=config.massive_max_retries,
                         backoff_seconds=config.massive_retry_backoff_seconds,
+                        requests_per_minute=config.massive_requests_per_minute,
                     )
                 except httpx.HTTPStatusError as exc:
                     if not _retryable_http_status(exc):

@@ -44,6 +44,8 @@ SECOND_AGG_REQUIRED_COLUMNS = {
     "volume",
     "transactions",
 }
+_TRUE_VALUES = {"1", "true", "yes", "y"}
+_FALSE_VALUES = {"0", "false", "no", "n"}
 
 
 def _progress(message: str) -> None:
@@ -55,6 +57,26 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
+def _canonical_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_json_value(nested)
+            for key, nested in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, tuple | list):
+        return [_canonical_json_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            return str(value)
+    return value
+
+
 def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
     if not path.exists() or path.stat().st_size <= 0:
         return False
@@ -62,7 +84,22 @@ def _json_params_match(path: Path, expected: Mapping[str, object]) -> bool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return bool(payload.get("pipeline_params") == dict(expected))
+    return bool(
+        _canonical_json_value(payload.get("pipeline_params"))
+        == _canonical_json_value(dict(expected))
+    )
+
+
+def _path_signature(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"path": str(path), "exists": False}
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
 
 
 def _write_parquet(path: Path, frame: pd.DataFrame | pl.DataFrame) -> None:
@@ -88,7 +125,40 @@ def _parquet_is_usable(path: Path, *, required_columns: set[str]) -> bool:
 def _bool_column(frame: pd.DataFrame, column: str, default: bool = False) -> pd.Series:
     if column not in frame.columns:
         return pd.Series(default, index=frame.index)
-    return frame[column].fillna(default).astype(bool)
+    return frame[column].map(lambda value: _coerce_bool_value(value, default=default)).astype(bool)
+
+
+def _coerce_bool_value(value: object, *, default: bool) -> bool:
+    if _is_missing_value(value):
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    return bool(value)
+
+
+def _is_missing_value(value: object) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _explicit_false_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return (
+        frame[column]
+        .map(
+            lambda value: (
+                False if _is_missing_value(value) else not _coerce_bool_value(value, default=True)
+            )
+        )
+        .astype(bool)
+    )
 
 
 def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -111,13 +181,22 @@ def _contract_reference_proxy_mask(contracts: pd.DataFrame) -> pd.Series:
         .fillna("")
         .astype(str)
     )
-    adjusted = _bool_column(contracts, "contract_reference_has_adjusted_deliverable")
+    deliverable_known = _bool_column(contracts, "contract_reference_deliverable_known")
+    explicitly_not_adjusted = _explicit_false_column(
+        contracts, "contract_reference_has_adjusted_deliverable"
+    )
     option_multiplier = _numeric_column(contracts, "option_multiplier")
     contract_size = _numeric_column(contracts, "contract_size")
     standard_size = option_multiplier.eq(100) | contract_size.eq(100)
     reference_missing = status.isin({"missing_reference", "not_requested"})
     discovery_standard = discovery_status.eq("ok")
-    fallback = reference_missing & discovery_standard & standard_size & ~adjusted
+    fallback = (
+        reference_missing
+        & discovery_standard
+        & standard_size
+        & deliverable_known
+        & explicitly_not_adjusted
+    )
     return validated | fallback
 
 
@@ -790,6 +869,8 @@ def build_trade_proxy_panel(
     diagnostics_path = out_root / "trade_proxy_panel" / "trade_proxy_panel_report.json"
     params = {
         "stage": "trade-proxy-panel",
+        "windows": _path_signature(windows_path),
+        "contracts": _path_signature(contracts_path),
         "max_events": max_events,
         "max_contracts": max_contracts,
         "lookback_seconds": lookback_seconds,
@@ -949,8 +1030,8 @@ def build_trade_proxy_panel(
     }
     report["contract_reference_proxy_policy"] = (
         "validated references are preferred; missing_reference/not_requested contracts are "
-        "allowed only when the discovery-stage contract was standard, size is 100, and no "
-        "adjusted deliverable was observed"
+        "allowed only when the discovery-stage contract was standard, size is 100, and the "
+        "reference data explicitly marks the deliverable as known and not adjusted"
     )
     report["bronze_second_aggregate_cache"] = {
         "dataset": "options_second_aggs",

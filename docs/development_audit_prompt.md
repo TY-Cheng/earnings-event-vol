@@ -62,9 +62,10 @@ Data route and labeling:
   day-aggregate close is not a strategy-exit fallback. Intrinsic fallback is
   flagged when the exit-preclose trade-aggregate mark is missing/unusable or
   when the option expires on the exit date.
-- The current old proxy/modeling snapshot is `2022-12-01` to `2025-12-31`.
-  The target rebuild/paper window is `2013-01-01` to `2026-06-05`, not the
-  current completed result.
+- The current main no-NBBO target window is `2016-10-01` to `2026-06-05`.
+  Broader Mac preflight artifacts from the previous `2016-01-01` window must
+  be identified as preflight only. Current model/report metric artifacts may
+  still be historical until rerun on the refreshed main-window feature matrix.
 - Universe construction filters ETF/index/non-single-name symbols before
   selecting the monthly top 50.
 - SEC EDGAR submissions plus SEC primary filing documents are the primary
@@ -76,7 +77,7 @@ Event variance construction:
 - AMC and BMO event windows use the documented pre-announcement close.
 - DMH and unknown timing are excluded from the first main sample.
 - Target construction writes C2O, C2C, and O2C realized-variance columns.
-- `rvar_event` remains the documented close-to-close alias for V1 proxy PnL.
+- `rvar_event` remains the documented close-to-close alias for current proxy PnL.
 - C2O is not described as executable option PnL.
 - `IVAR_event` is extracted from total ATM implied variance across two expiries
   that cover the realized event window.

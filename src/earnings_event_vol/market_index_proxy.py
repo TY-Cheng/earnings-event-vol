@@ -137,6 +137,7 @@ def fetch_massive_underlying_second_aggregates(
                 params=params,
                 max_retries=config.massive_max_retries,
                 backoff_seconds=config.massive_retry_backoff_seconds,
+                requests_per_minute=config.massive_requests_per_minute,
             )
     except httpx.HTTPError as exc:
         raise RuntimeError(safe_exception_text(exc)) from None

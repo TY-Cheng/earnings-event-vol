@@ -28,6 +28,7 @@ from earnings_event_vol.massive import (
     option_quotes_flat_file_key,
     read_secret_file,
 )
+from earnings_event_vol.rate_limit import throttle_requests_per_minute
 from earnings_event_vol.schemas import IVARFailureReason, OptionRight
 from earnings_event_vol.variance import year_fraction
 
@@ -142,6 +143,7 @@ def _get_json_with_retries(
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
+            throttle_requests_per_minute(config.massive_requests_per_minute)
             response = client.get(url, params=dict(params))
             response.raise_for_status()
             payload = response.json()

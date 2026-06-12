@@ -10,10 +10,9 @@ import pandas as pd
 
 from earnings_event_vol.events import market_close_timestamp
 
-FEATURE_SCHEMA_V1_LEGACY = "fe_v1_legacy"
 FEATURE_SCHEMA_V2_SEC_XBRL = "fe_v2_sec_xbrl"
 DEFAULT_FEATURE_SCHEMA_VERSION = FEATURE_SCHEMA_V2_SEC_XBRL
-FEATURE_SCHEMA_VERSIONS = (FEATURE_SCHEMA_V1_LEGACY, FEATURE_SCHEMA_V2_SEC_XBRL)
+FEATURE_SCHEMA_VERSIONS = (FEATURE_SCHEMA_V2_SEC_XBRL,)
 
 FEATURE_SCHEMA_COLUMNS = [
     "feature_name",
@@ -30,6 +29,7 @@ V2_EXACT_EXCLUDE_COLUMNS = {
     "cik",
     "event_year",
     "event_month",
+    "sic",
     "source_id",
     "source_timestamp",
     "feature_asof_timestamp",
@@ -113,37 +113,6 @@ V2_EXCLUDE_PATTERNS = (
     "surface_pair",
     "spread_over_mid",
     "return_on_premium_realized",
-    "realized",
-    "post_event",
-    "future",
-)
-
-LEGACY_EXCLUDE_PATTERNS = (
-    "rvar_event",
-    "rvar_",
-    "r_event_",
-    "preannouncement",
-    "prior_guidance",
-    "s_after",
-    "close_after",
-    "open_after",
-    "return_decomposition",
-    "cross_term",
-    "gross_proxy_pnl_usd",
-    "gross_exit_option_vwap",
-    "gross_c2o",
-    "gross_post_open",
-    "gross_reaction_o2c",
-    "exit_option_vwap",
-    "post_open_option_vwap",
-    "open_option_vwap",
-    "option_proxy_decomposition",
-    "reaction_o2c_option_vwap",
-    "c2o_exit_intrinsic",
-    "c2o_haircut",
-    "c2o_proxy_pnl",
-    "haircut_pnl_usd",
-    "net_proxy_pnl_usd",
     "realized",
     "post_event",
     "future",
@@ -416,23 +385,6 @@ def normalization_params_only(
     return params
 
 
-def _legacy_model_feature(column: str, series: pd.Series) -> tuple[bool, str]:
-    lower = column.lower()
-    if lower.startswith(("prior_", "xbrl_", "runup_", "delta_grid_proxy", "rnd_proxy")):
-        return False, "legacy_excludes_fe_v2_feature"
-    if lower.endswith("_train_z") or lower.endswith("_train_rank"):
-        return False, "legacy_excludes_fe_v2_feature"
-    if lower in {"event_month_sin", "event_month_cos", "signal_timestamp"}:
-        return False, "legacy_excludes_fe_v2_feature"
-    if any(pattern in lower for pattern in LEGACY_EXCLUDE_PATTERNS):
-        return False, "legacy_excluded_by_pattern"
-    if lower.startswith("forecast_"):
-        return False, "prediction_column"
-    if not (pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series)):
-        return False, "non_numeric"
-    return True, "legacy_numeric_or_bool"
-
-
 def _v2_model_feature(column: str, series: pd.Series) -> tuple[bool, str]:
     lower = column.lower()
     if column in V2_EXACT_EXCLUDE_COLUMNS or lower in V2_EXACT_EXCLUDE_COLUMNS:
@@ -463,9 +415,11 @@ def _feature_family(column: str) -> str:
         return "train_fit_normalization"
     if column.startswith("xbrl_"):
         return "sec_xbrl_companyfacts"
+    if column.startswith("sector_sic_"):
+        return "sector_sic_coarse_control"
     if "delta_grid_proxy" in column or "rnd_proxy" in column:
         return "single_name_surface_proxy"
-    if "runup" in column or "delta_" in column:
+    if "runup" in column or "underlying_pre_event_" in column or "delta_" in column:
         return "single_name_runup_proxy"
     if column.startswith(("vix_", "spy_", "qqq_", "market_second_")):
         return "market_covariate"
@@ -482,10 +436,7 @@ def build_feature_schema_report(
     version = validate_feature_schema_version(feature_schema_version)
     rows: list[dict[str, object]] = []
     for column in frame.columns:
-        if version == FEATURE_SCHEMA_V1_LEGACY:
-            model_feature, reason = _legacy_model_feature(column, frame[column])
-        else:
-            model_feature, reason = _v2_model_feature(column, frame[column])
+        model_feature, reason = _v2_model_feature(column, frame[column])
         coverage = float(frame[column].notna().mean()) if len(frame) else 0.0
         rows.append(
             {

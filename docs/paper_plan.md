@@ -33,25 +33,28 @@ variance, the market benchmark is option-implied event variance
 `IVAR_event`, and the tradable question is whether predicted mispricing improves
 premium-space trade selection after costs.
 
-The current proxy-stage study uses a SEC-first earnings calendar and Massive
-market-data proxy route for U.S. single-name equity options from 2022-12-01
-through 2025-12-31. The refreshed 2026-06-11 local data snapshot contains 816
-BMO/AMC earnings events, of which 705 have a trade-proxy `IVAR_event`. The
-latest local modeling refresh uses `sequence_suite=all` on that 816-row feature
-matrix with lightweight sequence diagnostics. The
-primary scientific target is close-to-open earnings jump variance (`jump_c2o`);
-the V1 proxy-PnL headline is close-to-close event variance (`day_c2c`);
+The intended current target-window rebuild uses a SEC-first earnings calendar
+and Massive market-data proxy route for U.S. single-name equity options from
+2016-10-01 through 2026-06-05. The 2026-06-12 Mac preflight snapshot was built
+on the broader 2016-01-01 window and
+contains 3,072 BMO/AMC main-sample candidate events and 80,275 contract
+candidates. Contract-reference validation, trade-proxy second aggregates, and
+the gold feature matrix were rebuilt for that preflight window; the main
+2016-10-01 window should be rebuilt on the remote data device before citation.
+Model/report artifacts still need a main-window rerun on a stable LightGBM
+runtime. The primary scientific target is close-to-open earnings jump variance
+(`jump_c2o`);
+the current proxy-PnL headline is close-to-close event variance (`day_c2c`);
 post-open digestion (`reaction_o2c`) is diagnostic.
 
-The refreshed FE V2 sequence-suite run finds that the Goyal-Saretto-style
-spread leads `jump_c2o` ranking, while the populated snapshot's old
-LightGBM/XGBoost ensemble row leads `jump_c2o` OOS R2 versus IVAR. The new
-active forecast-ensemble row requires a model-stage rerun before citation. The
-C2C proxy economics remain negative across refreshed tabular rows. The
-defensible conclusion is therefore preliminary
-signal-screening and benchmark discipline, not executable trading
-outperformance. Paper-grade claims require historical quote/NBBO or equivalent
-data, full-sample quote-based IVAR diagnostics, and leg-level execution with
+Historical model rows are stale after the 2016-2026 feature refresh and should
+not be cited as current evidence. The current verified target-window
+trade-proxy aggregate remains negative before model selection
+(`mean_gross_proxy_pnl_usd=-93.90`, `mean_haircut_pnl_usd=-221.04`), so the
+defensible conclusion remains preliminary signal-screening and benchmark
+discipline, not executable trading outperformance. Paper-grade claims require
+historical quote/NBBO or equivalent data, full-sample quote-based IVAR
+diagnostics, leg-level execution with
 realistic bid/ask or NBBO-equivalent crossing.
 
 ## 1. Introduction
@@ -91,7 +94,7 @@ option-implied event variance benchmark:
 RVAR_event - IVAR_event
 ```
 
-The V1 tradable proxy label uses close-to-close event variance:
+The tradable proxy label uses close-to-close event variance:
 
 ```text
 RVAR_event_day_c2c - IVAR_event
@@ -122,17 +125,15 @@ asset-pricing ML.
 | Empirical asset pricing with ML | ML claims need out-of-sample ranking, economic value, and strong tabular baselines. | Requires LightGBM/XGBoost and validation-only tuning before deep-model claims. |
 | Surface and sequence modeling | Ordered option-surface paths may contain incremental pre-event information. | Motivates FT-Transformer, ridge-flat, attention, CNN, mask-only, and time-shuffle diagnostics. |
 
-The current in-repo results are proxy-stage only. In the refreshed 2026-06-11
-FE V2 sequence-suite run, Goyal-Saretto-style spread has the strongest
-`jump_c2o` AUC at about 0.620 and the populated snapshot's old
-LightGBM/XGBoost ensemble row has the best `jump_c2o` OOS R2 versus IVAR at
-about 0.236. The new active forecast-ensemble row requires a model-stage rerun
-before citation. Refreshed `day_c2c` proxy economics remain negative across
-tabular rows; the best tabular net proxy PnL is about -1,948 USD for the
-Goyal-Saretto-style spread. Older FE V1/FE V2
-ablation artifacts remain useful for design comparison, but the current paper
-plan should treat the refreshed FE V2 sequence-suite run as the live local
-evidence ledger until the final data scope is rebuilt.
+The current in-repo data and feature artifacts are proxy-stage only, and the
+latest Mac materialization is a broader pre-window-change preflight snapshot.
+Historical 2026-06-11 model metrics predate the refreshed feature matrix and
+should not be cited as current evidence. Model-stage results, including
+Goyal-Saretto, LightGBM/XGBoost, ensemble, FT-Transformer, and sequence rows,
+need a rerun on the 2016-10-01 main-window `fe_v2_sec_xbrl` matrix before paper
+claims. The current paper plan should treat the populated 2026-06-11 model
+snapshot as historical local evidence until the data, feature, model, and
+report stages are rebuilt on the active main window.
 
 ### 1.3 Research Gap
 
@@ -161,8 +162,8 @@ Primary research question:
 
 Secondary questions:
 
-- Do richer FE V2 features improve over a parsimonious FE V1 tabular feature
-  set?
+- Do the current low-dimensional state/history additions improve ranking and
+  economics relative to market IVAR and classical baselines?
 - Do ordered pre-event proxy-surface sequences add incremental value beyond
   event-level tabular aggregates?
 - Does ranking improvement translate into `day_c2c` premium-space proxy
@@ -175,7 +176,7 @@ Expected hypotheses before running paper-grade data:
 | Hypothesis | Evidence needed |
 | --- | --- |
 | Market IVAR is a strong level benchmark but not necessarily an optimal ranking signal. | OOS R2, AUC, top-decile precision, and edge-decile monotonicity versus IVAR. |
-| Parsimonious tabular features may beat richer feature schemas under small proxy samples. | FE V1 versus FE V2 same-code ablation on locked test rows. |
+| State/history features may help sort event-variance mispricing under small proxy samples. | Locked validation/test ranking, edge-decile monotonicity, and premium-space proxy economics. |
 | Sequence models should not be sold unless they beat tabular baselines and mask/time-shuffle controls. | Common-row sequence diagnostics and bootstrap/inference checks. |
 | Trade value requires premium-space selection, not raw variance-edge ranking alone. | Net proxy PnL, cost sensitivity, drawdown, and turnover. |
 
@@ -236,12 +237,14 @@ absence of quote/NBBO execution evidence before presenting model results.
 
 ### 2.2 Sample, Universe, and Event Timing
 
-The active proxy modeling snapshot covers 2022-12-01 through 2025-12-31. The
-target rebuild and paper window is 2013-01-01 through 2026-06-05. The current
-lake-quality audit makes this gap explicit: all 15 required paper-grade datasets
-are still span-incomplete for the target window, with options day aggregates
-starting on 2022-05-04, underlying day aggregates starting on 2016-05-04, and
-the main event/modeling sample starting in December 2022.
+The active main data window targets 2016-10-01 through 2026-06-05.
+The current lake-quality audit makes the remaining paper-grade gap explicit:
+options day aggregates are available over the target span and the main window
+starts after the observed 2016-H1 underlying daily entitlement gap. Full
+bid/ask/NBBO or equivalent quote coverage is still not available. The
+pre-window-change no-NBBO trade-proxy feature matrix has 3,071 rows, 559
+columns, and 415 model features; rebuild it for the 2016-10-01 main window
+before citing current-window model results.
 
 The universe is dynamic. Each month, eligible U.S. single-name option
 underlyings are ranked by trailing six-month option premium dollar volume:
@@ -281,7 +284,7 @@ Roles:
 | Target | Role |
 | --- | --- |
 | `jump_c2o` | Primary scientific ranking target for the earnings jump. |
-| `day_c2c` | Literature-compatible target and only V1 proxy-PnL headline. |
+| `day_c2c` | Literature-compatible target and current proxy-PnL headline. |
 | `reaction_o2c` | Diagnostic post-open digestion target. |
 
 ### 2.4 IVAR Construction
@@ -383,8 +386,8 @@ model rows, and evidence grade.
 
 ### 2.7 Feature Engineering
 
-The default research schema is `fe_v2_sec_xbrl`; `fe_v1_legacy` is retained
-for same-code ablations. The resolved run-level allowlist is
+The default and only supported research schema is `fe_v2_sec_xbrl`. The
+resolved run-level allowlist is
 `artifacts/modeling/feature_schema_report.csv`, and only
 `model_feature=true` rows enter trainable models.
 
@@ -393,19 +396,24 @@ Feature families:
 | Family | Examples | Selection criterion |
 | --- | --- | --- |
 | Event-level option state | `IVAR_event`, ATM IV, term spread, skew, butterfly proxies | Pre-entry option-surface proxy state. |
-| Liquidity and execution proxy | entry premium, option volume, transactions, latest bar age | Allowed because signal timestamp equals completed entry window. |
-| Realized history | RV5/RV20/RV60, prior same-ticker earnings moves | Strictly prior events or pre-entry trading days. |
+| Liquidity and execution proxy | entry premium, option volume, transactions, call/put volume imbalance, latest bar age | Allowed because signal timestamp equals completed entry window. |
+| Realized history | own-underlying pre-event return/RV run-up, prior same-ticker earnings moves | Strictly prior events or pre-entry trading days. |
 | Market covariates | VIX level/change/percentile/regime, SPY/QQQ controls when available | Prior-close or pre-cutoff alignment. |
 | SEC XBRL fundamentals | assets, liabilities, revenue, profitability proxies | Conservative acceptance-time or filed-date gating. |
+| SEC SIC coarse controls | broad SIC/sector group flags | Static company metadata, used as coarse controls rather than alpha claims. |
 | Train-fitted transforms | z-scores, ranks, normalized features | Fit on train only; applied to validation/test. |
 | Single-name run-up and surface proxies | run-up returns, weak delta-grid and RND-like proxy features | Trade-implied proxy language only. |
 | Daily sequences | 20 pre-entry daily surface states | Close-trade-implied daily proxy surfaces. |
 | Hybrid sequences | 31 steps: 19 daily states plus 12 entry-day five-minute bins | Mixed-clock pre-entry proxy path. |
 
-FE V2 excludes raw numeric identifiers, raw year/month, exit/outcome/PnL
-fields, and post-event labels. `fe_v1_legacy` is not the default feature
-schema; it is retained because the current ablation says the parsimonious
-feature set is stronger in this proxy sample.
+The broader pre-window-change `feature_schema_report.csv` has 559 total columns
+and 415 `model_feature=true` columns. Low-dimensional additions include
+sequence call/put volume imbalance aggregates, own-underlying pre-event
+return/RV run-up, and SEC SIC coarse controls. Rebuild the report for the
+2016-10-01 main window before citing those counts as current sample evidence.
+
+The current schema excludes raw numeric identifiers, raw year/month,
+exit/outcome/PnL fields, post-event labels, and unsupported quote/NBBO claims.
 
 The feature section in the final paper should report both the intended feature
 families and the realized run-level schema: feature counts, coverage, excluded
@@ -502,7 +510,7 @@ but ranking and economic selection are the paper-facing objectives.
 
 Selection discipline:
 
-- `day_c2c` is the default hyperparameter-selection target and the only V1
+- `day_c2c` is the default hyperparameter-selection target and the only current
   proxy-PnL headline target.
 - `jump_c2o` is a primary scientific decomposition target for the earnings
   jump and remains a reported forecast/ranking table, but it is not the
@@ -522,7 +530,7 @@ and robustness diagnostics.
 
 ### 2.10 Strategy Layer
 
-The current V1 proxy strategy is a long ATM straddle when predicted
+The current proxy strategy is a long ATM straddle when predicted
 event-variance edge is positive and clears a premium-space transaction-cost
 threshold. Negative variance-edge rows remain diagnostics; the current proxy
 route does not open naked short straddles.
@@ -556,8 +564,7 @@ as exploratory.
 
 | Experiment | Purpose | Current status |
 | --- | --- | --- |
-| Canonical FE V2 tuned package | Default feature-schema evidence ledger. | Completed as proxy-stage modeling snapshot. |
-| FE V1 versus FE V2 same-code ablation | Tests whether richer features improve locked-test ranking/economics. | Completed; negative for FE V2. |
+| Canonical `fe_v2_sec_xbrl` tuned package | Default feature-schema evidence ledger. | Data and feature stages rebuilt for 2016-2026; model/report stages still need rerun. |
 | Benchmark ladder | Compares market IVAR, historical baselines, Goyal-Saretto spread, Elastic Net, LightGBM/XGBoost. | Completed. |
 | Full sequence diagnostic suite | Tests ordered proxy-surface paths against mask/time-shuffle controls. | Active suite is ridge-flat, attention pooling, dilated CNN, mask-only, and time-shuffle; sequence rows remain diagnostic because the primary gate does not pass. |
 | C2C proxy strategy | Tests premium-space headline economics. | Completed for no-NBBO long-straddle proxy. |
@@ -582,7 +589,7 @@ The current implementation of that ledger is in
 | Historical quote/NBBO or equivalent data route | Paper-grade IVAR and executable bid/ask strategy claims beyond the current targeted extraction prototype. |
 | Quote-based IVAR reconstruction | Replacing trade-aggregate IV proxies. |
 | Leg-level bid/ask execution | Full-spread long straddle and short iron fly tests. |
-| 2013-01-01 to 2026-06-05 full sample rebuild | Target paper sample and longer-history inference. |
+| 2016-10-01 to 2026-06-05 full sample rebuild | Target paper sample and longer-history inference. |
 | DTE 5-14 main and DTE 3-21 robustness reruns | Maturity-window robustness. |
 | Liquidity, year, ticker, sector, VIX-regime, and BMO/AMC subgroup tables | Stability and concentration diagnostics. |
 | Block/bootstrap or model-comparison inference | Final statistical claims under multiple models/thresholds. |
@@ -614,7 +621,7 @@ contract is:
 
 The data-readiness contract is tracked by
 `artifacts/data_pipeline/lake_quality_audit/`. The audit must become `ok=true`
-for the 2013-01-01 to 2026-06-05 target window before the paper can claim full
+for the 2016-10-01 to 2026-06-05 target window before the paper can claim full
 historical coverage or paper-grade quote execution.
 
 Its minimum paper-facing artifacts are:
@@ -632,7 +639,7 @@ Its minimum paper-facing artifacts are:
 
 | Outcome | Paper interpretation |
 | --- | --- |
-| FE V1/FE V2 tabular models beat market IVAR and classical baselines after costs | Sell an earnings event-variance mispricing ranking paper. |
+| Current tabular models beat market IVAR and classical baselines after costs | Sell an earnings event-variance mispricing ranking paper. |
 | Sequence models beat tabular baselines and controls on common rows | Add a secondary contribution on ordered pre-event proxy-surface paths. |
 | Market IVAR and Goyal-Saretto-style spread dominate | Sell a hard-to-beat market-efficiency result with strong benchmarks. |
 | Proxy signal disappears under quote/NBBO execution | Keep proxy evidence as signal screening and report realistic execution limits. |
@@ -646,7 +653,7 @@ The results page should carry the full evidence ledger in paper order:
 3. Ranking and top-decile evidence.
 4. Premium-space C2C proxy strategy results.
 5. C2O and O2C diagnostic decompositions.
-6. Feature-schema ablation: FE V1 versus FE V2.
+6. Feature schema, leakage controls, and feature-family coverage.
 7. Sequence diagnostics and control comparisons.
 8. Cost sensitivity and inference diagnostics.
 9. Quote-aware execution confidence, IVAR defeat analysis, and casebook
@@ -664,20 +671,19 @@ The current detailed implementation of that section is
 | Quote execution panel is only populated for a bounded slice | The pipeline can build targeted requests, matched quote subsets, leg fills, straddle diagnostics, and confidence bands, but the current results snapshot still cannot claim full-spread executable strategy performance. |
 | `quotes_v1` flat-file object is large | Requires targeted extraction; full-day raw quote files should not be stored as repo artifacts. |
 | Option second aggregates are trade OHLCV bars | IV surfaces and strategy marks are trade-price proxies. |
-| Current sample starts in 2022 | Does not yet cover the target 2013-01-01 to 2026-06-05 paper window. |
+| Model/report outputs still need main-window rerun | The main window is now 2016-10-01 to 2026-06-05; current PnL and selected-parameter claims require data/features/models/reports to be rebuilt on that main-window matrix. |
 | IVAR coverage screen is material | Events without usable trade-proxy IVAR cannot enter IVAR-based strategy claims. |
 | Sequence eligibility screen is material | Sequence results carry selection risk and remain diagnostic. |
-| C2O/O2C option PnL is diagnostic | V1 tradable mispricing headline remains `day_c2c`. |
+| C2O/O2C option PnL is diagnostic | The tradable mispricing headline remains `day_c2c`. |
 | Proxy haircut cost model | Full bid/ask crossing remains future paper-grade work. |
 
 ## 6. Conclusion
 
 The current proxy-stage evidence supports a disciplined, limited conclusion.
-The same-code ablation says a parsimonious FE V1 tabular feature set improves
-the ranking of earnings event-variance mispricing relative to market IVAR and
-simple historical benchmarks, and maps this ranking signal into positive
-`day_c2c` premium-space proxy economics. The richer FE V2 default is currently
-a negative diagnostic result rather than a headline improvement.
+The project has a leakage-controlled `fe_v2_sec_xbrl` feature schema, strong benchmark
+discipline, and useful diagnostics, but the current local model/report outputs
+have not yet been rerun on the refreshed 2016-2026 feature matrix and do not
+establish positive paper-grade `day_c2c` premium-space economics.
 
 The result is not a final execution claim. It is a credible signal-screening
 result that justifies either a paper-grade quote/NBBO extension or a

@@ -32,7 +32,7 @@ C2C ex post mispricing is:
 RVAR_event_day_c2c - IVAR_event
 ```
 
-The V1 strategy/PnL layer uses `day_c2c` only. `jump_c2o` remains a primary
+The current strategy/PnL layer uses `day_c2c` only. `jump_c2o` remains a primary
 scientific decomposition target, but it is not reported as executable option
 PnL in the current no-NBBO proxy run. The default tuning selection target is now
 `day_c2c`, so validation-only hyperparameter selection is aligned with the
@@ -42,38 +42,48 @@ entry cost and transaction cost estimates.
 
 ## Current State
 
-Verified local state on 2026-06-12:
+Verified local state on 2026-06-13:
 
-- `just data` now targets the rebuild window `2013-01-01` through
-  `2026-06-05`; pass `args="--start 2022-12-01 --end 2025-12-31"` for a
-  bounded rerun of the current old modeling snapshot.
+- `just data` now targets the main rebuild window `2016-10-01` through
+  `2026-06-05`; pass explicit `args` only for bounded cache/debug reruns.
 - `just research-fast` remains the quick no-sequence smoke-refresh command. The
-  current verified artifact set was refreshed with `sequence_suite=all`, reusing
-  locked tuning parameters and keeping sequence rows diagnostic.
-- `just research` still builds the full V5 proxy feature/model/report package
+  local pre-window-change data/feature artifact set was refreshed for the
+  broader 2016-01-01 window, while the main `2016-10-01` window should be
+  rebuilt on the remote data device before citing current results.
+- `just research` builds the current proxy feature/model/report package
   from the current trade-proxy event panel, including sequence diagnostics.
-- Current old modeling snapshot is `2022-12-01` through `2025-12-31`, because
-  the populated event/modeling artifacts still come from the previous cache.
-- The target rebuild and paper window is `2013-01-01` through `2026-06-05`, but
+- The populated local gold feature matrix is useful as a data/feature
+  preflight snapshot; model/report metric artifacts should still be treated as
+  stale until the model stage is rerun on the refreshed main-window feature
+  matrix.
+- The target rebuild and paper window is `2016-10-01` through `2026-06-05`, but
   paper-grade claims still require complete target-window quote/NBBO-equivalent
   coverage.
 - All current trade-price results are `panel_grade=no_nbbo_trade_proxy` and
   `paper_grade=false`.
 
-Latest proxy data artifacts:
+Latest local pre-window-change data rebuild artifacts:
 
-- Dynamic calendar/event window panel: 816 BMO/AMC main-sample events after the
-  current restored SEC-first calendar and universe filters.
-- Trade-proxy panel: 816 events, 807 with the backward-compatible C2C
-  `rvar_event` alias, 705 with trade-proxy `IVAR_event`.
-- Event contract candidates: 23,845 total; 11,729 quote-pool contracts; 11,729
-  missing-reference standard-contract fallback rows allowed by the current
-  contract-reference policy.
-- Proxy entry-price status: 10,046 contracts with usable pre-cutoff
-  second-aggregate prices and 1,683 with no trade in the cutoff window.
-- Proxy straddle diagnostics: 789 rows; mean gross C2C primary exit-preclose
-  VWAP proxy PnL about -112.06 USD, mean exit-preclose VWAP proxy PnL about
-  -162.30 USD, and mean haircut proxy PnL about -289.80 USD.
+- Options day-aggregate bronze coverage reaches the broader preflight window.
+  The main `2016-10-01` window avoids the known 2016-H1 underlying daily
+  entitlement gap.
+- Dynamic SEC calendar: 5,785 universe-filtered candidate rows and 3,072
+  BMO/AMC main-sample candidate events after SEC primary-document validation
+  and SEC acceptance-time proxy timing.
+- SEC CompanyFacts: 228,205 standardized fact rows for 201 tickers.
+- Event-window panel: 3,072 events, 3,001 with realized event variance, 3,071
+  with entry-window support, 80,275 contract candidates, 40,709 quote-pool
+  contracts, 17,595 main DTE 5-14 contracts, and 39,566 IVAR-support-only
+  contracts.
+- Contract-reference validation: 79,903 unique option tickers, 79,634
+  validated, 269 `missing_reference`, and 80,006 proxy-usable candidate rows.
+  Unknown adjusted-deliverable state is excluded from proxy usability.
+- Trade-proxy panel: 3,072 events, 3,001 with RVAR, 2,538 with trade-proxy
+  IVAR, 80,006 proxy-usable contract rows, 55,580 contracts with usable
+  pre-entry trade proxy marks, and 24,426 with no trade in the cutoff window.
+- Second-aggregate cache: 79,920 main files with 70,825 writes and 9,095 hits;
+  exit-preclose and post-open caches each have 5,400 files with 4,134 writes
+  and 1,266 hits.
 - Quote execution artifacts: a bounded targeted REST slice is populated with
   `--quote-workers 8`, cache reuse, and sixteen merged follow-on shards
   (`offset64_size64`, `offset128_size64`, `offset192_size64`,
@@ -94,16 +104,17 @@ Latest proxy data artifacts:
   batch-specific lake/artifact paths without overwriting the canonical bounded
   slice, then `--stage quote-execution-merge --quote-merge-batch offsetN_sizeM`
   to consolidate verified shards into canonical quote diagnostics.
-- Lake quality audit: `lake-quality-audit` now writes target-window coverage gates.
-  The latest audit finds 17/17 audited lake datasets are span-incomplete for
-  the target window, including all 15 required paper-grade datasets. Options
-  day aggregates cover 2022-05-04 to 2025-12-31; underlying day aggregates cover
-  2016-05-04 to 2025-12-31; the main event/modeling sample still starts in
-  December 2022.
+- Lake quality audit: `lake-quality-audit` writes target-window coverage
+  gates. For the main `2016-10-01` window, the expected remaining blocker is
+  full bid/ask/NBBO-equivalent quote coverage rather than 2016-H1 underlying
+  daily bars.
 
 Latest proxy modeling artifacts:
 
-- Feature matrix: 816 rows.
+- Feature matrix: 3,071 rows and 559 columns under `fe_v2_sec_xbrl`. The
+  refreshed `feature_schema_report.csv` has 415 `model_feature=true` columns,
+  including sequence call/put volume imbalance aggregates, own-underlying
+  pre-event return/RV run-up, and SEC SIC coarse controls.
 - Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost, a
   LightGBM/XGBoost forecast ensemble, FT-Transformer, and the refreshed
@@ -111,27 +122,20 @@ Latest proxy modeling artifacts:
 - The Goyal-Saretto-style row is an earnings-event RV-IV spread benchmark
   inspired by the original predictability literature, not a full
   cross-sectional option-portfolio replication.
-- Current tuned protocol: train/validation-locked tuning parameters are reused
-  in the populated old snapshot, locked test rows are evaluated once, and
-  `sequence_suite=all`. Current code defaults to the
+- Current tuned protocol: train/validation-locked tuning parameters are selected
+  before locked-test evaluation, and `sequence_suite=all` is diagnostic unless
+  common-row/control/bootstrap gates pass. Current code defaults to the
   `tuned_phase1_day_c2c_rank_log_rvar` profile: learned tabular models and
   FT-Transformer train on `log(max(RVAR, 0) + 1e-6)`, forecasts are
   back-transformed to variance units before metrics and strategy logic, and
   validation selection targets `day_c2c` edge ranking rather than direct PnL.
   It will not reuse stale `jump_c2o`, raw-target, or old-profile
-  selected-parameter artifacts. The active-suite model cleanup refresh used
-  `bootstrap_iter=0`;
-  the report manifest still needs a refresh from these artifacts. With the current
-  14-model active suite, the refreshed model artifacts produce 2,448 prediction rows and
-  writes 42 forecast metric rows, 42 ranking metric rows, 84
-  strategy metric rows, 4,260 IVAR defeat event rows, and 3,745 casebook event
-  rows. Locked-test predictions now include 141 high/medium quote-confidence
-  target rows across 47 unique events. The model manifest also writes a
-  15-row sequence diagnostic gate table, a 15-row incremental-value table, an
-  18-row robustness summary for DTE, liquidity, VIX-regime, timing, ticker, and
-  quote-confidence splits, plus quote-confidence summary artifacts for
-  prediction coverage, quote-IVAR, strategy, IVAR defeat, and casebook
-  diagnostics.
+  selected-parameter artifacts. The current Mac checkout materialized a
+  broader pre-window-change data and feature matrix, but `lightgbm_tuned`
+  segfaulted in the local LightGBM runtime during a no-sequence model smoke
+  run; rebuild the 2016-10-01 main-window data/features and rerun models/report
+  on another stable CPU/GPU environment before citing current selected params,
+  model rows, or PnL.
 - The active sequence diagnostic suite is ridge-flat, attention pooling,
   dilated CNN, mask-only, and time-shuffle. It uses only lightweight in-repo
   PyTorch encoders; the slow recurrent/SSM 5-seed sequence ensembles are not
@@ -139,9 +143,12 @@ Latest proxy modeling artifacts:
   unless the common-row/control/bootstrap/economics gates pass. After the
   sequence-control runtime cleanup, rerun models/report before citing
   mask-only or time-shuffle numeric rows as current-code evidence.
+- The feature stage emits the canonical hybrid sequence tensor only at
+  `$GOLD_DATA_DIR/modeling/hybrid_sequence_tensor_v2.npz`; the non-`_v2`
+  compatibility duplicate is no longer written.
 - `FT-Transformer` refers to the validation-tuned tabular transformer
   specification.
-- In the refreshed FE V2 sequence-suite snapshot, the strongest `jump_c2o` AUC
+- In the refreshed `fe_v2_sec_xbrl` sequence-suite snapshot, the strongest `jump_c2o` AUC
   is the Goyal-Saretto-style spread at about 0.620, while the old
   LightGBM/XGBoost ensemble row has the best `jump_c2o` OOS R2 versus IVAR at
   about 0.236. Rerun models under
@@ -151,7 +158,7 @@ Latest proxy modeling artifacts:
   tabular rows; the best net proxy PnL is still Goyal-Saretto-style spread at
   about -1,948 USD. This weakens any direct executable-trading sell and
   supports a more conservative signal-screening/market-efficiency framing.
-- `reaction_o2c` is included in the V5 proxy model artifacts as a diagnostic
+- `reaction_o2c` is included in the proxy model artifacts as a diagnostic
   target. In the current sequence refresh, ridge-flat sequence leads O2C AUC at
   about 0.808, but O2C strategy rows remain `pnl_headline_eligible=false`.
 - The sequence gate does not upgrade the claim: for primary `jump_c2o`,
@@ -190,9 +197,9 @@ options-day-aggs-bulk -> universe -> dynamic-calendar -> sec-companyfacts
 
 Default data parameters:
 
-- target rebuild range: `2013-01-01` to `2026-06-05`;
-- old modeling snapshot range: `2022-12-01` to `2025-12-31`;
-- universe lookback for the target rebuild: from `2012-07-01`;
+- target rebuild range: `2016-10-01` to `2026-06-05`;
+- bounded debug rerun ranges should be passed explicitly when needed;
+- universe lookback for the target rebuild: from `2016-04-01`;
 - monthly top 50 liquid U.S. single-name option underlyings;
 - DTE `3-21`, supporting the main `5-14` sample and robustness window;
 - market data route:
@@ -257,9 +264,9 @@ Paired original rows are intentionally not emitted.
 The default feature schema is `fe_v2_sec_xbrl`. It uses the resolved
 `artifacts/modeling/feature_schema_report.csv` as the model-feature allowlist,
 excludes raw IDs and outcome/exit/PnL fields, adds point-in-time rolling
-same-ticker earnings history, SEC XBRL fundamentals, train-fitted rank/z-score
-features, and single-name run-up/surface proxy features. `fe_v1_legacy` remains
-available only for same-code feature-ablation reruns.
+same-ticker earnings history, SEC XBRL fundamentals, SEC SIC coarse controls,
+train-fitted rank/z-score features, single-name run-up/surface proxy features,
+call/put volume imbalance, and own-underlying pre-event return/RV run-up.
 
 It consumes the current proxy panel, builds features, trains/evaluates models,
 writes metrics, writes `reports/modeling/proxy_research_report.md`, regenerates
@@ -325,10 +332,8 @@ The defensible near-term claim is narrower:
 
 > In a no-NBBO proxy sample, state and event-history features show preliminary
 > cross-sectional ranking signal for earnings event-variance mispricing beyond
-> the market-implied IVAR baseline. The current same-code ablation says the
-> parsimonious FE V1 tabular signal is stronger than the richer FE V2 default,
-> so FE V2 is a negative diagnostic result rather than a headline improvement.
-> Paper-grade claims require quote/NBBO data and robust cost/inference checks.
+> the market-implied IVAR baseline. Paper-grade claims require quote/NBBO data,
+> robust cost/inference checks, and a full 2016-10-01 to 2026-06-05 rebuild.
 
 ## Docs
 

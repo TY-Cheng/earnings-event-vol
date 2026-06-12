@@ -33,14 +33,17 @@ Research object:
 - Options embed an ex ante market-implied event variance.
 - Models forecast C2O, C2C, and O2C realized-variance targets.
 - The primary scientific target is `RVAR_event_jump_c2o`.
-- V1 tradable proxy mispricing uses C2C: `RVAR_event_day_c2c - IVAR_event`.
+- Tradable proxy mispricing uses C2C: `RVAR_event_day_c2c - IVAR_event`.
 - Trading entry is evaluated in USD premium space, not raw variance space.
 
 Data:
 
 - The options source and entitlement window are stated explicitly.
-- Current local proxy results use Massive option second aggregates and option
-  day aggregates from the observed 2022-onward entitlement window.
+- Current main no-NBBO data and feature artifacts should target `2016-10-01`
+  through `2026-06-05`; broader `2016-01-01` Mac artifacts must be labeled as
+  preflight if they have not been rebuilt for the main window. Current
+  model/report results must be identified separately if they still come from
+  historical pre-rerun artifacts.
 - Market-data inputs are stated precisely: options day aggregates for universe,
   contract, IV proxy, fallback exit diagnostics, and sequence construction;
   underlying day aggregates for vendor OHLC opens, C2O/C2C/O2C targets, and
@@ -56,9 +59,10 @@ Data:
   option day-aggregate close is not used as a strategy-exit fallback.
 - O2C proxy PnL is a realized decomposition diagnostic, not a model-driven
   strategy headline without a post-open residual-IV baseline.
-- The 2013-01-01 to 2026-06-05 sample is described as the target paper window
-  unless historical option and quote/NBBO-equivalent data for that range have
-  actually been acquired and processed.
+- The 2016-10-01 to 2026-06-05 no-NBBO data and feature sample may be
+  described as processed only after the matching main-window rebuild completes;
+  paper-grade execution still requires historical bid/ask or NBBO-equivalent
+  data for that range.
 - Earnings events come from SEC EDGAR submissions plus SEC primary filing
   document validation.
 - Massive 8-K text is auxiliary fallback only.
@@ -127,4 +131,5 @@ Backtests:
   XGBoost.
 - Calendar returns interpreted as pure event-variance returns.
 - Variance-space edge compared directly to dollar transaction costs.
-- Proxy results from 2022-2025 presented as full target-window paper evidence.
+- Historical proxy/model results presented as current target-window paper
+  evidence without a matching refreshed feature matrix and model/report rerun.

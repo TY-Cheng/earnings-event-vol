@@ -14,12 +14,18 @@ import numpy as np
 import pandas as pd
 
 from earnings_event_vol.config import ProjectConfig
-from earnings_event_vol.event_panel import CONTRACT_STATUS_NON_STANDARD_EXCLUDED
+from earnings_event_vol.event_panel import CONTRACT_STATUS_NON_STANDARD_EXCLUDED, CONTRACT_STATUS_OK
 from earnings_event_vol.massive import parse_massive_option_ticker, read_secret_file
+from earnings_event_vol.rate_limit import throttle_requests_per_minute
 
-CONTRACT_REFERENCE_SCHEMA_VERSION = "v1"
+CONTRACT_REFERENCE_SCHEMA_VERSION = "v2"
+CONTRACT_REFERENCE_FETCH_ROUTE_VERSION = "v2_ticker_expired_expiration_date"
 CONTRACT_REFERENCE_SOURCE_DATASET = "massive_reference_options_contracts"
 CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED = "contract_reference_unvalidated_excluded"
+CONTRACT_STATUS_IVAR_SUPPORT_ONLY = "ivar_support_only"
+REFERENCE_DERIVED_DISCOVERY_STATUSES = frozenset(
+    {CONTRACT_STATUS_REFERENCE_UNVALIDATED_EXCLUDED, CONTRACT_STATUS_NON_STANDARD_EXCLUDED}
+)
 QueryParamValue = str | int | float | bool | None
 _SECRET_QUERY_PATTERN = re.compile(r"(?i)((?:apiKey|api_key)=)[^&\s)]+")
 
@@ -31,6 +37,8 @@ REFERENCE_STATUS_NOT_REQUESTED = "not_requested"
 REFERENCE_PROXY_SOURCE_EXCLUDED = "excluded"
 REFERENCE_PROXY_SOURCE_VALIDATED = "validated_reference"
 REFERENCE_PROXY_SOURCE_MISSING_STANDARD_FALLBACK = "missing_reference_standard_contract_fallback"
+_TRUE_VALUES = {"1", "true", "yes", "y"}
+_FALSE_VALUES = {"0", "false", "no", "n"}
 
 
 @dataclass(frozen=True)
@@ -44,12 +52,18 @@ class ContractReferenceFetchResult:
 
     def report_row(self) -> dict[str, object]:
         extracted = extract_contract_reference_fields(self.options_ticker, self.payload)
+        fetch_route_version = (
+            self.payload.get("_contract_reference_fetch_route_version")
+            if isinstance(self.payload, dict)
+            else pd.NA
+        )
         return {
             "options_ticker": self.options_ticker,
             "fetch_status": self.fetch_status,
             "contract_reference_status": self.contract_reference_status,
             "contract_reference_error": self.error,
             "cache_path": self.cache_path,
+            "contract_reference_fetch_route_version": fetch_route_version,
             **extracted,
         }
 
@@ -157,6 +171,7 @@ def _get_json_with_retries(
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
+            throttle_requests_per_minute(config.massive_requests_per_minute)
             response = client.get(url, params=params)
             if response.status_code in retry_statuses and attempt < attempts - 1:
                 time.sleep(float(config.massive_retry_backoff_seconds) * (attempt + 1))
@@ -192,23 +207,25 @@ def fetch_massive_option_contract_reference(
         cached = _load_cached_payload(cache_path)
         if cached is not None:
             status, error = _reference_status(cached, ticker)
-            return ContractReferenceFetchResult(
-                options_ticker=ticker,
-                fetch_status="hit",
-                contract_reference_status=status,
-                payload=cached,
-                error=error,
-                cache_path=str(cache_path),
+            stale_missing_reference = (
+                status == REFERENCE_STATUS_MISSING_REFERENCE
+                and cached.get("_contract_reference_fetch_route_version")
+                != CONTRACT_REFERENCE_FETCH_ROUTE_VERSION
             )
+            if not stale_missing_reference:
+                return ContractReferenceFetchResult(
+                    options_ticker=ticker,
+                    fetch_status="hit",
+                    contract_reference_status=status,
+                    payload=cached,
+                    error=error,
+                    cache_path=str(cache_path),
+                )
 
     api_key = _api_key(config)
     base = config.massive_base_url.rstrip("/")
     encoded = quote(ticker, safe="")
     params: dict[str, QueryParamValue] = {"apiKey": api_key}
-    urls = [
-        f"{base}/v3/reference/options/contracts/{encoded}",
-        f"{base}/v3/reference/options/contracts",
-    ]
     fallback_params: dict[str, QueryParamValue] = {
         "apiKey": api_key,
         "ticker": ticker,
@@ -217,18 +234,29 @@ def fetch_massive_option_contract_reference(
     }
     expiration = _expiration_from_options_ticker(ticker)
     if expiration is not None:
-        fallback_params["as_of"] = expiration.isoformat()
+        fallback_params["expiration_date"] = expiration.isoformat()
+    requests = [
+        (f"{base}/v3/reference/options/contracts", fallback_params),
+        (f"{base}/v3/reference/options/contracts/{encoded}", params),
+    ]
     last_error: str | None = None
-    for index, url in enumerate(urls):
+    for index, (url, query_params) in enumerate(requests):
         try:
             payload = _get_json_with_retries(
                 client,
                 url,
-                params=params if index == 0 else fallback_params,
+                params=query_params,
                 config=config,
             )
             status, error = _reference_status(payload, ticker)
-            _write_json(cache_path, payload)
+            versioned_payload = {
+                **payload,
+                "_contract_reference_fetch_route_version": CONTRACT_REFERENCE_FETCH_ROUTE_VERSION,
+            }
+            _write_json(
+                cache_path,
+                versioned_payload,
+            )
             fetch_status = (
                 "missing_reference"
                 if status == REFERENCE_STATUS_MISSING_REFERENCE
@@ -238,7 +266,7 @@ def fetch_massive_option_contract_reference(
                 options_ticker=ticker,
                 fetch_status=fetch_status,
                 contract_reference_status=status,
-                payload=payload,
+                payload=versioned_payload,
                 error=error,
                 cache_path=str(cache_path),
             )
@@ -271,7 +299,8 @@ def extract_contract_reference_fields(
         return {
             "contract_reference_shares_per_contract": np.nan,
             "contract_reference_additional_underlyings_count": 0,
-            "contract_reference_has_adjusted_deliverable": False,
+            "contract_reference_has_adjusted_deliverable": pd.NA,
+            "contract_reference_deliverable_known": False,
             "contract_reference_exercise_style": pd.NA,
             "contract_reference_correction": pd.NA,
         }
@@ -281,15 +310,49 @@ def extract_contract_reference_fields(
         "contract_reference_shares_per_contract": float(shares) if not pd.isna(shares) else np.nan,
         "contract_reference_additional_underlyings_count": int(additional_count),
         "contract_reference_has_adjusted_deliverable": bool(additional_count > 0),
+        "contract_reference_deliverable_known": True,
         "contract_reference_exercise_style": result.get("exercise_style", pd.NA),
         "contract_reference_correction": result.get("correction", pd.NA),
     }
 
 
+def _coerce_bool_value(value: object, *, default: bool) -> bool:
+    if _is_missing_value(value):
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    return bool(value)
+
+
+def _is_missing_value(value: object) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _bool_column(frame: pd.DataFrame, column: str, default: bool = False) -> pd.Series:
     if column not in frame.columns:
         return pd.Series(default, index=frame.index)
-    return frame[column].fillna(default).astype(bool)
+    return frame[column].map(lambda value: _coerce_bool_value(value, default=default)).astype(bool)
+
+
+def _explicit_false_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return (
+        frame[column]
+        .map(
+            lambda value: (
+                False if _is_missing_value(value) else not _coerce_bool_value(value, default=True)
+            )
+        )
+        .astype(bool)
+    )
 
 
 def _numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -312,15 +375,65 @@ def _contract_reference_proxy_mask(frame: pd.DataFrame) -> pd.Series:
         .fillna("")
         .astype(str)
     )
-    adjusted = _bool_column(frame, "contract_reference_has_adjusted_deliverable")
+    deliverable_known = _bool_column(frame, "contract_reference_deliverable_known")
+    explicitly_not_adjusted = _explicit_false_column(
+        frame, "contract_reference_has_adjusted_deliverable"
+    )
     standard_size = _numeric_column(frame, "option_multiplier").eq(100) | _numeric_column(
         frame, "contract_size"
     ).eq(100)
     reference_missing = status.isin(
         {REFERENCE_STATUS_MISSING_REFERENCE, REFERENCE_STATUS_NOT_REQUESTED}
     )
-    fallback = reference_missing & discovery_status.eq("ok") & standard_size & ~adjusted
+    fallback = (
+        reference_missing
+        & discovery_status.eq("ok")
+        & standard_size
+        & deliverable_known
+        & explicitly_not_adjusted
+    )
     return validated | fallback
+
+
+def _restore_pre_reference_candidate_state(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    status = (
+        out["contract_discovery_status"].copy()
+        if "contract_discovery_status" in out.columns
+        else pd.Series(pd.NA, index=out.index)
+    )
+    pre_reference = (
+        out["contract_discovery_status_pre_reference"].copy()
+        if "contract_discovery_status_pre_reference" in out.columns
+        else status.copy()
+    )
+
+    if "is_ivar_support_only" in out.columns:
+        ivar_support_only = _bool_column(out, "is_ivar_support_only")
+        stable_candidate_status = pre_reference.astype(str).isin(
+            {
+                CONTRACT_STATUS_OK,
+                CONTRACT_STATUS_IVAR_SUPPORT_ONLY,
+                *REFERENCE_DERIVED_DISCOVERY_STATUSES,
+            }
+        )
+        restore_mask = stable_candidate_status | pre_reference.isna()
+        pre_reference.loc[restore_mask & ivar_support_only] = CONTRACT_STATUS_IVAR_SUPPORT_ONLY
+        pre_reference.loc[restore_mask & ~ivar_support_only] = CONTRACT_STATUS_OK
+
+        if "eligible_for_quote_pool" in out.columns:
+            out["eligible_for_quote_pool"] = ~ivar_support_only
+        dte = _numeric_column(out, "dte")
+        if "is_main_dte_5_14" in out.columns:
+            out["is_main_dte_5_14"] = (~ivar_support_only) & dte.between(5, 14, inclusive="both")
+        if "is_robustness_dte_3_21" in out.columns:
+            out["is_robustness_dte_3_21"] = (~ivar_support_only) & dte.between(
+                3, 21, inclusive="both"
+            )
+
+    out["contract_discovery_status_pre_reference"] = pre_reference
+    out["contract_discovery_status"] = pre_reference
+    return out
 
 
 def apply_contract_reference_validation(
@@ -330,11 +443,22 @@ def apply_contract_reference_validation(
     if "options_ticker" not in candidates.columns:
         raise ValueError("candidate contract frame missing options_ticker column.")
     out = candidates.copy()
-    if "contract_discovery_status" in out.columns:
-        out["contract_discovery_status_pre_reference"] = out["contract_discovery_status"]
-    else:
-        out["contract_discovery_status_pre_reference"] = pd.NA
-        out["contract_discovery_status"] = pd.NA
+    stale_reference_columns = [
+        "contract_reference_status",
+        "contract_reference_error",
+        "contract_reference_shares_per_contract",
+        "contract_reference_additional_underlyings_count",
+        "contract_reference_has_adjusted_deliverable",
+        "contract_reference_deliverable_known",
+        "contract_reference_exercise_style",
+        "contract_reference_correction",
+        "contract_reference_validated",
+        "contract_reference_proxy_usable",
+        "contract_reference_proxy_source",
+        "contract_reference_source_dataset",
+    ]
+    out = out.drop(columns=[column for column in stale_reference_columns if column in out.columns])
+    out = _restore_pre_reference_candidate_state(out)
     if reference_report.empty:
         out["contract_reference_status"] = REFERENCE_STATUS_NOT_REQUESTED
         out["contract_reference_validated"] = False
@@ -368,6 +492,7 @@ def apply_contract_reference_validation(
             "contract_reference_shares_per_contract",
             "contract_reference_additional_underlyings_count",
             "contract_reference_has_adjusted_deliverable",
+            "contract_reference_deliverable_known",
             "contract_reference_exercise_style",
             "contract_reference_correction",
         ]

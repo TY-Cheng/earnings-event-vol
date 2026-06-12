@@ -18,6 +18,7 @@ from earnings_event_vol.backtest import black_scholes_price
 from earnings_event_vol.config import ProjectConfig
 from earnings_event_vol.events import market_close_timestamp
 from earnings_event_vol.massive import read_secret_file
+from earnings_event_vol.rate_limit import throttle_requests_per_minute
 from earnings_event_vol.schemas import OptionRight
 from earnings_event_vol.variance import (
     TotalVariancePoint,
@@ -119,11 +120,13 @@ def _get_json_with_retries(
     params: Mapping[str, QueryParamValue],
     max_retries: int,
     backoff_seconds: float,
+    requests_per_minute: int | None = None,
 ) -> dict[str, object]:
     attempts = max(1, int(max_retries) + 1)
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
+            throttle_requests_per_minute(requests_per_minute)
             response = client.get(url, params=dict(params))
             response.raise_for_status()
             payload = response.json()
@@ -211,6 +214,7 @@ def fetch_massive_option_second_aggregates(
                 params=params,
                 max_retries=config.massive_max_retries,
                 backoff_seconds=config.massive_retry_backoff_seconds,
+                requests_per_minute=config.massive_requests_per_minute,
             )
     except httpx.HTTPError as exc:
         raise RuntimeError(safe_exception_text(exc)) from None

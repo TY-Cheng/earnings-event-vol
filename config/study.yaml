@@ -5,8 +5,8 @@ study:
 
 sample:
   universe: "top_50_liquid_us_single_name_options"
-  start_year: 2013
-  end_year: 2025
+  start_year: 2016
+  end_year: 2026
   announcement_times: ["bmo", "amc"]
   exclude_announcement_times: ["dmh", "unknown"]
   event_expiry_dte_main: [5, 14]

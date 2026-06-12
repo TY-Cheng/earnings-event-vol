@@ -58,6 +58,11 @@ def _matching_columns(columns: Iterable[str], patterns: Iterable[re.Pattern[str]
     )
 
 
+def _is_allowed_prior_history_column(column: str) -> bool:
+    lower = str(column).lower()
+    return lower.startswith("prior_") and "guidance" not in lower and "preannouncement" not in lower
+
+
 def _timestamp_tz_state(values: pd.Series) -> str:
     states: set[str] = set()
     for value in values.dropna():
@@ -91,7 +96,11 @@ def audit_feature_leakage(
         asof = pd.to_datetime(frame[asof_col], errors="coerce", utc=use_utc)
         entry = pd.to_datetime(frame[entry_col], errors="coerce", utc=use_utc)
         asof_violations = frame.loc[asof.isna() | entry.isna() | (asof > entry)].copy()
-    blocked_columns = _matching_columns(frame.columns, DEFAULT_BLOCKED_PATTERNS)
+    blocked_columns = [
+        column
+        for column in _matching_columns(frame.columns, DEFAULT_BLOCKED_PATTERNS)
+        if not _is_allowed_prior_history_column(column)
+    ]
     vendor_forecasts = _matching_columns(frame.columns, DEFAULT_VENDOR_FORECAST_PATTERNS)
     whitelist = set(vendor_forecast_whitelist)
     vendor_forecasts = [column for column in vendor_forecasts if column not in whitelist]
