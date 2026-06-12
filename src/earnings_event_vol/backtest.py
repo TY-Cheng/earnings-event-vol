@@ -449,7 +449,7 @@ def _quote_modes(frame: pd.DataFrame) -> list[dict[str, object]]:
     has_score = "execution_confidence_score" in frame.columns
     has_spread = "median_spread_over_mid" in frame.columns
     has_age = "max_quote_age_seconds" in frame.columns
-    modes = [
+    modes: list[dict[str, object]] = [
         {
             "allowed_execution_confidence_bands": ("high", "medium"),
             "min_execution_confidence_score": 0.5 if has_score else None,

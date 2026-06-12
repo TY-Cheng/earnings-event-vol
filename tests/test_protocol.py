@@ -29,6 +29,7 @@ import earnings_event_vol.trade_proxy as trade_proxy_module
 import scripts.build_trade_proxy_panel as trade_proxy_panel_script
 from earnings_event_vol.backtest import (
     GaussianEventJumpDistribution,
+    StrategyPolicy,
     SymmetricTwoPointJumpDistribution,
     apply_portfolio_caps,
     apply_strategy_policy,
@@ -7624,6 +7625,60 @@ def test_strategy_policy_top_k_can_use_separate_selection_score() -> None:
     ]
     selected_test = tuned.loc[tuned["event_id"].eq("T_rank")].iloc[0]
     assert selected_test["expected_strategy_edge_usd"] == pytest.approx(40.0)
+
+
+def test_strategy_policy_defensive_branches() -> None:
+    frame = pd.DataFrame(
+        {
+            "split": ["validation", "test"],
+            "forecast": [0.08, 0.09],
+            "ivar_event": [0.05, 0.05],
+            "gross_proxy_pnl_usd": [100.0, -10.0],
+            "entry_premium_usd": [100.0, 100.0],
+            "estimated_transaction_cost_usd": [1.0, 1.0],
+            "expected_strategy_edge_usd": [60.0, 80.0],
+            "should_trade": [True, True],
+            "gross_strategy_pnl_usd": [100.0, -10.0],
+            "net_proxy_pnl_usd": [99.0, -11.0],
+            "capital_at_risk_usd": [100.0, 100.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="strategy frame missing required columns"):
+        build_proxy_strategy_frame(frame.drop(columns=["forecast"]), forecast_col="forecast")
+    with pytest.raises(ValueError, match="threshold_multiplier must be positive"):
+        apply_strategy_policy(frame, StrategyPolicy(threshold_multiplier=0.0))
+    with pytest.raises(ValueError, match="top_k must be positive"):
+        apply_strategy_policy(frame, StrategyPolicy(top_k=0))
+
+    missing_field_policies = [
+        StrategyPolicy(allowed_liquidity_buckets=("high",)),
+        StrategyPolicy(require_main_dte_5_14=True),
+        StrategyPolicy(allowed_dte_buckets=("main_5_14",)),
+        StrategyPolicy(allowed_execution_confidence_bands=("high",)),
+        StrategyPolicy(min_execution_confidence_score=0.8),
+        StrategyPolicy(max_median_spread_over_mid=0.25),
+        StrategyPolicy(max_quote_age_seconds=60.0),
+    ]
+    for policy in missing_field_policies:
+        filtered = apply_strategy_policy(frame, policy)
+        assert not filtered["should_trade"].any()
+
+    policy, search = tune_strategy_policy_validation_only(
+        frame.loc[frame["split"].eq("test")],
+        forecast_col="forecast",
+    )
+    assert policy.quote_filter_status == "no_validation_rows"
+    assert bool(search["selected"].iloc[0])
+
+    with pytest.raises(ValueError, match="min_validation_trades must be nonnegative"):
+        tune_strategy_policy_validation_only(
+            frame,
+            forecast_col="forecast",
+            min_validation_trades=-1,
+        )
+    with pytest.raises(ValueError, match="drawdown_penalty must be nonnegative"):
+        tune_strategy_policy_validation_only(frame, forecast_col="forecast", drawdown_penalty=-0.1)
 
 
 def test_feature_schema_allowlist_blocks_raw_ids_and_outcomes() -> None:

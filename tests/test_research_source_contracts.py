@@ -29,11 +29,13 @@ def test_xgboost_min_child_weight_uses_continuous_search_space() -> None:
             and node.targets[0].id == "XGBOOST_MIN_CHILD_WEIGHT_RANGE"
             and isinstance(node.value, ast.Tuple)
         ):
-            min_child_range = tuple(
+            range_values = [
                 float(element.value)
                 for element in node.value.elts
                 if isinstance(element, ast.Constant) and isinstance(element.value, (int, float))
-            )
+            ]
+            if len(range_values) == 2:
+                min_child_range = (range_values[0], range_values[1])
         if isinstance(node, ast.FunctionDef) and node.name == "_xgboost_trial_params":
             xgboost_param_function = node
 
@@ -42,22 +44,22 @@ def test_xgboost_min_child_weight_uses_continuous_search_space() -> None:
 
     float_call_found = False
     categorical_call_found = False
-    for node in ast.walk(xgboost_param_function):
+    for call_node in ast.walk(xgboost_param_function):
         if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "min_child_weight"
+            isinstance(call_node, ast.Call)
+            and isinstance(call_node.func, ast.Attribute)
+            and call_node.args
+            and isinstance(call_node.args[0], ast.Constant)
+            and call_node.args[0].value == "min_child_weight"
         ):
             continue
-        if node.func.attr == "suggest_float":
+        if call_node.func.attr == "suggest_float":
             float_call_found = (
-                len(node.args) >= 3
-                and _range_bound(node.args[1], 0)
-                and _range_bound(node.args[2], 1)
+                len(call_node.args) >= 3
+                and _range_bound(call_node.args[1], 0)
+                and _range_bound(call_node.args[2], 1)
             )
-        if node.func.attr == "suggest_categorical":
+        if call_node.func.attr == "suggest_categorical":
             categorical_call_found = True
 
     assert float_call_found

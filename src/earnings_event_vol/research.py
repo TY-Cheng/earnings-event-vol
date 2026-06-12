@@ -197,9 +197,9 @@ REAL_SEQUENCE_MODEL_IDS = (
     SEQUENCE_MODEL_IDS - SEQUENCE_CONTROL_MODEL_IDS - {"ridge_flat_aggregates_sequence"}
 )
 SplitName = Literal["train", "validation", "test"]
-DEFAULT_TUNING_PROFILE = "tuned_phase1_day_c2c_rank_log_rvar"
 TuningProfile = Literal["tuned_phase1_day_c2c_rank_log_rvar"]
-TUNING_PROFILES = {DEFAULT_TUNING_PROFILE}
+DEFAULT_TUNING_PROFILE: TuningProfile = "tuned_phase1_day_c2c_rank_log_rvar"
+TUNING_PROFILES: set[TuningProfile] = {DEFAULT_TUNING_PROFILE}
 TUNING_SELECTION_TARGET_ID = "day_c2c"
 TUNING_LIGHTGBM_TRIALS = 50
 TUNING_XGBOOST_TRIALS = 50
@@ -1943,7 +1943,7 @@ def _target_to_log_rvar(
     forecast_floor: float = FORECAST_FLOOR,
 ) -> np.ndarray:
     raw = np.asarray(values, dtype=float)
-    return np.log(np.maximum(raw, 0.0) + float(forecast_floor))
+    return cast(np.ndarray, np.log(np.maximum(raw, 0.0) + float(forecast_floor)))
 
 
 def _log_rvar_to_variance(
@@ -1952,7 +1952,10 @@ def _log_rvar_to_variance(
     forecast_floor: float = FORECAST_FLOOR,
 ) -> np.ndarray:
     log_values = np.asarray(values, dtype=float)
-    return np.maximum(np.exp(log_values) - float(forecast_floor), float(forecast_floor))
+    return cast(
+        np.ndarray,
+        np.maximum(np.exp(log_values) - float(forecast_floor), float(forecast_floor)),
+    )
 
 
 def _training_target_values(frame: pd.DataFrame, *, target_col: str = "rvar_event") -> np.ndarray:
@@ -2294,10 +2297,11 @@ def _train_elastic_net_tuned(
         val_pred = _back_transform_model_forecast(
             cv_model.predict(_numeric_matrix(validation_fit, features))
         )
-        metrics = _validation_tuning_metrics(validation_fit, forecast=val_pred)
-        metrics = {
-            **metrics,
-            **_canonical_target_diagnostics(
+        metrics: dict[str, object] = dict(
+            _validation_tuning_metrics(validation_fit, forecast=val_pred)
+        )
+        metrics.update(
+            _canonical_target_diagnostics(
                 early_stop_metric="elastic_net_cv_mse",
                 selection_metric=f"validation_{target_id}_predicted_edge_auc",
                 selection_checkpoint_diagnostic=(
@@ -2305,7 +2309,7 @@ def _train_elastic_net_tuned(
                     "validation_ranking_selects_profile_artifact"
                 ),
             ),
-        }
+        )
         elastic = cast(Any, cv_model.named_steps["elastic_net"])
         params = {
             "alpha": float(elastic.alpha_),

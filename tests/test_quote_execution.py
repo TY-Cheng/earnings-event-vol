@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 from typing import cast
 
+import httpx
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -872,6 +873,170 @@ def test_quote_rest_cache_loader_discards_non_dataframe_cache(
 
     assert quote_execution_module._load_cached_normalized_quotes(cache_path) is None
     assert not cache_path.exists()
+
+
+def test_quote_rest_retries_paginates_and_redacts_errors(tmp_path: Path) -> None:
+    key_path = tmp_path / "massive.key"
+    key_path.write_text("test-key\n", encoding="utf-8")
+    config = replace(
+        load_project_config(),
+        massive_api_key_file=key_path,
+        massive_base_url="https://api.massive.test",
+        massive_max_retries=1,
+        massive_retry_backoff_seconds=0,
+    )
+    stamp = int(pd.Timestamp("2026-02-05 20:59:50Z").value)
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class RetryClient:
+        def get(self, url: str, params: dict[str, object]) -> httpx.Response:
+            calls.append((url, dict(params)))
+            request = httpx.Request("GET", url)
+            if len(calls) == 1:
+                return httpx.Response(503, request=request, text="temporary apiKey=test-key")
+            if len(calls) == 2:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "results": [{"sip_timestamp": stamp, "bid_price": 5.0, "ask_price": 5.2}],
+                        "next_url": "/v3/quotes/next",
+                    },
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                json={"results": [{"sip_timestamp": stamp, "bid_price": 5.1, "ask_price": 5.3}]},
+            )
+
+    quotes = quote_execution_module.fetch_massive_option_quote_window_rest(
+        cast(httpx.Client, RetryClient()),
+        config,
+        options_ticker="O:ABC260213C00100000",
+        window_start="2026-02-05 15:45:00-05:00",
+        window_end="2026-02-05 16:00:00-05:00",
+    )
+
+    assert len(quotes) == 2
+    assert len(calls) == 3
+    assert calls[-1][0] == "https://api.massive.test/v3/quotes/next"
+    assert calls[-1][1] == {"apiKey": "test-key"}
+
+    class BadRequestClient:
+        def get(self, url: str, params: dict[str, object]) -> httpx.Response:
+            _ = params
+            return httpx.Response(
+                400,
+                request=httpx.Request("GET", url),
+                text="bad apiKey=test-key token",
+            )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        quote_execution_module.fetch_massive_option_quote_window_rest(
+            cast(httpx.Client, BadRequestClient()),
+            config,
+            options_ticker="O:ABC260213C00100000",
+            window_start="2026-02-05 15:45:00-05:00",
+            window_end="2026-02-05 16:00:00-05:00",
+        )
+    assert "test-key" not in str(exc_info.value)
+    assert "<redacted>" in str(exc_info.value)
+
+    class TransportClient:
+        def get(self, url: str, params: dict[str, object]) -> httpx.Response:
+            _ = url, params
+            raise httpx.TransportError("temporary network failure")
+
+    with pytest.raises(httpx.TransportError, match="temporary network failure"):
+        quote_execution_module._get_json_with_retries(
+            cast(httpx.Client, TransportClient()),
+            "https://api.massive.test/v3/quotes/O:ABC",
+            params={"apiKey": "test-key"},
+            config=config,
+        )
+
+
+def test_quote_execution_misc_defensive_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert (
+        quote_execution_module._to_datetime_et("2026-02-05 15:45:00")
+        .tz_convert("America/New_York")
+        .hour
+        == 15
+    )
+    assert "apiKey=<redacted>" in quote_execution_module._safe_exception_text(
+        ValueError("failed url?apiKey=test-key")
+    )
+
+    empty_key_path = tmp_path / "empty.key"
+    empty_key_path.write_text("\n", encoding="utf-8")
+    missing_key_config = replace(
+        load_project_config(),
+        massive_api_key_file=empty_key_path,
+    )
+    with pytest.raises(ValueError, match="MASSIVE_API_KEY_FILE"):
+        quote_execution_module._api_key(missing_key_config)
+
+    key_path = tmp_path / "massive.key"
+    key_path.write_text("test-key\n", encoding="utf-8")
+    config = replace(
+        load_project_config(),
+        massive_api_key_file=key_path,
+        massive_base_url="https://api.massive.test",
+        massive_max_retries=1,
+        massive_retry_backoff_seconds=0.5,
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr("earnings_event_vol.quote_execution.time_module.sleep", sleeps.append)
+
+    class EmptyRetryClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, url: str, params: dict[str, object]) -> httpx.Response:
+            _ = params
+            self.calls += 1
+            request = httpx.Request("GET", url)
+            if self.calls == 1:
+                return httpx.Response(503, request=request, text="temporary")
+            return httpx.Response(200, request=request, json={"results": []})
+
+    quotes = quote_execution_module.fetch_massive_option_quote_window_rest(
+        cast(httpx.Client, EmptyRetryClient()),
+        config,
+        options_ticker="O:ABC260213C00100000",
+        window_start="2026-02-05 15:45:00-05:00",
+        window_end="2026-02-05 16:00:00-05:00",
+    )
+    assert quotes.empty
+    assert sleeps == [0.5]
+
+    with pytest.raises(ValueError, match="unsupported quote_source"):
+        extract_quote_execution_panel(
+            config=config,
+            contracts=_quote_contracts(),
+            windows=_quote_windows(),
+            out_dir=tmp_path / "bad-source",
+            quote_source="bad",
+        )
+    with pytest.raises(ValueError, match="quote_workers must be positive"):
+        extract_quote_execution_panel(
+            config=config,
+            contracts=_quote_contracts(),
+            windows=_quote_windows(),
+            out_dir=tmp_path / "bad-workers",
+            quote_workers=0,
+        )
+    with pytest.raises(ValueError, match="event_offset must be non-negative"):
+        extract_quote_execution_panel(
+            config=config,
+            contracts=_quote_contracts(),
+            windows=_quote_windows(),
+            out_dir=tmp_path / "bad-offset",
+            event_offset=-1,
+        )
 
 
 def test_data_pipeline_quote_execution_stage_writes_lake_artifacts(tmp_path: Path) -> None:
