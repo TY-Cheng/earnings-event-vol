@@ -76,6 +76,9 @@ from earnings_event_vol.universe import (
     eligible_equity_cache_matches_rule,
 )
 
+TARGET_WINDOW_START = date(2013, 1, 1)
+TARGET_WINDOW_END = date(2026, 6, 5)
+
 DEFAULT_STATIC_TICKERS: tuple[str, ...] = (
     "AAPL",
     "MSFT",
@@ -2272,7 +2275,7 @@ def _lake_dataset_row(
     target_start: date,
     target_end: date,
     date_columns: Sequence[str],
-    required_for_2013_2025: bool,
+    required_for_target_window: bool,
     paper_grade_requirement: str,
     note: str,
     partitioned_by_date: bool = False,
@@ -2383,7 +2386,8 @@ def _lake_dataset_row(
         "target_end": target_end.isoformat(),
         "target_coverage_status": coverage_status,
         "gap_reason": gap_reason,
-        "required_for_2013_2025": bool(required_for_2013_2025),
+        "required_for_target_window": bool(required_for_target_window),
+        "required_for_2013_2025": bool(required_for_target_window),
         "paper_grade_requirement": paper_grade_requirement,
         "expected_weekday_partitions": expected_partitions,
         "partition_coverage_share": partition_coverage,
@@ -2431,7 +2435,7 @@ def _lake_quality_audit_step(
             "layer": "bronze",
             "path": config.bronze_data_dir / "massive" / "options_day_aggs",
             "date_columns": ("source_date", "date", "quote_date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "historical option chain daily aggregates for universe, contract discovery, "
                 "proxy IV surfaces"
@@ -2447,7 +2451,7 @@ def _lake_quality_audit_step(
             "layer": "bronze",
             "path": config.bronze_data_dir / "massive" / "underlying_day_aggs",
             "date_columns": ("source_date", "date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "underlying daily bars for event returns and universe construction"
             ),
@@ -2465,7 +2469,7 @@ def _lake_quality_audit_step(
             / "quotes_v1_target_windows"
             / "quote_window_quotes.parquet",
             "date_columns": ("quote_date", "quote_timestamp_et"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "matched targeted quote rows for quote-aware execution diagnostics"
             ),
@@ -2476,7 +2480,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "earnings_calendar" / "main_sample.parquet",
             "date_columns": ("announcement_date", "entry_date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "SEC/text-validated event calendar over the target study window"
             ),
@@ -2487,7 +2491,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "event_windows" / "event_windows.parquet",
             "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "event-aligned entry/exit windows and contract candidates",
             "note": "One event row per retained earnings event.",
         },
@@ -2496,7 +2500,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "contracts" / "event_contract_candidates.parquet",
             "date_columns": ("entry_date", "announcement_date", "quote_date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "validated option candidate contracts for every retained event"
             ),
@@ -2507,7 +2511,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "trade_proxy" / "trade_proxy_option_prices.parquet",
             "date_columns": ("entry_date", "quote_date", "timestamp_et", "event_entry_timestamp"),
-            "required_for_2013_2025": False,
+            "required_for_target_window": False,
             "paper_grade_requirement": (
                 "diagnostic no-NBBO trade-proxy entry marks, not quote execution"
             ),
@@ -2518,7 +2522,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "quote_execution" / "quote_window_marks.parquet",
             "date_columns": ("quote_date", "quote_timestamp_et", "window_start"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "selected bid/ask quote marks for every event leg/window",
             "note": "Bounded quote slice should be nonzero; full sample remains the target.",
         },
@@ -2527,7 +2531,7 @@ def _lake_quality_audit_step(
             "layer": "silver",
             "path": config.silver_data_dir / "quote_execution" / "quote_execution_legs.parquet",
             "date_columns": ("quote_date", "quote_timestamp_et", "window_start"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "leg-level bid/ask execution diagnostics",
             "note": "Bounded quote slice should be nonzero; full sample remains the target.",
         },
@@ -2536,7 +2540,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "event_panel" / "trade_proxy_event_panel.parquet",
             "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
-            "required_for_2013_2025": False,
+            "required_for_target_window": False,
             "paper_grade_requirement": (
                 "no-NBBO proxy event panel; paper-grade execution requires quote/NBBO replacement"
             ),
@@ -2547,7 +2551,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "modeling" / "feature_matrix.parquet",
             "date_columns": ("entry_date", "announcement_date", "event_entry_timestamp"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "modeling features over the final target event sample",
             "note": "Analysis-only quote fields must remain excluded from model features.",
         },
@@ -2563,7 +2567,7 @@ def _lake_quality_audit_step(
                 "announcement_date",
                 "exit_date",
             ),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "straddle-level bid/ask execution diagnostics",
             "note": "Bounded quote slice should be nonzero; full sample remains the target.",
         },
@@ -2572,7 +2576,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "quote_execution" / "quote_ivar_event.parquet",
             "date_columns": ("entry_date", "announcement_date", "quote_date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "quote-based event IVAR or explicitly diagnostic quote premium proxy"
             ),
@@ -2583,7 +2587,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "quote_execution" / "quote_iv_surface.parquet",
             "date_columns": ("entry_date", "announcement_date", "expiration"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "bounded quote-derived leg-level Black-Scholes IV diagnostics"
             ),
@@ -2596,7 +2600,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "quote_execution" / "quote_iv_surface_summary.parquet",
             "date_columns": ("entry_date", "announcement_date", "expiration"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "call-put quote-IV surface-pair diagnostics",
             "note": (
                 "Pairs entry-window quote IVs by event, expiry, and strike for bounded diagnostics."
@@ -2607,7 +2611,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "quote_execution" / "quote_surface_ivar_event.parquet",
             "date_columns": ("entry_date", "announcement_date", "expiration_1", "expiration_2"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": "event-IVAR extracted from quote-IV total variance pairs",
             "note": (
                 "Surface-IVAR diagnostic over bounded targeted quotes; full historical coverage "
@@ -2619,7 +2623,7 @@ def _lake_quality_audit_step(
             "layer": "gold",
             "path": config.gold_data_dir / "quote_execution" / "quote_execution_confidence.parquet",
             "date_columns": ("entry_date", "announcement_date", "quote_date"),
-            "required_for_2013_2025": True,
+            "required_for_target_window": True,
             "paper_grade_requirement": (
                 "event-level execution-confidence bands over the final target event sample"
             ),
@@ -2636,7 +2640,7 @@ def _lake_quality_audit_step(
             target_start=target_start,
             target_end=target_end,
             date_columns=cast(Sequence[str], spec["date_columns"]),
-            required_for_2013_2025=bool(spec["required_for_2013_2025"]),
+            required_for_target_window=bool(spec["required_for_target_window"]),
             paper_grade_requirement=str(spec["paper_grade_requirement"]),
             note=str(spec["note"]),
             partitioned_by_date=bool(spec.get("partitioned_by_date", False)),
@@ -2663,7 +2667,7 @@ def _lake_quality_audit_step(
     out.mkdir(parents=True, exist_ok=True)
     coverage.to_csv(coverage_path, index=False)
     year_coverage.to_csv(year_path, index=False)
-    required = coverage.loc[coverage["required_for_2013_2025"].astype(bool)].copy()
+    required = coverage.loc[coverage["required_for_target_window"].astype(bool)].copy()
     complete_statuses = {"target_span_covered"}
     incomplete_required = required.loc[
         ~required["target_coverage_status"].astype(str).isin(complete_statuses)
@@ -3945,8 +3949,8 @@ def run_data_pipeline(
     force: bool = False,
     jobs: int = 1,
     tickers: Sequence[str] = DEFAULT_STATIC_TICKERS,
-    start_date: date = date(2013, 1, 1),
-    end_date: date = date(2025, 12, 31),
+    start_date: date = TARGET_WINDOW_START,
+    end_date: date = TARGET_WINDOW_END,
     dates: Sequence[date] = (),
     options_day_aggs_path: Path | None = None,
     sec_submissions_dir: Path | None = None,

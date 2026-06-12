@@ -19,15 +19,15 @@ wsl -d Ubuntu --cd /home/tycheng/projects/earnings-event-vol/earnings-event-vol 
   pytest, MkDocs strict build, CLI status, and `source-probe all`.
 - `just data args="--dry-run"`: Dry-run the active `all` data DAG.
 - `just data`: Runs the active `all` data route for the 2013-01-01 to
-  2025-12-31 target window by default; pass explicit `args` for bounded
+  2026-06-05 target window by default; pass explicit `args` for bounded
   current-cache reruns.
 - `just research`: Runs the development-default research package with
   `sequence_suite=all`, `allow_high_sequence_risk`, and `bootstrap_iter=200`.
 - `just research-fast`: Reuses compatible tuning params and runs the current
   fast tabular/no-sequence smoke refresh plus report/figure sync.
-- `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1 --feature-schema-version fe_v2_sec_xbrl"`:
-  Runs the current paper-facing canonical FE V2 tuned package.
-- `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1 --feature-schema-version fe_v1_legacy"`:
+- `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1_day_c2c_rank_log_rvar --feature-schema-version fe_v2_sec_xbrl"`:
+  Runs the current paper-facing canonical FE V2 log-target tuned package.
+- `just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1_day_c2c_rank_log_rvar --feature-schema-version fe_v1_legacy"`:
   Runs the same-code FE V1 feature-schema ablation.
 - `just research-report`: Regenerates the report and figures from existing
   modeling artifacts.

@@ -22,7 +22,7 @@ Paper-grade market data:
 Full sample:
 
 - Extend from the current 2022-onward entitlement-backed proxy sample to the
-  target 2013-2025 sample.
+  target 2013-01-01 to 2026-06-05 sample.
 - Preserve monthly top-50 liquid single-name universe construction.
 - Keep ETF, index, volatility, commodity trust, and other non-single-name
   symbols out of the main universe.
@@ -46,7 +46,7 @@ Sequence route:
   claim.
 - Report sequence coverage, drop rate, and missingness by year and ticker.
 - Keep mask-only and deterministic time-shuffle controls.
-- Keep official `mamba-ssm` framed as a diagnostic unless a future run beats
+- Keep sequence models framed as diagnostics unless a future run beats
   mask-only/time-shuffle controls and tabular tuned rows on the common-row
   bootstrap gate.
 

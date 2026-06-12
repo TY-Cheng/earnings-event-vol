@@ -21,7 +21,7 @@ It must not claim:
 - generic IV forecasting superiority;
 - paper-grade executable backtest results from second-aggregate trade bars;
 - that lower RMSE alone implies economic value;
-- that official `mamba-ssm` or any sequence model is the contribution
+- that a sequence model is the contribution
   independent of baselines, ablations, and costs;
 - that calendar spreads isolate pure event variance.
 
@@ -56,8 +56,9 @@ Data:
   option day-aggregate close is not used as a strategy-exit fallback.
 - O2C proxy PnL is a realized decomposition diagnostic, not a model-driven
   strategy headline without a post-open residual-IV baseline.
-- The 2013-2025 sample is described as the target paper range unless historical
-  option data for that range has actually been acquired and processed.
+- The 2013-01-01 to 2026-06-05 sample is described as the target paper window
+  unless historical option and quote/NBBO-equivalent data for that range have
+  actually been acquired and processed.
 - Earnings events come from SEC EDGAR submissions plus SEC primary filing
   document validation.
 - Massive 8-K text is auxiliary fallback only.
@@ -116,7 +117,7 @@ Backtests:
 
 ## Red Flags
 
-- "Mamba predicts IV better" as the headline.
+- "A sequence model predicts IV better" as the headline.
 - Random train/test split.
 - Missing BMO/AMC alignment.
 - Trades entered after the event cutoff.
@@ -126,4 +127,4 @@ Backtests:
   XGBoost.
 - Calendar returns interpreted as pure event-variance returns.
 - Variance-space edge compared directly to dollar transaction costs.
-- Proxy results from 2022-2025 presented as full 2013-2025 paper evidence.
+- Proxy results from 2022-2025 presented as full target-window paper evidence.

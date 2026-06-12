@@ -818,6 +818,61 @@ def test_quote_execution_panel_fetches_targeted_rest_quotes_with_cache(
     assert cached_report.quote_workers == 2
     assert len(calls) == 4
 
+    cache_files = sorted(cache_dir.glob("quote_date=*/options_ticker=*/window=*.parquet"))
+    cache_files[0].write_bytes(b"not a parquet file")
+    refetched_report = extract_quote_execution_panel(
+        config=config,
+        contracts=_quote_contracts(),
+        windows=_quote_windows(),
+        out_dir=tmp_path / "third",
+        dates=(date(2026, 2, 5),),
+        metadata_only=False,
+        quote_source="rest",
+        quote_cache_dir=cache_dir,
+        quote_workers=2,
+    )
+
+    assert refetched_report.quote_rows_matched == 4
+    assert len(calls) == 5
+    pd.read_parquet(cache_files[0])
+
+    pd.DataFrame({"unexpected": [1]}).to_parquet(cache_files[1], index=False)
+    schema_refetched_report = extract_quote_execution_panel(
+        config=config,
+        contracts=_quote_contracts(),
+        windows=_quote_windows(),
+        out_dir=tmp_path / "fourth",
+        dates=(date(2026, 2, 5),),
+        metadata_only=False,
+        quote_source="rest",
+        quote_cache_dir=cache_dir,
+        quote_workers=2,
+    )
+
+    assert schema_refetched_report.quote_rows_matched == 4
+    assert len(calls) == 6
+    assert "unexpected" not in pd.read_parquet(cache_files[1]).columns
+
+
+def test_quote_rest_cache_loader_discards_empty_files(tmp_path: Path) -> None:
+    cache_path = tmp_path / "empty.parquet"
+    cache_path.touch()
+
+    assert quote_execution_module._load_cached_normalized_quotes(cache_path) is None
+    assert not cache_path.exists()
+
+
+def test_quote_rest_cache_loader_discards_non_dataframe_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_path = tmp_path / "bad.parquet"
+    cache_path.write_bytes(b"nonempty")
+    monkeypatch.setattr("earnings_event_vol.quote_execution.pd.read_parquet", lambda _: ["bad"])
+
+    assert quote_execution_module._load_cached_normalized_quotes(cache_path) is None
+    assert not cache_path.exists()
+
 
 def test_data_pipeline_quote_execution_stage_writes_lake_artifacts(tmp_path: Path) -> None:
     config = replace(

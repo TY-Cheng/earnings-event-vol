@@ -9,8 +9,9 @@
 - **Task runner**: `just`
 - **Core libraries**: `numpy`, `pandas`, `polars`, `pyarrow`, `pydantic`,
   `scipy`, `scikit-learn`, `lightgbm`, `xgboost`, `optuna`, `torch`
-- **Sequence runtime**: official `mamba-ssm` is optional but available locally
-  through the CUDA Mamba install recipe
+- **Sequence runtime**: active sequence diagnostics use ridge-flat aggregates
+  plus lightweight in-repo PyTorch attention/CNN encoders only. Slow recurrent
+  or SSM 5-seed sequence ensembles are not active runtime dependencies.
 - **Docs**: `mkdocs` with `mkdocs-material`
 
 # Codebase Structure

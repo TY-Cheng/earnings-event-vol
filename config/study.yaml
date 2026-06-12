@@ -48,8 +48,6 @@ baselines:
 models:
   - ft_transformer
   - ridge_flat_aggregates_sequence
-  - bigru_sequence
-  - mamba_ssm_sequence
   - mask_only_sequence
   - time_shuffle_sequence
 

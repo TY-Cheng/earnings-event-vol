@@ -31,6 +31,7 @@ from earnings_event_vol.backtest import (
     GaussianEventJumpDistribution,
     SymmetricTwoPointJumpDistribution,
     apply_portfolio_caps,
+    apply_strategy_policy,
     black_scholes_price,
     build_proxy_strategy_frame,
     estimated_transaction_cost_usd,
@@ -38,12 +39,15 @@ from earnings_event_vol.backtest import (
     integer_contract_count,
     market_entry_cost_usd,
     premium_space_signal,
+    tune_strategy_policy_validation_only,
 )
-from earnings_event_vol.cli import _parse_comma_ints, build_parser, main
+from earnings_event_vol.cli import build_parser, main
 from earnings_event_vol.config import load_project_config
 from earnings_event_vol.contract_reference import apply_contract_reference_validation
 from earnings_event_vol.data_audit import audit_data_fields, vendor_local_iv_comparison
 from earnings_event_vol.data_pipeline import (
+    TARGET_WINDOW_END,
+    TARGET_WINDOW_START,
     DataPipelineStep,
     parse_text_list,
     run_data_pipeline,
@@ -163,11 +167,10 @@ from earnings_event_vol.metrics import (
 from earnings_event_vol.models import (
     MODEL_REGISTRY,
     AttentionPoolingSequenceEncoder,
-    BiGRUSequenceEncoder,
     DilatedCNNSequenceEncoder,
     FTTransformerRegressor,
     LinearElasticNetRegressor,
-    MambaSSMSequenceEncoder,
+    RidgeRegressor,
     add_benchmark_predictions,
     fit_model,
     get_model_spec,
@@ -180,17 +183,28 @@ from earnings_event_vol.models import (
     unimplemented_model_message,
 )
 from earnings_event_vol.research import (
+    CANONICAL_BACK_TRANSFORM,
+    CANONICAL_EVALUATION_SPACE,
+    CANONICAL_TARGET_TRANSFORM,
+    CANONICAL_TRAINING_SPACE,
+    DEFAULT_TUNING_PROFILE,
+    ENSEMBLE_RANK_SIGNAL_COL,
     FORECAST_FLOOR,
     HYBRID_SEQUENCE_FEATURE_NAMES,
     HYBRID_STEPS,
     SEQUENCE_FEATURE_NAMES,
     TARGET_IDS,
-    TUNING_SEQUENCE_ENSEMBLE_SEEDS,
+    TUNING_SELECTION_TARGET_ID,
     TuningState,
+    _best_completed_trial,
     _latest_xbrl_values_for_event,
     _load_reusable_tuning_state,
+    _log_rvar_to_variance,
     _model_ids_for_sequence_suite,
-    _train_sequence_seed_ensemble,
+    _sequence_losses,
+    _target_ids_for_sequence_suite,
+    _target_to_log_rvar,
+    _torch_log_rvar_to_variance,
     _write_tuning_artifacts,
     aggregate_sequence_features,
     assign_event_splits,
@@ -3303,11 +3317,13 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
         target_start=target_start,
         target_end=target_end,
         date_columns=("entry_date",),
-        required_for_2013_2025=True,
+        required_for_target_window=True,
         paper_grade_requirement="required",
         note="missing path",
     )
     assert missing_row["target_coverage_status"] == "missing"
+    assert missing_row["required_for_target_window"] is True
+    assert missing_row["required_for_2013_2025"] is True
     assert missing_years.empty
 
     partitioned = tmp_path / "partitioned"
@@ -3325,7 +3341,7 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
         target_start=target_start,
         target_end=target_end,
         date_columns=("source_date",),
-        required_for_2013_2025=True,
+        required_for_target_window=True,
         paper_grade_requirement="required",
         note="partitioned",
         partitioned_by_date=True,
@@ -3347,7 +3363,7 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
         target_start=target_start,
         target_end=target_end,
         date_columns=("entry_date",),
-        required_for_2013_2025=True,
+        required_for_target_window=True,
         paper_grade_requirement="required",
         note="csv",
     )
@@ -3365,7 +3381,7 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
         target_start=target_start,
         target_end=target_end,
         date_columns=("entry_date",),
-        required_for_2013_2025=False,
+        required_for_target_window=False,
         paper_grade_requirement="metadata",
         note="text",
     )
@@ -3380,7 +3396,7 @@ def test_lake_quality_audit_helper_edges(tmp_path: Path) -> None:
         target_start=target_start,
         target_end=target_end,
         date_columns=("entry_date",),
-        required_for_2013_2025=False,
+        required_for_target_window=False,
         paper_grade_requirement="bad",
         note="bad",
     )
@@ -6920,12 +6936,16 @@ def test_black_scholes_and_model_registry_protocol() -> None:
     assert get_model_spec("last_four_ivar").implemented is True
     assert get_model_spec("patell_wolfson_diagnostic").implemented is True
     assert get_model_spec("xgboost_tuned").implemented is True
+    assert get_model_spec("lightgbm_xgboost_forecast_ensemble").implemented is True
+    assert get_model_spec("lightgbm_xgboost_rank_ensemble").implemented is False
     for removed_model_id in [
         "linear_elastic_net",
         "lightgbm",
         "xgboost",
         "bigru_sequence",
         "mamba_ssm_sequence",
+        "bigru_sequence_5seed",
+        "mamba_ssm_sequence_5seed",
     ]:
         assert removed_model_id not in MODEL_REGISTRY
     assert "implemented as a deterministic baseline" in unimplemented_model_message(
@@ -6941,8 +6961,8 @@ def test_black_scholes_and_model_registry_protocol() -> None:
         assert retired_id not in MODEL_REGISTRY
     for sequence_id in [
         "ridge_flat_aggregates_sequence",
-        "bigru_sequence_5seed",
-        "mamba_ssm_sequence_5seed",
+        "attention_pooling_sequence",
+        "dilated_cnn_sequence",
         "mask_only_sequence",
         "time_shuffle_sequence",
     ]:
@@ -6984,35 +7004,88 @@ def _synthetic_tuning_frame() -> pd.DataFrame:
     )
 
 
+def test_log_rvar_target_helpers_round_trip_and_floor() -> None:
+    raw = np.asarray([0.0, 0.01, 0.2])
+    log_values = _target_to_log_rvar(raw)
+    restored = _log_rvar_to_variance(log_values)
+
+    assert restored[0] == pytest.approx(FORECAST_FLOOR)
+    assert restored[1:] == pytest.approx(raw[1:])
+    assert _log_rvar_to_variance([-1000.0])[0] == pytest.approx(FORECAST_FLOOR)
+
+
+def test_sequence_pairwise_edge_uses_variance_space_after_log_back_transform() -> None:
+    log_prediction = torch.log(torch.tensor([FORECAST_FLOOR, 0.02 + FORECAST_FLOOR]))
+    log_target = torch.log(torch.tensor([FORECAST_FLOOR, 0.03 + FORECAST_FLOOR]))
+    ivar = torch.tensor([0.01, 0.01])
+    realized_edge = torch.tensor([-0.01, 0.02])
+
+    predicted_variance = _torch_log_rvar_to_variance(log_prediction)
+    _huber, ranking = _sequence_losses(
+        log_prediction,
+        log_target,
+        predicted_variance - ivar,
+        realized_edge,
+    )
+    _bad_huber, bad_ranking = _sequence_losses(
+        log_prediction,
+        log_target,
+        log_prediction - ivar,
+        realized_edge,
+    )
+
+    assert predicted_variance.tolist() == pytest.approx([FORECAST_FLOOR, 0.02])
+    assert float(ranking.item()) != pytest.approx(float(bad_ranking.item()))
+
+
+def test_ft_transformer_log_mode_uses_unconstrained_head() -> None:
+    default_model = FTTransformerRegressor(n_features=3)
+    log_model = FTTransformerRegressor(n_features=3, positive_output=False)
+
+    assert default_model.positive_output is True
+    assert any(isinstance(module, torch.nn.Softplus) for module in default_model.head.modules())
+    assert log_model.positive_output is False
+    assert not any(isinstance(module, torch.nn.Softplus) for module in log_model.head.modules())
+    with torch.no_grad():
+        raw_log_output = log_model(torch.zeros((2, 3), dtype=torch.float32)).numpy()
+    assert (_log_rvar_to_variance(raw_log_output) >= FORECAST_FLOOR).all()
+
+
 def test_research_tuning_cli_and_model_ids() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
             "research",
             "--tuning-profile",
-            "tuned_phase1",
+            "tuned_phase1_day_c2c_rank_log_rvar",
             "--tuning-seed",
             "123",
             "--reuse-tuning-params",
         ]
     )
 
-    assert args.tuning_profile == "tuned_phase1"
+    assert args.tuning_profile == DEFAULT_TUNING_PROFILE
     assert args.tuning_seed == 123
     assert args.reuse_tuning_params is True
     assert args.feature_schema_version == FEATURE_SCHEMA_V2_SEC_XBRL
-    expected_sequence_seeds = ",".join(str(seed) for seed in TUNING_SEQUENCE_ENSEMBLE_SEEDS)
-    assert args.mamba_seeds == expected_sequence_seeds
+    assert not hasattr(args, "mamba_backend")
+    assert not hasattr(args, "mamba_seeds")
     for function in (run_proxy_model_suite, run_research_models, run_proxy_research_package):
         defaults = function.__kwdefaults__
         assert defaults is not None
-        assert defaults["mamba_seeds"] == TUNING_SEQUENCE_ENSEMBLE_SEEDS
+        assert "mamba_backend" not in defaults
+        assert "mamba_seeds" not in defaults
     with pytest.raises(SystemExit):
         parser.parse_args(["research", "--tuning-profile", "bad_profile"])
 
     default_ids = _model_ids_for_sequence_suite("all")
-    tuned_ids = _model_ids_for_sequence_suite("all", tuning_profile="tuned_phase1")
-    tuned_no_sequence_ids = _model_ids_for_sequence_suite("none", tuning_profile="tuned_phase1")
+    tuned_ids = _model_ids_for_sequence_suite(
+        "all", tuning_profile="tuned_phase1_day_c2c_rank_log_rvar"
+    )
+    tuned_no_sequence_ids = _model_ids_for_sequence_suite(
+        "none",
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
+    )
     with pytest.raises(ValueError, match="unsupported sequence_suite"):
         _model_ids_for_sequence_suite("phase1")
 
@@ -7023,28 +7096,100 @@ def test_research_tuning_cli_and_model_ids() -> None:
     assert "linear_elastic_net_tuned" in tuned_ids
     assert "lightgbm_tuned" in tuned_ids
     assert "xgboost_tuned" in tuned_ids
+    assert "lightgbm_xgboost_forecast_ensemble" in tuned_ids
+    assert "lightgbm_xgboost_rank_ensemble" not in tuned_ids
     assert "ft_transformer" in tuned_ids
-    assert "bigru_sequence_5seed" in tuned_ids
-    assert "mamba_ssm_sequence_5seed" in tuned_ids
+    assert "bigru_sequence_5seed" not in tuned_ids
+    assert "mamba_ssm_sequence_5seed" not in tuned_ids
     assert "attention_pooling_sequence" in tuned_ids
     assert "dilated_cnn_sequence" in tuned_ids
     assert "bigru_sequence_5seed" not in tuned_no_sequence_ids
+    assert "mamba_ssm_sequence_5seed" not in tuned_no_sequence_ids
     assert "attention_pooling_sequence" not in tuned_no_sequence_ids
     assert "dilated_cnn_sequence" not in tuned_no_sequence_ids
     assert default_ids == tuned_ids
+    assert TUNING_SELECTION_TARGET_ID == "day_c2c"
+    assert _target_ids_for_sequence_suite("all")[0] == TUNING_SELECTION_TARGET_ID
+
+
+def test_data_cli_defaults_target_rebuild_window() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["data"])
+
+    assert args.start == TARGET_WINDOW_START.isoformat()
+    assert args.end == TARGET_WINDOW_END.isoformat()
+
+
+def test_lightgbm_xgboost_forecast_ensemble_uses_variance_units(tmp_path: Path) -> None:
+    frame = _synthetic_tuning_frame().assign(
+        forecast_lightgbm_tuned=np.linspace(0.01, 0.04, 40),
+        forecast_xgboost_tuned=np.linspace(0.02, 0.08, 40)[::-1],
+    )
+
+    predictions, diagnostics = run_proxy_model_suite(
+        frame,
+        tensor_path=tmp_path / "unused_sequence_tensor.npz",
+        model_ids=["lightgbm_xgboost_forecast_ensemble"],
+    )
+
+    forecast = predictions["forecast_lightgbm_xgboost_forecast_ensemble"]
+    expected = (frame["forecast_lightgbm_tuned"] + frame["forecast_xgboost_tuned"]) / 2.0
+    assert np.allclose(forecast, expected)
+    assert ENSEMBLE_RANK_SIGNAL_COL in predictions.columns
+    edges = pd.DataFrame(
+        {
+            "lightgbm": frame["forecast_lightgbm_tuned"] - frame["ivar_event"],
+            "xgboost": frame["forecast_xgboost_tuned"] - frame["ivar_event"],
+        }
+    )
+    split_groups = frame["split"].astype(str)
+    expected_rank_signal = pd.DataFrame(
+        {
+            "lightgbm": edges.groupby(split_groups)["lightgbm"].rank(method="average", pct=True),
+            "xgboost": edges.groupby(split_groups)["xgboost"].rank(method="average", pct=True),
+        }
+    ).mean(axis=1)
+    assert np.allclose(predictions[ENSEMBLE_RANK_SIGNAL_COL], expected_rank_signal)
+    assert not np.allclose(
+        forecast.rank(method="average", pct=True),
+        predictions[ENSEMBLE_RANK_SIGNAL_COL],
+    )
+    row = diagnostics.loc[diagnostics["model_id"].eq("lightgbm_xgboost_forecast_ensemble")].iloc[0]
+    assert row["ensemble_method"] == "equal_weight_forecast_average"
+    assert row["prediction_scale"] == "variance_units"
+    assert row["ranking_signal_col"] == ENSEMBLE_RANK_SIGNAL_COL
+
+
+def test_best_completed_trial_respects_penalized_objective() -> None:
+    class FakeTrial:
+        def __init__(self, value: float, auc: float, top_decile: float, rmse: float):
+            self.value = value
+            self.user_attrs = {
+                "validation_auc": auc,
+                "validation_top_decile_precision": top_decile,
+                "validation_rmse": rmse,
+            }
+
+    class FakeStudy:
+        trials = [
+            FakeTrial(0.61, auc=0.66, top_decile=0.5, rmse=0.01),
+            FakeTrial(0.62, auc=0.62, top_decile=0.3, rmse=0.02),
+        ]
+
+    assert _best_completed_trial(FakeStudy()) is FakeStudy.trials[1]
 
 
 def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> None:
     pytest.importorskip("sklearn")
     frame = _synthetic_tuning_frame()
-    tuning_state = TuningState(profile="tuned_phase1", seed=17)
+    tuning_state = TuningState(profile="tuned_phase1_day_c2c_rank_log_rvar", seed=17)
 
     predictions, diagnostics = run_proxy_model_suite(
         frame,
         tensor_path=tmp_path / "unused_sequence_tensor.npz",
         model_ids=["linear_elastic_net_tuned"],
         tuning_state=tuning_state,
-        target_id="jump_c2o",
+        target_id=TUNING_SELECTION_TARGET_ID,
     )
     outputs = _write_tuning_artifacts(tmp_path, tuning_state=tuning_state)
     selected_payload = json.loads(Path(outputs["tuning_selected_params"]).read_text())
@@ -7062,28 +7207,49 @@ def test_tuned_elastic_net_records_validation_only_artifacts(tmp_path: Path) -> 
         == "trained"
     )
     assert selected_payload["test_metrics_used_for_selection"] is False
+    assert selected_payload["selection_target_id"] == TUNING_SELECTION_TARGET_ID
+    assert selected_payload["target_transform"] == CANONICAL_TARGET_TRANSFORM
+    assert selected_payload["training_space"] == CANONICAL_TRAINING_SPACE
+    assert selected_payload["evaluation_space"] == CANONICAL_EVALUATION_SPACE
+    assert selected_payload["back_transform"] == CANONICAL_BACK_TRANSFORM
     selected = selected_payload["selected_params"]["linear_elastic_net_tuned"]
+    assert selected["selection_target_id"] == TUNING_SELECTION_TARGET_ID
+    assert selected["target_transform"] == CANONICAL_TARGET_TRANSFORM
+    assert selected["training_space"] == CANONICAL_TRAINING_SPACE
+    assert selected["evaluation_space"] == CANONICAL_EVALUATION_SPACE
+    assert selected["back_transform"] == CANONICAL_BACK_TRANSFORM
+    assert (
+        selected["primary_metric"] == f"validation_{TUNING_SELECTION_TARGET_ID}_predicted_edge_auc"
+    )
     assert selected["selection_protocol"] == "train_validation_only"
     assert selected["refit_protocol"] == "train_plus_validation"
     assert set(selected["params"]) >= {"alpha", "l1_ratio"}
     assert not any(key.startswith("test") for key in selected["validation_metrics"])
     assert not any(column.startswith("test") for column in trials.columns)
     assert trials["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
-    assert trials["tuning_profile"].eq("tuned_phase1").all()
+    assert trials["tuning_profile"].eq("tuned_phase1_day_c2c_rank_log_rvar").all()
+    assert trials["target_id"].eq(TUNING_SELECTION_TARGET_ID).all()
+    assert trials["target_transform"].eq(CANONICAL_TARGET_TRANSFORM).all()
+    assert trials["evaluation_space"].eq(CANONICAL_EVALUATION_SPACE).all()
     assert {"validation_auc", "validation_top_decile_precision", "validation_rmse"}.issubset(
         trials.columns
     )
 
 
 def test_reusable_tuning_state_requires_matching_schema_profile_and_seed(tmp_path: Path) -> None:
-    tuning_state = TuningState(profile="tuned_phase1", seed=17)
+    tuning_state = TuningState(profile="tuned_phase1_day_c2c_rank_log_rvar", seed=17)
     cache_params: dict[str, object] = {"alpha": 0.01, "l1_ratio": 0.1, "max_iter": 100}
     _cache_payload: dict[str, object] = {
         "model_id": "linear_elastic_net_tuned",
-        "selection_target_id": "jump_c2o",
+        "selection_target_id": TUNING_SELECTION_TARGET_ID,
         "selection_protocol": "train_validation_only",
         "refit_protocol": "train_plus_validation",
-        "primary_metric": "validation_jump_c2o_predicted_edge_auc",
+        "primary_metric": f"validation_{TUNING_SELECTION_TARGET_ID}_predicted_edge_auc",
+        "target_transform": CANONICAL_TARGET_TRANSFORM,
+        "training_space": CANONICAL_TRAINING_SPACE,
+        "evaluation_space": CANONICAL_EVALUATION_SPACE,
+        "back_transform": CANONICAL_BACK_TRANSFORM,
+        "forecast_floor": FORECAST_FLOOR,
         "params": cache_params,
         "validation_metrics": {"validation_auc": 0.5},
     }
@@ -7091,7 +7257,7 @@ def test_reusable_tuning_state_requires_matching_schema_profile_and_seed(tmp_pat
     tuning_state.trials.append(
         {
             "model_id": "linear_elastic_net_tuned",
-            "target_id": "jump_c2o",
+            "target_id": TUNING_SELECTION_TARGET_ID,
             "trial_number": 0,
             "selected": True,
             "seed": 17,
@@ -7112,7 +7278,7 @@ def test_reusable_tuning_state_requires_matching_schema_profile_and_seed(tmp_pat
 
     loaded, reused, source = _load_reusable_tuning_state(
         tmp_path,
-        tuning_profile="tuned_phase1",
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
         tuning_seed=17,
         feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
     )
@@ -7124,13 +7290,41 @@ def test_reusable_tuning_state_requires_matching_schema_profile_and_seed(tmp_pat
 
     fallback, reused, reason = _load_reusable_tuning_state(
         tmp_path,
-        tuning_profile="tuned_phase1",
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
         tuning_seed=123,
         feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
     )
 
     assert reused is False
     assert reason == "tuning_seed_mismatch"
+    assert fallback.selected == {}
+
+    selected_payload = json.loads((tmp_path / "tuning_selected_params.json").read_text())
+    selected_payload["target_transform"] = "raw_rvar"
+    (tmp_path / "tuning_selected_params.json").write_text(json.dumps(selected_payload))
+    fallback, reused, reason = _load_reusable_tuning_state(
+        tmp_path,
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
+        tuning_seed=17,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    assert reused is False
+    assert reason == "target_transform_mismatch"
+    assert fallback.selected == {}
+
+    selected_payload["target_transform"] = CANONICAL_TARGET_TRANSFORM
+    selected_payload["selection_target_id"] = "jump_c2o"
+    (tmp_path / "tuning_selected_params.json").write_text(json.dumps(selected_payload))
+    fallback, reused, reason = _load_reusable_tuning_state(
+        tmp_path,
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
+        tuning_seed=17,
+        feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
+    )
+
+    assert reused is False
+    assert reason == "selection_target_id_mismatch"
     assert fallback.selected == {}
 
 
@@ -7173,60 +7367,21 @@ def test_trained_model_with_no_usable_predictions_is_invalid(
     assert row["test_prediction_finite_rows"] == 0
 
 
-def test_sequence_seed_ensemble_records_fixed_seed_list(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+def test_removed_sequence_ensembles_are_not_runnable(tmp_path: Path) -> None:
     frame = _synthetic_tuning_frame()
-    calls: list[int] = []
+    active_ids = _model_ids_for_sequence_suite("all")
 
-    def fake_train_sequence_model(
-        frame: pd.DataFrame,
-        *,
-        tensor_path: Path,
-        model_id: str,
-        seed: int = 17,
-        **unused: object,
-    ) -> tuple[pd.Series, dict[str, object], object | None]:
-        _ = tensor_path, model_id, unused
-        calls.append(seed)
-        return (
-            pd.Series(float(seed), index=frame.index),
-            {"status": "trained", "seed": seed},
-            None,
-        )
-
-    monkeypatch.setattr(
-        "earnings_event_vol.research._train_sequence_model",
-        fake_train_sequence_model,
-    )
-    pred, diag, model = _train_sequence_seed_ensemble(
-        frame,
-        tensor_path=tmp_path / "sequence_tensor.npz",
-        model_id="bigru_sequence_5seed",
-        base_model_id="bigru_encoder",
-        seeds=(17, 42, 123, 456, 789),
-    )
-
-    assert model is None
-    assert calls == [17, 42, 123, 456, 789]
-    assert diag["seed_list"] == "17,42,123,456,789"
-    assert diag["trained_seed_count"] == 5
-    assert pred.mean() == pytest.approx(np.mean(calls))
-
-    calls.clear()
-    suite_predictions, suite_diag = run_proxy_model_suite(
-        frame,
-        tensor_path=tmp_path / "unused_sequence_tensor.npz",
-        model_ids=["bigru_sequence_5seed"],
-        mamba_seeds=(31, 37),
-    )
-    assert calls == [31, 37]
-    assert "forecast_bigru_sequence_5seed" in suite_predictions
-    assert (
-        suite_diag.loc[suite_diag["model_id"].eq("bigru_sequence_5seed"), "seed_list"].iloc[0]
-        == "31,37"
-    )
+    for removed_model_id in ("bigru_sequence_5seed", "mamba_ssm_sequence_5seed"):
+        assert removed_model_id not in active_ids
+        assert removed_model_id not in MODEL_REGISTRY
+        with pytest.raises(KeyError):
+            prediction_column_for_model(removed_model_id)
+        with pytest.raises(ValueError, match="unknown model_id"):
+            run_proxy_model_suite(
+                frame,
+                tensor_path=tmp_path / "unused_sequence_tensor.npz",
+                model_ids=[removed_model_id],
+            )
 
 
 def test_feature_matrix_benchmarks_models_and_metrics() -> None:
@@ -7329,6 +7484,146 @@ def test_feature_matrix_benchmarks_models_and_metrics() -> None:
             forecast_col="forecast",
             threshold_multiplier=0,
         )
+
+
+def test_validation_only_strategy_policy_filters_quote_quality_and_top_k() -> None:
+    validation_edges = [0.020, 0.019, 0.018, 0.017, 0.016, 0.015, 0.014]
+    validation_gross = [101.0, 91.0, 81.0, 71.0, 61.0, -199.0, -199.0]
+    filtered_edges = [0.030, 0.029, 0.028]
+    filtered_gross = [5001.0, 5001.0, 5001.0]
+    test_edges = [0.020, 0.019, 0.030, 0.029, 0.028]
+    test_gross = [31.0, 21.0, 5001.0, 5001.0, 5001.0]
+    frame = pd.DataFrame(
+        {
+            "split": ["validation"] * 10 + ["test"] * 5,
+            "forecast": [
+                *(0.05 + np.asarray(validation_edges)),
+                *(0.05 + np.asarray(filtered_edges)),
+                *(0.05 + np.asarray(test_edges)),
+            ],
+            "ivar_event": [0.05] * 15,
+            "gross_proxy_pnl_usd": [*validation_gross, *filtered_gross, *test_gross],
+            "entry_premium_usd": [100.0] * 15,
+            "estimated_transaction_cost_usd": [1.0] * 15,
+            "liquidity_bucket": ["high"] * 15,
+            "is_main_dte_5_14": [True] * 15,
+            "execution_confidence_band": [
+                *["high"] * 7,
+                "low",
+                "high",
+                "high",
+                "high",
+                "medium",
+                "low",
+                "high",
+                "high",
+            ],
+            "execution_confidence_score": [
+                *[0.95] * 7,
+                0.25,
+                0.95,
+                0.95,
+                0.95,
+                0.70,
+                0.25,
+                0.95,
+                0.95,
+            ],
+            "median_spread_over_mid": [
+                *[0.05] * 8,
+                0.30,
+                0.05,
+                0.05,
+                0.05,
+                0.05,
+                0.30,
+                0.05,
+            ],
+            "max_quote_age_seconds": [
+                *[10.0] * 9,
+                70.0,
+                10.0,
+                10.0,
+                10.0,
+                10.0,
+                70.0,
+            ],
+        }
+    )
+
+    policy, search = tune_strategy_policy_validation_only(frame, forecast_col="forecast")
+
+    assert not search.empty
+    assert int(search["selected"].sum()) == 1
+    assert policy.top_k == 5
+    assert "low" not in policy.allowed_execution_confidence_bands
+    assert policy.max_median_spread_over_mid is not None
+    assert policy.max_quote_age_seconds == pytest.approx(60.0)
+    assert policy.quote_filter_status.startswith("required_")
+
+    base = build_proxy_strategy_frame(
+        frame,
+        forecast_col="forecast",
+        min_edge_var=policy.min_edge_var,
+        threshold_multiplier=policy.threshold_multiplier,
+    )
+    tuned = apply_strategy_policy(base, policy)
+    validation_trades = tuned.loc[
+        tuned["split"].eq("validation") & tuned["should_trade"].astype(bool)
+    ]
+    test_trades = tuned.loc[tuned["split"].eq("test") & tuned["should_trade"].astype(bool)]
+
+    assert len(validation_trades) == 5
+    assert validation_trades["net_proxy_pnl_usd"].sum() == pytest.approx(400.0)
+    assert len(test_trades) == 2
+    assert set(test_trades["execution_confidence_band"]) <= {"high", "medium"}
+    assert test_trades["median_spread_over_mid"].le(0.25).all()
+    assert test_trades["max_quote_age_seconds"].le(60.0).all()
+
+
+def test_strategy_policy_top_k_can_use_separate_selection_score() -> None:
+    frame = pd.DataFrame(
+        {
+            "event_id": ["V_forecast", "V_rank", "T_forecast", "T_rank"],
+            "split": ["validation", "validation", "test", "test"],
+            "forecast": [0.08, 0.07, 0.08, 0.07],
+            "ivar_event": [0.05, 0.05, 0.05, 0.05],
+            "rank_signal": [0.10, 0.90, 0.20, 0.80],
+            "gross_proxy_pnl_usd": [-10.0, 100.0, -10.0, 100.0],
+            "entry_premium_usd": [100.0, 100.0, 100.0, 100.0],
+            "estimated_transaction_cost_usd": [1.0, 1.0, 1.0, 1.0],
+        }
+    )
+
+    policy, search = tune_strategy_policy_validation_only(
+        frame,
+        forecast_col="forecast",
+        selection_score_col="rank_signal",
+        threshold_multipliers=(0.5,),
+        min_edge_vars=(0.0,),
+        top_k_values=(1,),
+        min_validation_trades=1,
+        drawdown_penalty=0.0,
+    )
+    base = build_proxy_strategy_frame(
+        frame,
+        forecast_col="forecast",
+        min_edge_var=policy.min_edge_var,
+        threshold_multiplier=policy.threshold_multiplier,
+    )
+    tuned = apply_strategy_policy(base, policy)
+
+    assert not search.empty
+    assert policy.selection_score_col == "rank_signal"
+    assert tuned["strategy_policy_effective_selection_score_col"].eq("rank_signal").all()
+    assert tuned.loc[
+        tuned["split"].eq("validation") & tuned["should_trade"], "event_id"
+    ].tolist() == ["V_rank"]
+    assert tuned.loc[tuned["split"].eq("test") & tuned["should_trade"], "event_id"].tolist() == [
+        "T_rank"
+    ]
+    selected_test = tuned.loc[tuned["event_id"].eq("T_rank")].iloc[0]
+    assert selected_test["expected_strategy_edge_usd"] == pytest.approx(40.0)
 
 
 def test_feature_schema_allowlist_blocks_raw_ids_and_outcomes() -> None:
@@ -7644,7 +7939,7 @@ def test_event_target_decomposition_amc_bmo_and_open_audit() -> None:
         target_label_column("bad_target", out)
 
 
-def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sequence_matrix_and_torch_sequence_models() -> None:
     rows = pd.DataFrame(
         {
             "event_id": ["E1", "E1", "E2", "E2"],
@@ -7663,7 +7958,6 @@ def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPat
     ft = FTTransformerRegressor(n_features=3)
     ft_dropout = FTTransformerRegressor(n_features=3, dropout=0.2)
     attention = AttentionPoolingSequenceEncoder(n_features=3, hidden_size=4, n_heads=2)
-    bigru = BiGRUSequenceEncoder(n_features=3, hidden_size=4, n_layers=2, dropout=0.0)
     cnn = DilatedCNNSequenceEncoder(
         n_features=3,
         channels=(4, 4),
@@ -7675,39 +7969,11 @@ def test_sequence_matrix_and_torch_sequence_models(monkeypatch: pytest.MonkeyPat
     assert attention(tensor, mask).shape == (2,)
     assert attention.last_attention_weights is not None
     assert attention.last_attention_weights.shape == (2, 1, 2)
-    assert bigru(tensor, mask).shape == (2,)
     assert cnn(tensor, mask).shape == (2,)
     with pytest.raises(ValueError, match="hidden_size must be divisible"):
         AttentionPoolingSequenceEncoder(n_features=3, hidden_size=5, n_heads=2)
     with pytest.raises(ValueError, match="channels and dilations"):
         DilatedCNNSequenceEncoder(n_features=3, channels=(4,), dilations=(1, 2))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="CUDA-enabled"):
-        MambaSSMSequenceEncoder(n_features=3)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-
-    class FakeMamba(torch.nn.Module):
-        def __init__(self, *, d_model: int):
-            super().__init__()
-            self.projection = torch.nn.Linear(d_model, d_model)
-
-        def forward(self, values: torch.Tensor) -> torch.Tensor:
-            return cast(torch.Tensor, self.projection(values))
-
-    class FakeMambaModule:
-        Mamba = FakeMamba
-
-    monkeypatch.setattr(
-        "earnings_event_vol.models.importlib.import_module",
-        lambda _name: FakeMambaModule,
-    )
-    official_wrapper = MambaSSMSequenceEncoder(
-        n_features=3,
-        hidden_size=4,
-        n_layers=1,
-        dropout=0.0,
-    )
-    assert official_wrapper(tensor, mask).shape == (2,)
 
 
 def test_research_metrics_cover_empty_and_breakdown_paths() -> None:
@@ -7964,7 +8230,10 @@ def test_completion_gap_audit_separates_quote_progress_from_paper_grade_gaps(
             {
                 "status": "ran",
                 "ok": False,
-                "target_window": {"start": "2013-01-01", "end": "2025-12-31"},
+                "target_window": {
+                    "start": TARGET_WINDOW_START.isoformat(),
+                    "end": TARGET_WINDOW_END.isoformat(),
+                },
                 "incomplete_required_datasets": 2,
                 "incomplete_required_dataset_ids": [
                     "bronze_options_day_aggs",
@@ -7994,8 +8263,6 @@ def test_completion_gap_audit_separates_quote_progress_from_paper_grade_gaps(
         }
         for model_id in [
             "ridge_flat_aggregates_sequence",
-            "bigru_sequence_5seed",
-            "mamba_ssm_sequence_5seed",
             "attention_pooling_sequence",
             "dilated_cnn_sequence",
             "mask_only_sequence",
@@ -8020,7 +8287,7 @@ def test_completion_gap_audit_separates_quote_progress_from_paper_grade_gaps(
     assert statuses["full_historical_lake_quality_audit"] == "complete"
     assert statuses["quote_ivar_populated_but_not_surface"] == "diagnostic_only"
     assert statuses["sequence_headline_gate"] == "diagnostic_only"
-    assert statuses["historical_2013_2025_data_coverage"] == "incomplete"
+    assert statuses["target_window_data_coverage"] == "incomplete"
     assert statuses["paper_grade_bid_ask_nbbo_execution"] == "incomplete"
     summary = json.loads(Path(outputs["completion_gap_audit_summary"]).read_text())
     assert summary["paper_grade_ready"] is False
@@ -8096,7 +8363,7 @@ def test_robustness_summary_table_covers_dte_liquidity_and_vix_regime(tmp_path: 
     assert dte_ivar["positive_metric_rows"] == 1
 
 
-def test_report_uses_sequence_gate_when_mamba_is_unavailable(tmp_path: Path) -> None:
+def test_report_uses_sequence_gate_for_lightweight_sequence_suite(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
     reports = tmp_path / "reports"
     artifacts.mkdir()
@@ -8113,30 +8380,30 @@ def test_report_uses_sequence_gate_when_mamba_is_unavailable(tmp_path: Path) -> 
     )
     pd.DataFrame(
         {
-            "model_id": ["mamba_ssm_sequence_5seed"],
+            "model_id": ["attention_pooling_sequence"],
             "target_id": ["jump_c2o"],
-            "status": ["skipped_dependency_unavailable"],
+            "status": ["trained"],
             "feature_count": [243],
         }
     ).to_csv(artifacts / "model_fit_diagnostics.csv", index=False)
     pd.DataFrame(
         {
             "feature_schema_version": [FEATURE_SCHEMA_V2_SEC_XBRL] * 4,
-            "tuning_profile": ["tuned_phase1"] * 4,
+            "tuning_profile": ["tuned_phase1_day_c2c_rank_log_rvar"] * 4,
             "target_id": ["jump_c2o"] * 4,
             "model_id": [
                 "ridge_flat_aggregates_sequence",
-                "bigru_sequence_5seed",
-                "mamba_ssm_sequence_5seed",
+                "attention_pooling_sequence",
+                "dilated_cnn_sequence",
                 "mask_only_sequence",
             ],
-            "coverage": [12, 10, 0, 10],
-            "drop_rate": [0.1, 0.2, 1.0, 0.2],
-            "auc_lift": [0.03, -0.01, np.nan, 0.0],
-            "auc_lift_ci_low": [-0.02, -0.04, np.nan, 0.0],
-            "auc_lift_ci_high": [0.08, 0.02, np.nan, 0.0],
-            "mask_only_lift": [0.03, -0.01, np.nan, 0.0],
-            "time_shuffle_lift": [0.02, -0.02, np.nan, 0.0],
+            "coverage": [12, 10, 10, 10],
+            "drop_rate": [0.1, 0.2, 0.2, 0.2],
+            "auc_lift": [0.03, -0.01, 0.01, 0.0],
+            "auc_lift_ci_low": [-0.02, -0.04, -0.03, 0.0],
+            "auc_lift_ci_high": [0.08, 0.02, 0.04, 0.0],
+            "mask_only_lift": [0.03, -0.01, 0.01, 0.0],
+            "time_shuffle_lift": [0.02, -0.02, 0.0, 0.0],
             "headline_eligible": [False, False, False, False],
             "claim_scope": ["diagnostic"] * 4,
             "fail_reason": ["gate_not_passed_or_control_missing"] * 4,
@@ -8152,9 +8419,9 @@ def test_report_uses_sequence_gate_when_mamba_is_unavailable(tmp_path: Path) -> 
     text = report.read_text(encoding="utf-8")
     assert "Sequence diagnostics were unavailable" not in text
     assert "Current sequence diagnostics are populated" in text
-    assert "skipped_dependency_unavailable" in text
-    assert "official Mamba runtime is available" not in text
-    assert "sequence rows pass common-row/control/bootstrap/economics gates" in text
+    assert "mamba" not in text.lower()
+    assert "sequence diagnostics as exploratory" in text
+    assert "common-row/control/bootstrap/economics gates" in text
 
 
 def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) -> None:
@@ -8321,7 +8588,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
             "market_implied_event_variance",
             "linear_elastic_net_tuned",
             "ridge_flat_aggregates_sequence",
-            "mamba_ssm_sequence_5seed",
+            "attention_pooling_sequence",
         ],
     )
     assert (
@@ -8336,12 +8603,10 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         ].iloc[0]
         == "trained"
     )
-    assert diagnostics.loc[diagnostics["model_id"].eq("mamba_ssm_sequence_5seed"), "status"].iloc[
-        0
-    ] in {
-        "trained",
-        "skipped_dependency_unavailable",
-    }
+    assert (
+        diagnostics.loc[diagnostics["model_id"].eq("attention_pooling_sequence"), "status"].iloc[0]
+        == "trained"
+    )
     ridge_forecast = predictions["forecast_ridge_flat_aggregates_sequence"].dropna()
     assert ridge_forecast.gt(0).all()
     assert ridge_forecast.std() > 0
@@ -8390,11 +8655,11 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     assert Path(diagnostics_paths["common_row_universe"]).exists()
     common_rows = pd.read_csv(diagnostics_paths["common_row_universe"])
     assert common_rows["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
-    assert common_rows["tuning_profile"].eq("tuned_phase1").all()
+    assert common_rows["tuning_profile"].eq("tuned_phase1_day_c2c_rank_log_rvar").all()
     retired_manifest = write_retired_model_manifest(tmp_path / "manifest")
     retired_payload = json.loads(retired_manifest.read_text())
     assert "daily_mamba_20step" in retired_payload["retired_model_ids"]
-    assert retired_payload["reason"] == "in-repo gated-RNN, not official Mamba"
+    assert retired_payload["reason"] == "legacy in-repo Mamba-style gated RNN models are retired"
     metrics_dir = tmp_path / "metrics"
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").parent.mkdir()
     (metrics_dir / "edge_deciles_mamba_sequence_encoder.csv").write_text("stale\n")
@@ -8419,6 +8684,8 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
         "forecast_metrics",
         "ranking_metrics",
         "strategy_metrics",
+        "strategy_policy_search",
+        "strategy_selected_policies",
         "cost_sensitivity",
         "robustness_summary",
         "qlike_sanity",
@@ -8426,7 +8693,14 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     ):
         artifact = pd.read_csv(metric_paths[artifact_name])
         assert artifact["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
-        assert artifact["tuning_profile"].eq("tuned_phase1").all()
+        assert artifact["tuning_profile"].eq("tuned_phase1_day_c2c_rank_log_rvar").all()
+    selected_policies = pd.read_csv(metric_paths["strategy_selected_policies"])
+    assert not selected_policies.empty
+    assert selected_policies["selected"].astype(bool).all()
+    policy_counts = selected_policies.groupby(
+        ["target_id", "model_id", "strategy_proxy_kind"], dropna=False
+    )["selected"].sum()
+    assert policy_counts.eq(1).all()
     assert {"day_c2c", "jump_c2o", "reaction_o2c"}.issubset(set(strategy["target_id"]))
     c2o_strategy = strategy.loc[strategy["target_id"].eq("jump_c2o")]
     assert {
@@ -8446,7 +8720,7 @@ def test_proxy_research_split_tensor_models_and_sanity_tables(tmp_path: Path) ->
     )
     if not o2c_trades.empty:
         assert o2c_trades["feature_schema_version"].eq(FEATURE_SCHEMA_V2_SEC_XBRL).all()
-        assert o2c_trades["tuning_profile"].eq("tuned_phase1").all()
+        assert o2c_trades["tuning_profile"].eq("tuned_phase1_day_c2c_rank_log_rvar").all()
         expected_anchor = events[["event_id", "open_option_vwap_5_15_anchor_usd"]]
         anchored = o2c_trades.merge(expected_anchor, on="event_id", how="left")
         assert np.allclose(
@@ -8873,6 +9147,15 @@ def test_research_model_suite_and_error_paths() -> None:
     regressor_predictions = regressor.predict(feature_frame)
     assert regressor_predictions.shape == (len(feature_frame),)
     assert np.isfinite(regressor_predictions).all()
+    ridge = RidgeRegressor(alpha=0.01)
+    ridge.fit(feature_frame, target_col="rvar_event", feature_columns=["feature_a", "feature_b"])
+    ridge_predictions = ridge.predict(feature_frame)
+    assert ridge_predictions.shape == (len(feature_frame),)
+    assert np.isfinite(ridge_predictions).all()
+    with pytest.raises(ValueError, match="alpha"):
+        RidgeRegressor(alpha=-0.1)
+    with pytest.raises(ValueError, match="model is not fit"):
+        RidgeRegressor().predict(feature_frame)
     with pytest.raises(ValueError, match="no finite target"):
         regressor.fit(
             feature_frame.assign(rvar_event=np.nan),
@@ -8958,8 +9241,25 @@ def test_research_model_suite_and_error_paths() -> None:
     assert same_time_predictions["forecast_goyal_saretto_rv_iv_spread"].iloc[0] == pytest.approx(
         0.05
     )
+    assert bool(same_time_predictions["goyal_saretto_fallback_spread_used"].iloc[0]) is True
+    assert same_time_predictions["goyal_saretto_signed_rv_iv_spread"].iloc[2] == pytest.approx(
+        0.095
+    )
+    negative_spread = add_benchmark_predictions(
+        pd.DataFrame(
+            {
+                "event_id": ["N1", "N2"],
+                "ticker": ["NEG", "NEG"],
+                "event_date": pd.to_datetime(["2025-01-01", "2025-02-01"]),
+                "rvar_event": [0.02, 0.04],
+                "ivar_event": [0.08, 0.03],
+            }
+        )
+    )
+    assert negative_spread["goyal_saretto_signed_rv_iv_spread"].iloc[1] == pytest.approx(-0.06)
+    assert negative_spread["forecast_goyal_saretto_rv_iv_spread"].iloc[1] == pytest.approx(0.0)
     with pytest.raises(ValueError, match="sequence must have shape"):
-        BiGRUSequenceEncoder(n_features=2)(torch.zeros(2, 2))
+        DilatedCNNSequenceEncoder(n_features=2)(torch.zeros(2, 2))
 
 
 def test_feature_matrix_edge_cases_and_sequence_eligibility() -> None:
@@ -9522,12 +9822,6 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert (models_out / "strategy_metrics.csv").exists()
 
 
-def test_cli_comma_int_parser_validates_mamba_seed_lists() -> None:
-    assert _parse_comma_ints("17, 31,,47") == [17, 31, 47]
-    with pytest.raises(ValueError, match="expected at least one integer seed"):
-        _parse_comma_ints(" , ")
-
-
 def test_cli_private_command_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     csv_path = tmp_path / "table.csv"
     cli_module._write_table(csv_path, pd.DataFrame({"x": [1]}))
@@ -9593,6 +9887,8 @@ def test_cli_private_command_branches(tmp_path: Path, monkeypatch: pytest.Monkey
     def fake_research_package(*args: object, **kwargs: object) -> dict[str, object]:
         _ = args
         assert kwargs["feature_schema_version"] == FEATURE_SCHEMA_V2_SEC_XBRL
+        assert "mamba_backend" not in kwargs
+        assert "mamba_seeds" not in kwargs
         return {"ok": False, "stage": kwargs["stage"]}
 
     monkeypatch.setattr(cli_module, "run_proxy_research_package", fake_research_package)
@@ -9602,10 +9898,8 @@ def test_cli_private_command_branches(tmp_path: Path, monkeypatch: pytest.Monkey
         split_date=None,
         allow_high_sequence_risk=True,
         sequence_suite="all",
-        mamba_backend="mamba_ssm",
-        mamba_seeds="17,42",
         bootstrap_iter=10,
-        tuning_profile="tuned_phase1",
+        tuning_profile="tuned_phase1_day_c2c_rank_log_rvar",
         tuning_seed=17,
         feature_schema_version=FEATURE_SCHEMA_V2_SEC_XBRL,
         reuse_tuning_params=False,

@@ -62,9 +62,9 @@ Data route and labeling:
   day-aggregate close is not a strategy-exit fallback. Intrinsic fallback is
   flagged when the exit-preclose trade-aggregate mark is missing/unusable or
   when the option expires on the exit date.
-- The current default proxy range is the observed entitlement range
-  `2022-12-01` to `2025-12-31`; 2013-2025 remains the target paper range, not
-  the current completed result.
+- The current old proxy/modeling snapshot is `2022-12-01` to `2025-12-31`.
+  The target rebuild/paper window is `2013-01-01` to `2026-06-05`, not the
+  current completed result.
 - Universe construction filters ETF/index/non-single-name symbols before
   selecting the monthly top 50.
 - SEC EDGAR submissions plus SEC primary filing documents are the primary

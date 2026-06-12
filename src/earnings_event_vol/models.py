@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import importlib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -42,6 +41,7 @@ DEFAULT_FEATURE_EXCLUDE_PATTERNS = (
     "realized",
     "post_event",
     "future",
+    "goyal_saretto_",
 )
 
 
@@ -112,9 +112,12 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="linear_elastic_net_tuned",
         role="model_tuned",
         implemented=True,
-        justification="Sklearn ElasticNetCV tuned on train/validation in tuned_phase1.",
+        justification=(
+            "Sklearn ElasticNetCV tuned on train/validation in the canonical log-RVAR profile."
+        ),
         risk=(
-            "Available through the research tuned_phase1 protocol, not the legacy train-models CLI."
+            "Available through the research tuned_phase1_day_c2c_rank_log_rvar protocol, "
+            "not the legacy train-models CLI."
         ),
     ),
     "lightgbm_tuned": ModelSpec(
@@ -138,12 +141,28 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Validation-tuned FT-Transformer architecture for mixed event features.",
         risk="May overfit small event panels despite validation-only selection.",
     ),
-    "lightgbm_xgboost_mean_ensemble": ModelSpec(
-        model_id="lightgbm_xgboost_mean_ensemble",
+    "lightgbm_xgboost_forecast_ensemble": ModelSpec(
+        model_id="lightgbm_xgboost_forecast_ensemble",
         role="ensemble",
         implemented=True,
-        justification="Equal-weight tuned LightGBM/XGBoost rank-average ensemble.",
-        risk="Should not be tuned on the locked test sample.",
+        justification=(
+            "Equal-weight average of calibrated LightGBM/XGBoost variance forecasts, "
+            "paired with a split-level base-edge rank score in the research protocol."
+        ),
+        risk=(
+            "Forecast-level metrics use the raw average; ranking and top-k ordering use "
+            "the separate research score column."
+        ),
+    ),
+    "lightgbm_xgboost_rank_ensemble": ModelSpec(
+        model_id="lightgbm_xgboost_rank_ensemble",
+        role="ranking_diagnostic",
+        implemented=False,
+        justification=(
+            "Reserved for a rank-only LightGBM/XGBoost score that must be evaluated only "
+            "with ranking diagnostics, not premium-space edge."
+        ),
+        risk="Needs a separate ranking-only artifact path before activation.",
     ),
     "ridge_flat_aggregates_sequence": ModelSpec(
         model_id="ridge_flat_aggregates_sequence",
@@ -162,26 +181,12 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         justification="Learned-query attention pooling over pre-entry sequence tokens.",
         risk="Diagnostic; may overfit on small sequence samples.",
     ),
-    "bigru_sequence_5seed": ModelSpec(
-        model_id="bigru_sequence_5seed",
-        role="sequence_baseline_tuned",
-        implemented=True,
-        justification="Five-seed BiGRU ensemble diagnostic for tuned_phase1.",
-        risk="Diagnostic only unless it clears mask-only/time-shuffle/common-row gates.",
-    ),
     "dilated_cnn_sequence": ModelSpec(
         model_id="dilated_cnn_sequence",
         role="sequence_baseline",
         implemented=True,
         justification="Non-causal dilated 1D CNN baseline for short pre-entry paths.",
         risk="Diagnostic; non-causal only because all tokens are pre-entry.",
-    ),
-    "mamba_ssm_sequence_5seed": ModelSpec(
-        model_id="mamba_ssm_sequence_5seed",
-        role="sequence_challenger_tuned",
-        implemented=True,
-        justification="Five-seed official mamba-ssm ensemble diagnostic for tuned_phase1.",
-        risk="Requires Linux/NVIDIA/CUDA; diagnostic only unless it clears sequence controls.",
     ),
     "mask_only_sequence": ModelSpec(
         model_id="mask_only_sequence",
@@ -288,15 +293,22 @@ def add_benchmark_predictions(frame: pd.DataFrame) -> pd.DataFrame:
     market = pd.to_numeric(out[MARKET_BASELINE_COL], errors="coerce")
     rvar_last4 = _prior_rolling_mean(out, TARGET_COL).clip(lower=0)
     ivar_last4 = _prior_rolling_mean(out, MARKET_BASELINE_COL).clip(lower=0)
-    trailing_spread = _prior_rolling_mean(
-        out.assign(_rv_iv_spread=pd.to_numeric(out[TARGET_COL], errors="coerce") - market),
+    spread_frame = out.assign(
+        _rv_iv_spread=pd.to_numeric(out[TARGET_COL], errors="coerce") - market
+    )
+    trailing_spread_raw = _prior_rolling_mean(
+        spread_frame,
         "_rv_iv_spread",
         fallback_col=None,
-        fallback_value=0.0,
-    ).fillna(0.0)
+        fallback_value=None,
+    )
+    trailing_spread = trailing_spread_raw.fillna(0.0)
+    fallback_used = trailing_spread_raw.isna()
     out["forecast_market_implied_event_variance"] = market
     out["forecast_last_four_rvar"] = rvar_last4
     out["forecast_last_four_ivar"] = ivar_last4
+    out["goyal_saretto_signed_rv_iv_spread"] = trailing_spread
+    out["goyal_saretto_fallback_spread_used"] = fallback_used
     out["forecast_goyal_saretto_rv_iv_spread"] = (market + trailing_spread).clip(lower=0)
     out["patell_wolfson_prior_rvar_mean"] = rvar_last4
     out["patell_wolfson_prior_ivar_mean"] = ivar_last4
@@ -328,7 +340,7 @@ def default_feature_columns(
 
 
 class LinearElasticNetRegressor:
-    def __init__(self, *, alpha: float = 0.01, l1_ratio: float = 0.15, max_iter: int = 500):
+    def __init__(self, *, alpha: float = 0.01, l1_ratio: float = 0.15, max_iter: int = 10000):
         if alpha < 0:
             raise ValueError("alpha must be nonnegative")
         if not 0 <= l1_ratio <= 1:
@@ -399,6 +411,68 @@ class LinearElasticNetRegressor:
         )
 
 
+class RidgeRegressor:
+    def __init__(self, *, alpha: float = 0.01):
+        if alpha < 0:
+            raise ValueError("alpha must be nonnegative")
+        self.alpha = alpha
+        self.feature_columns: list[str] = []
+        self.mean_: np.ndarray | None = None
+        self.scale_: np.ndarray | None = None
+        self.coef_: np.ndarray | None = None
+        self.intercept_: float = 0.0
+
+    def _matrix(self, frame: pd.DataFrame) -> np.ndarray:
+        if not self.feature_columns:
+            raise ValueError("model is not fit")
+        x = (
+            frame[self.feature_columns]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=float)
+        )
+        mean = self.mean_
+        scale = self.scale_
+        if mean is None or scale is None:
+            raise ValueError("model is not fit")
+        return np.asarray((x - mean) / scale, dtype=float)
+
+    def fit(self, frame: pd.DataFrame, *, target_col: str, feature_columns: Sequence[str]) -> None:
+        self.feature_columns = list(feature_columns)
+        x_raw = (
+            frame[self.feature_columns]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=float)
+        )
+        y = pd.to_numeric(frame[target_col], errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(y)
+        if not bool(valid.any()):
+            raise ValueError("no finite target rows for ridge fit")
+        x_raw = x_raw[valid]
+        y = y[valid]
+        self.mean_ = x_raw.mean(axis=0)
+        self.scale_ = np.where(x_raw.std(axis=0) <= 1e-12, 1.0, x_raw.std(axis=0))
+        x = (x_raw - self.mean_) / self.scale_
+        self.intercept_ = float(y.mean())
+        y_centered = y - self.intercept_
+        gram = x.T @ x / max(len(y_centered), 1)
+        rhs = x.T @ y_centered / max(len(y_centered), 1)
+        penalty = self.alpha * np.eye(gram.shape[0], dtype=float)
+        try:
+            self.coef_ = np.linalg.solve(gram + penalty, rhs)
+        except np.linalg.LinAlgError:
+            self.coef_ = np.linalg.lstsq(gram + penalty, rhs, rcond=None)[0]
+
+    def predict(self, frame: pd.DataFrame) -> np.ndarray:
+        coef = self.coef_
+        if coef is None:
+            raise ValueError("model is not fit")
+        return np.asarray(
+            np.maximum(self.intercept_ + self._matrix(frame) @ coef, 0.0), dtype=float
+        )
+
+
 def temporal_train_test_split(
     frame: pd.DataFrame,
     *,
@@ -429,8 +503,10 @@ class FTTransformerRegressor(nn.Module):
         n_heads: int = 4,
         n_layers: int = 2,
         dropout: float = 0.0,
+        positive_output: bool = True,
     ):
         super().__init__()
+        self.positive_output = positive_output
         self.feature_projection = nn.Linear(1, d_token)
         self.feature_embedding = nn.Parameter(torch.zeros(n_features, d_token))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_token))
@@ -443,12 +519,14 @@ class FTTransformerRegressor(nn.Module):
             activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.head = nn.Sequential(
+        head_layers: list[nn.Module] = [
             nn.LayerNorm(d_token),
             nn.Dropout(dropout),
             nn.Linear(d_token, 1),
-            nn.Softplus(),
-        )
+        ]
+        if positive_output:
+            head_layers.append(nn.Softplus())
+        self.head = nn.Sequential(*head_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.feature_projection(x.unsqueeze(-1)) + self.feature_embedding.unsqueeze(0)
@@ -488,6 +566,7 @@ class AttentionPoolingSequenceEncoder(nn.Module):
         n_features: int,
         hidden_size: int = 32,
         n_heads: int = 4,
+        dropout: float = 0.0,
     ):
         super().__init__()
         if hidden_size % n_heads != 0:
@@ -495,7 +574,11 @@ class AttentionPoolingSequenceEncoder(nn.Module):
         self.input_projection = nn.Linear(n_features, hidden_size)
         self.query = nn.Parameter(torch.zeros(1, 1, hidden_size))
         self.attention = nn.MultiheadAttention(hidden_size, n_heads, batch_first=True)
-        self.head = nn.Sequential(nn.LayerNorm(hidden_size), nn.Linear(hidden_size, 1))
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
         self.last_attention_weights: torch.Tensor | None = None
 
     def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -513,40 +596,6 @@ class AttentionPoolingSequenceEncoder(nn.Module):
         )
         self.last_attention_weights = weights.detach()
         return cast(torch.Tensor, self.head(pooled[:, 0, :]).squeeze(-1))
-
-
-class BiGRUSequenceEncoder(nn.Module):
-    """LayerNorm bidirectional GRU for short pre-entry option-surface paths."""
-
-    def __init__(
-        self,
-        *,
-        n_features: int,
-        hidden_size: int = 32,
-        n_layers: int = 1,
-        dropout: float = 0.15,
-    ):
-        super().__init__()
-        self.input_norm = nn.LayerNorm(n_features)
-        self.gru = nn.GRU(
-            input_size=n_features,
-            hidden_size=hidden_size,
-            num_layers=n_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if n_layers > 1 else 0.0,
-        )
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * 4),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, 1),
-        )
-
-    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        _validate_sequence(sequence)
-        encoded, _ = self.gru(self.input_norm(sequence))
-        pooled = torch.cat([_masked_mean(encoded, mask), _masked_max(encoded, mask)], dim=1)
-        return cast(torch.Tensor, self.head(pooled).squeeze(-1))
 
 
 class DilatedCNNSequenceEncoder(nn.Module):
@@ -590,60 +639,6 @@ class DilatedCNNSequenceEncoder(nn.Module):
         return cast(torch.Tensor, self.head(_masked_mean(encoded, mask)).squeeze(-1))
 
 
-class MambaSSMSequenceEncoder(nn.Module):
-    """Bidirectional wrapper around official `mamba_ssm.Mamba`.
-
-    This is a non-causal encoder over a completed pre-entry path. It is not a causal
-    event-after-entry predictor and therefore does not use post-entry information.
-    """
-
-    def __init__(
-        self,
-        *,
-        n_features: int,
-        hidden_size: int = 32,
-        n_layers: int = 1,
-        dropout: float = 0.15,
-    ):
-        super().__init__()
-        if not torch.cuda.is_available():
-            raise RuntimeError("official mamba-ssm encoder requires CUDA-enabled torch")
-        try:
-            module = importlib.import_module("mamba_ssm")
-            mamba_cls = cast(Any, module.Mamba)
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError("mamba_ssm package with Mamba class is required") from exc
-        self.input_projection = nn.Linear(n_features, hidden_size)
-        self.forward_layers = nn.ModuleList(
-            [mamba_cls(d_model=hidden_size) for _ in range(n_layers)]
-        )
-        self.reverse_layers = nn.ModuleList(
-            [mamba_cls(d_model=hidden_size) for _ in range(n_layers)]
-        )
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * 4),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size * 4, 1),
-        )
-
-    def _encode(self, tokens: torch.Tensor, layers: nn.ModuleList) -> torch.Tensor:
-        out = tokens
-        for layer in layers:
-            out = cast(torch.Tensor, layer(out))
-        return out
-
-    def forward(self, sequence: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        _validate_sequence(sequence)
-        tokens = self.input_projection(sequence)
-        forward = self._encode(tokens, self.forward_layers)
-        reverse = torch.flip(
-            self._encode(torch.flip(tokens, dims=[1]), self.reverse_layers), dims=[1]
-        )
-        encoded = torch.cat([forward, reverse], dim=2)
-        pooled = torch.cat([_masked_mean(encoded, mask), _masked_max(encoded, mask)], dim=1)
-        return cast(torch.Tensor, self.head(pooled).squeeze(-1))
-
-
 def fit_model(
     model_id: str,
     frame: pd.DataFrame,
@@ -666,12 +661,10 @@ def prediction_column_for_model(model_id: str) -> str:
         "lightgbm_tuned": "forecast_lightgbm_tuned",
         "xgboost_tuned": "forecast_xgboost_tuned",
         "ft_transformer": "forecast_ft_transformer",
-        "lightgbm_xgboost_mean_ensemble": "forecast_lightgbm_xgboost_mean_ensemble",
+        "lightgbm_xgboost_forecast_ensemble": ("forecast_lightgbm_xgboost_forecast_ensemble"),
         "ridge_flat_aggregates_sequence": "forecast_ridge_flat_aggregates_sequence",
         "attention_pooling_sequence": "forecast_attention_pooling_sequence",
-        "bigru_sequence_5seed": "forecast_bigru_sequence_5seed",
         "dilated_cnn_sequence": "forecast_dilated_cnn_sequence",
-        "mamba_ssm_sequence_5seed": "forecast_mamba_ssm_sequence_5seed",
         "mask_only_sequence": "forecast_mask_only_sequence",
         "time_shuffle_sequence": "forecast_time_shuffle_sequence",
     }

@@ -17,6 +17,8 @@ from earnings_event_vol.config import ProjectConfig, load_project_config
 from earnings_event_vol.data_audit import audit_data_fields
 from earnings_event_vol.data_pipeline import (
     DEFAULT_STATIC_TICKERS,
+    TARGET_WINDOW_END,
+    TARGET_WINDOW_START,
     parse_text_list,
     run_data_pipeline,
 )
@@ -54,7 +56,7 @@ from earnings_event_vol.quote_execution import (
     extract_quote_execution_panel,
 )
 from earnings_event_vol.research import (
-    TUNING_SEQUENCE_ENSEMBLE_SEEDS,
+    DEFAULT_TUNING_PROFILE,
     remove_model_level_csv_artifacts,
     run_proxy_research_package,
 )
@@ -650,8 +652,6 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
         split_date=args.split_date,
         allow_high_sequence_risk=args.allow_high_sequence_risk,
         sequence_suite=args.sequence_suite,
-        mamba_backend=args.mamba_backend,
-        mamba_seeds=_parse_comma_ints(args.mamba_seeds),
         bootstrap_iter=args.bootstrap_iter,
         tuning_profile=args.tuning_profile,
         tuning_seed=args.tuning_seed,
@@ -660,18 +660,6 @@ def _research(args: argparse.Namespace, config: ProjectConfig) -> int:
     )
     _print_json(payload)
     return 0 if bool(payload["ok"]) else 1
-
-
-def _parse_comma_ints(raw: str) -> list[int]:
-    values: list[int] = []
-    for piece in str(raw).split(","):
-        value = piece.strip()
-        if not value:
-            continue
-        values.append(int(value))
-    if not values:
-        raise ValueError("expected at least one integer seed")
-    return values
 
 
 def _leakage_audit(args: argparse.Namespace) -> int:
@@ -910,8 +898,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_STATIC_TICKERS),
         help="Ticker list; accepts repeated, comma-separated, or space-separated values.",
     )
-    data.add_argument("--start", default="2013-01-01")
-    data.add_argument("--end", default="2025-12-31")
+    data.add_argument("--start", default=TARGET_WINDOW_START.isoformat())
+    data.add_argument("--end", default=TARGET_WINDOW_END.isoformat())
     data.add_argument("--dates", nargs="*", default=[])
     data.add_argument("--options-day-aggs", type=Path)
     data.add_argument("--sec-submissions-dir", type=Path)
@@ -1060,16 +1048,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Sequence diagnostics to run; use none to skip sequence models.",
     )
-    research.add_argument("--mamba-backend", choices=["mamba_ssm"], default="mamba_ssm")
-    research.add_argument(
-        "--mamba-seeds",
-        default=",".join(str(seed) for seed in TUNING_SEQUENCE_ENSEMBLE_SEEDS),
-    )
     research.add_argument("--bootstrap-iter", type=int, default=200)
     research.add_argument(
         "--tuning-profile",
-        choices=["tuned_phase1"],
-        default="tuned_phase1",
+        choices=[DEFAULT_TUNING_PROFILE],
+        default=DEFAULT_TUNING_PROFILE,
         help=argparse.SUPPRESS,
     )
     research.add_argument("--tuning-seed", type=int, default=17)

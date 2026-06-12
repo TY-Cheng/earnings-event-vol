@@ -32,30 +32,31 @@ C2C ex post mispricing is:
 RVAR_event_day_c2c - IVAR_event
 ```
 
-The V1 strategy/PnL layer uses `day_c2c` only. `jump_c2o` is the primary
-scientific forecast/ranking target, but it is not reported as executable option
-PnL in the current no-NBBO proxy run. Trading decisions are evaluated in premium
-space. A raw variance forecast is not enough; expected strategy value must beat
-market entry cost and transaction cost estimates.
+The V1 strategy/PnL layer uses `day_c2c` only. `jump_c2o` remains a primary
+scientific decomposition target, but it is not reported as executable option
+PnL in the current no-NBBO proxy run. The default tuning selection target is now
+`day_c2c`, so validation-only hyperparameter selection is aligned with the
+headline proxy economics. Trading decisions are evaluated in premium space. A
+raw variance forecast is not enough; expected strategy value must beat market
+entry cost and transaction cost estimates.
 
 ## Current State
 
-Verified local state on 2026-06-11:
+Verified local state on 2026-06-12:
 
-- `just data` builds the active no-NBBO proxy data pipeline with a 2013-2025
-  target window; pass `args="--start 2022-12-01 --end 2025-12-31"` for a
-  bounded current-cache rerun.
+- `just data` now targets the rebuild window `2013-01-01` through
+  `2026-06-05`; pass `args="--start 2022-12-01 --end 2025-12-31"` for a
+  bounded rerun of the current old modeling snapshot.
 - `just research-fast` remains the quick no-sequence smoke-refresh command. The
   current verified artifact set was refreshed with `sequence_suite=all`, reusing
   locked tuning parameters and keeping sequence rows diagnostic.
 - `just research` still builds the full V5 proxy feature/model/report package
   from the current trade-proxy event panel, including sequence diagnostics.
-- `just mamba-install` installs the local CUDA Mamba wheels and `just
-  mamba-doctor` verifies the official `mamba-ssm` runtime.
-- Current data range is `2022-12-01` through `2025-12-31`, because the observed
-  Massive options day-aggregate entitlement in this workspace starts in 2022.
-- The target paper range remains 2013-2025, but that needs upgraded historical
-  option data entitlement or another licensed options route.
+- Current old modeling snapshot is `2022-12-01` through `2025-12-31`, because
+  the populated event/modeling artifacts still come from the previous cache.
+- The target rebuild and paper window is `2013-01-01` through `2026-06-05`, but
+  paper-grade claims still require complete target-window quote/NBBO-equivalent
+  coverage.
 - All current trade-price results are `panel_grade=no_nbbo_trade_proxy` and
   `paper_grade=false`.
 
@@ -74,20 +75,26 @@ Latest proxy data artifacts:
   VWAP proxy PnL about -112.06 USD, mean exit-preclose VWAP proxy PnL about
   -162.30 USD, and mean haircut proxy PnL about -289.80 USD.
 - Quote execution artifacts: a bounded targeted REST slice is populated with
-  `--quote-workers 8` and cache reuse. It covers 64 events with 1,642
-  quote-window requests, 1,226,559 matched quote rows, 1,642 window marks, 1,642
-  leg execution rows, 412 straddle rows, 64 quote-IVAR diagnostic rows, 821
-  quote-IV leg rows, 412 quote-IV surface-pair rows, 64 quote-surface IVAR
-  rows, and 64 confidence rows. The bounded surface has 821 finite
-  `quote_mid_iv` values, 412 finite quote total-variance rows, and 57 finite
-  surface-IVAR mid rows. Confidence bands are 55 high and 9 medium. No full-day
-  quote files are stored in the repo; full-sample quote/NBBO evidence is still
-  pending. Follow-on quote runs can use `--quote-event-offset N --max-events M
-  --quote-batch-label offsetN_sizeM` to write batch-specific lake/artifact paths
-  without overwriting the canonical 64-event slice, then
-  `--stage quote-execution-merge --quote-merge-batch offsetN_sizeM` to
-  consolidate verified shards into canonical quote diagnostics.
-- Lake quality audit: `lake-quality-audit` now writes 2013-2025 coverage gates.
+  `--quote-workers 8`, cache reuse, and sixteen merged follow-on shards
+  (`offset64_size64`, `offset128_size64`, `offset192_size64`,
+  `offset256_size64`, `offset320_size16`, `offset336_size16`,
+  `offset352_size16`, `offset368_size16`, `offset384_size16`,
+  `offset400_size16`, `offset416_size16`, `offset432_size16`,
+  `offset448_size16`, `offset464_size16`, `offset480_size16`,
+  `offset496_size16`). It covers 502 events with 14,366 quote-window requests,
+  10,921,438 matched quote rows, 14,366 window marks, 14,366 leg execution
+  rows, 3,599 straddle rows, 502 quote-IVAR diagnostic rows, 7,183 quote-IV
+  leg rows, 3,599 quote-IV surface-pair rows, 502 quote-surface IVAR rows, and
+  502 confidence rows. The bounded surface has 7,164 finite `quote_mid_iv`
+  values, 3,573 finite quote mid-total-variance rows, and 471 finite
+  surface-IVAR mid rows. Confidence bands are 448 high, 53 medium, and 1 low.
+  No full-day quote files are stored in the repo; full-sample quote/NBBO
+  evidence is still pending. Follow-on quote runs can use `--quote-event-offset N`,
+  `--max-events M`, and `--quote-batch-label offsetN_sizeM` to write
+  batch-specific lake/artifact paths without overwriting the canonical bounded
+  slice, then `--stage quote-execution-merge --quote-merge-batch offsetN_sizeM`
+  to consolidate verified shards into canonical quote diagnostics.
+- Lake quality audit: `lake-quality-audit` now writes target-window coverage gates.
   The latest audit finds 17/17 audited lake datasets are span-incomplete for
   the target window, including all 15 required paper-grade datasets. Options
   day aggregates cover 2022-05-04 to 2025-12-31; underlying day aggregates cover
@@ -99,30 +106,47 @@ Latest proxy modeling artifacts:
 - Feature matrix: 816 rows.
 - Models evaluated: market-implied IVAR, last-four RVAR, last-four IVAR,
   Goyal-Saretto-style RV-IV spread, Elastic Net, LightGBM, XGBoost, a
-  LightGBM/XGBoost rank-average ensemble, FT-Transformer, and the refreshed
+  LightGBM/XGBoost forecast ensemble, FT-Transformer, and the refreshed
   sequence diagnostic suite.
-- Current fast tuned protocol: train/validation-locked tuning parameters are
-  reused, locked test rows are evaluated once, `sequence_suite=all`, and the
-  latest local model manifest uses `bootstrap_iter=200`. This refresh produced
-  2,448 prediction rows, 48 forecast metric rows, 48 ranking metric rows, 96
-  strategy metric rows, 4,830 IVAR defeat event rows, and 4,271 casebook event
-  rows. Locked-test predictions now include 24 high/medium quote-confidence
-  target rows across 8 unique events. The model manifest also writes a
-  21-row sequence diagnostic gate table, a 21-row incremental-value table, an
+- The Goyal-Saretto-style row is an earnings-event RV-IV spread benchmark
+  inspired by the original predictability literature, not a full
+  cross-sectional option-portfolio replication.
+- Current tuned protocol: train/validation-locked tuning parameters are reused
+  in the populated old snapshot, locked test rows are evaluated once, and
+  `sequence_suite=all`. Current code defaults to the
+  `tuned_phase1_day_c2c_rank_log_rvar` profile: learned tabular models and
+  FT-Transformer train on `log(max(RVAR, 0) + 1e-6)`, forecasts are
+  back-transformed to variance units before metrics and strategy logic, and
+  validation selection targets `day_c2c` edge ranking rather than direct PnL.
+  It will not reuse stale `jump_c2o`, raw-target, or old-profile
+  selected-parameter artifacts. The active-suite model cleanup refresh used
+  `bootstrap_iter=0`;
+  the report manifest still needs a refresh from these artifacts. With the current
+  14-model active suite, the refreshed model artifacts produce 2,448 prediction rows and
+  writes 42 forecast metric rows, 42 ranking metric rows, 84
+  strategy metric rows, 4,260 IVAR defeat event rows, and 3,745 casebook event
+  rows. Locked-test predictions now include 141 high/medium quote-confidence
+  target rows across 47 unique events. The model manifest also writes a
+  15-row sequence diagnostic gate table, a 15-row incremental-value table, an
   18-row robustness summary for DTE, liquidity, VIX-regime, timing, ticker, and
   quote-confidence splits, plus quote-confidence summary artifacts for
   prediction coverage, quote-IVAR, strategy, IVAR defeat, and casebook
   diagnostics.
-- The sequence diagnostic suite was refreshed with explicit 5-seed sequence
-  ensembles. Ridge-flat, BiGRU 5-seed, official `mamba-ssm` 5-seed, attention
-  pooling, dilated CNN, mask-only, and time-shuffle rows all trained in the
-  external CUDA-enabled uv environment. Sequence rows remain diagnostic unless
-  the common-row/control/bootstrap/economics gates pass.
+- The active sequence diagnostic suite is ridge-flat, attention pooling,
+  dilated CNN, mask-only, and time-shuffle. It uses only lightweight in-repo
+  PyTorch encoders; the slow recurrent/SSM 5-seed sequence ensembles are not
+  active model ids or runtime dependencies. Sequence rows remain diagnostic
+  unless the common-row/control/bootstrap/economics gates pass. After the
+  sequence-control runtime cleanup, rerun models/report before citing
+  mask-only or time-shuffle numeric rows as current-code evidence.
 - `FT-Transformer` refers to the validation-tuned tabular transformer
   specification.
-- In the refreshed FE V2 fast run, the strongest `jump_c2o` AUC is the
-  Goyal-Saretto-style spread at about 0.620, while the best `jump_c2o` OOS R2
-  versus IVAR is the LightGBM/XGBoost ensemble at about 0.236.
+- In the refreshed FE V2 sequence-suite snapshot, the strongest `jump_c2o` AUC
+  is the Goyal-Saretto-style spread at about 0.620, while the old
+  LightGBM/XGBoost ensemble row has the best `jump_c2o` OOS R2 versus IVAR at
+  about 0.236. Rerun models under
+  `tuned_phase1_day_c2c_rank_log_rvar` before citing any new selected params or
+  the dual-output LightGBM/XGBoost ensemble row.
 - The refreshed `day_c2c` headline proxy economics remain negative across
   tabular rows; the best net proxy PnL is still Goyal-Saretto-style spread at
   about -1,948 USD. This weakens any direct executable-trading sell and
@@ -130,9 +154,8 @@ Latest proxy modeling artifacts:
 - `reaction_o2c` is included in the V5 proxy model artifacts as a diagnostic
   target. In the current sequence refresh, ridge-flat sequence leads O2C AUC at
   about 0.808, but O2C strategy rows remain `pnl_headline_eligible=false`.
-- The sequence gate does not upgrade the claim: for primary `jump_c2o`, all
-  real sequence rows, including official `mamba-ssm` 5-seed, fail the
-  control/bootstrap gate.
+- The sequence gate does not upgrade the claim: for primary `jump_c2o`,
+  sequence rows fail the control/bootstrap gate.
 
 ## Command Surface
 
@@ -141,8 +164,6 @@ Use `just` as the public command surface:
 ```bash
 just status
 just check
-just mamba-doctor
-just mamba-install
 just data args="--dry-run"
 just data
 just research
@@ -169,8 +190,9 @@ options-day-aggs-bulk -> universe -> dynamic-calendar -> sec-companyfacts
 
 Default data parameters:
 
-- study range: `2022-12-01` to `2025-12-31`;
-- universe lookback: from `2022-06-01`;
+- target rebuild range: `2013-01-01` to `2026-06-05`;
+- old modeling snapshot range: `2022-12-01` to `2025-12-31`;
+- universe lookback for the target rebuild: from `2012-07-01`;
 - monthly top 50 liquid U.S. single-name option underlyings;
 - DTE `3-21`, supporting the main `5-14` sample and robustness window;
 - market data route:
@@ -217,12 +239,19 @@ run the canonical tuned proxy package with the full sequence diagnostic suite
 and 1,000 bootstrap iterations:
 
 ```bash
-just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1 --feature-schema-version fe_v2_sec_xbrl"
+just research args="--stage all --sequence-suite all --allow-high-sequence-risk --bootstrap-iter 1000 --tuning-profile tuned_phase1_day_c2c_rank_log_rvar --feature-schema-version fe_v2_sec_xbrl"
 ```
 
-In the canonical tuned protocol, Optuna objectives and `ElasticNetCV` read only train and
-locked validation rows. The selected hyperparameters are refit on
-train+validation, and locked test rows are evaluated once after selection.
+In the canonical `tuned_phase1_day_c2c_rank_log_rvar` protocol, Optuna
+objectives and `ElasticNetCV` read only train and locked validation rows.
+Elastic Net, LightGBM, XGBoost, and FT-Transformer train in log-RVAR space
+with `FORECAST_FLOOR=1e-6`, then back-transform forecasts to raw variance
+units before forecast metrics, ranking, strategy, IVAR-defeat, and casebook
+artifacts. The default selection target is `day_c2c`; selected hyperparameters
+are refit on train+validation, and locked test rows are evaluated once after
+selection. Proxy PnL remains economic validation, not the hyperparameter
+objective. `jump_c2o` remains a scientific target tested with the same
+selected hyperparameters for cross-target generalization.
 Paired original rows are intentionally not emitted.
 
 The default feature schema is `fe_v2_sec_xbrl`. It uses the resolved
@@ -289,7 +318,7 @@ Do not claim:
 - generic IV forecasting superiority;
 - paper-grade full-spread tradability;
 - that second-aggregate trade bars are NBBO quotes;
-- that Mamba is the contribution independent of baselines and costs;
+- that a sequence architecture is the contribution independent of baselines and costs;
 - that lower RMSE alone implies economic value.
 
 The defensible near-term claim is narrower:

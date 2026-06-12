@@ -43,6 +43,16 @@ QUOTE_IV_SURFACE_METHOD = "entry_quote_black_scholes_iv_surface"
 QUOTE_IV_SURFACE_CLAIM_SCOPE = "bounded_quote_iv_surface_diagnostic_not_full_nbbo_surface"
 QUOTE_SURFACE_IVAR_METHOD = "entry_quote_iv_surface_total_variance_extraction"
 QUOTE_SURFACE_IVAR_CLAIM_SCOPE = "bounded_quote_iv_surface_ivar_diagnostic_not_full_nbbo_surface"
+NORMALIZED_QUOTE_COLUMNS = (
+    "options_ticker",
+    "quote_date",
+    "quote_timestamp_et",
+    "bid",
+    "ask",
+    "mid",
+    "spread",
+    "spread_over_mid",
+)
 QUOTE_STATUS_OK = "ok"
 QUOTE_STATUS_MISSING = "missing_quote"
 QUOTE_STATUS_INVALID = "invalid_bid_ask"
@@ -178,18 +188,37 @@ def _rest_quote_cache_path(
 
 
 def _load_cached_normalized_quotes(path: Path) -> pd.DataFrame | None:
-    if not path.exists() or path.stat().st_size <= 0:
+    if not path.exists():
+        return None
+    try:
+        if path.stat().st_size <= 0:
+            path.unlink(missing_ok=True)
+            return None
+    except OSError:
         return None
     try:
         cached = pd.read_parquet(path)
-    except (OSError, ValueError):
+    except Exception:
+        path.unlink(missing_ok=True)
         return None
-    return cached if isinstance(cached, pd.DataFrame) else None
+    if not isinstance(cached, pd.DataFrame):
+        path.unlink(missing_ok=True)
+        return None
+    missing_columns = set(NORMALIZED_QUOTE_COLUMNS) - set(cached.columns)
+    if missing_columns:
+        path.unlink(missing_ok=True)
+        return None
+    return cached
 
 
 def _write_cached_normalized_quotes(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(path, index=False)
+    tmp_path = path.with_name(f".{path.name}.{time_module.time_ns()}.tmp")
+    try:
+        frame.to_parquet(tmp_path, index=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def fetch_massive_option_quote_window_rest(
@@ -272,18 +301,7 @@ def _load_or_fetch_rest_quote_window(
 
 
 def _empty_normalized_quotes_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "options_ticker",
-            "quote_date",
-            "quote_timestamp_et",
-            "bid",
-            "ask",
-            "mid",
-            "spread",
-            "spread_over_mid",
-        ]
-    )
+    return pd.DataFrame(columns=list(NORMALIZED_QUOTE_COLUMNS))
 
 
 def _empty_quote_window_marks_frame() -> pd.DataFrame:
