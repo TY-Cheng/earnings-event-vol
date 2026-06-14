@@ -152,6 +152,8 @@ def _get_json_with_retries(
             if not _retryable_http_error(exc):
                 raise
             last_exc = exc
+        except json.JSONDecodeError as exc:
+            last_exc = exc
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             last_exc = exc
         if attempt < attempts - 1 and config.massive_retry_backoff_seconds > 0:
@@ -2003,7 +2005,11 @@ def extract_quote_execution_panel(
                 matched += int(len(filtered))
                 if not filtered.empty:
                     matched_chunks.append(filtered)
-    quotes = pd.concat(matched_chunks, ignore_index=True) if matched_chunks else pd.DataFrame()
+    quotes = (
+        pd.concat(matched_chunks, ignore_index=True)
+        if matched_chunks
+        else _empty_normalized_quotes_frame()
+    )
     marks = build_quote_window_marks(
         quotes,
         requests,
@@ -2017,8 +2023,6 @@ def extract_quote_execution_panel(
     quote_iv_surface_summary = build_quote_iv_surface_summary_panel(quote_iv_surface)
     quote_surface_ivar = build_quote_surface_ivar_event_panel(quote_iv_surface_summary)
     confidence = build_execution_confidence_panel(marks, quote_execution_route=route)
-    if quotes.empty:
-        quotes = _empty_normalized_quotes_frame()
     quotes.to_csv(quotes_path, index=False)
     marks.to_csv(marks_path, index=False)
     legs.to_csv(legs_path, index=False)

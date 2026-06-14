@@ -1,71 +1,71 @@
 # Audit Status
 
-Last synced: 2026-06-13 after switching the main target window to
-2016-10-01 through 2026-06-05.
+Last synchronized: 2026-06-13 after the WSL2/CUDA cold run.
 
-## Current Verification
+## Handoff Gate
 
-- Current Mac checkout root is
-  `/Users/tycheng/Library/CloudStorage/OneDrive-NationalUniversityofSingapore/earnings-event-vol/earnings-event-vol`;
-  other machines should use their active checkout path and machine-local `.env`.
-- Full `just check` passed on 2026-06-13 after the latest
-  contract-reference, manifest-canonicalization, rate-limiter, feature, docs,
-  and research-helper fixes: 175 tests passed, total coverage 95.13%, ruff
-  format/check passed, mypy passed, MkDocs strict build passed, CLI `status`
-  passed, and `source-probe all` passed.
-- Remaining warnings are upstream/dependency warnings; they are non-blocking.
+Latest full gate:
 
-## Current Artifact Audit
+- `just check` must be rerun after the latest quote-shard promotion,
+  source-coverage audit, research refresh, docs sync, and legacy cleanup.
 
-- The Mac checkout has a broader pre-window-change preflight rebuild for
-  2016-01-01 through 2026-06-05: options day aggregates, universe, dynamic SEC
-  calendar, SEC CompanyFacts, event-window/contract-candidate setup,
-  contract-reference validation, trade-proxy panel, and the gold feature matrix
-  were refreshed. Do not cite those counts as current main-window evidence until
-  the 2016-10-01 through 2026-06-05 pipeline is rerun.
-- Preflight event-window report has 3,072 events, 3,001 events with realized
-  variance, 3,071 events with entry-window support, 80,275 contract candidates,
-  40,709 quote-pool contracts, 17,595 main DTE 5-14 contracts, and 39,566
-  IVAR-support-only contracts.
-- Preflight SEC CompanyFacts manifest has 228,205 standardized fact rows for
-  201 tickers.
-- Preflight contract-reference validation covers 79,903 unique tickers: 79,634
-  validated and 269 `missing_reference`; unknown deliverables are excluded from
-  proxy usability.
-- Preflight trade-proxy panel has 3,072 events, 3,001 events with RVAR, 2,538
-  events with trade-proxy IVAR, 80,006 proxy-usable contract rows, 55,580
-  contracts with usable pre-entry trade proxy marks, and 24,426 with no trade
-  in the cutoff window.
-- Preflight feature matrix has 3,071 rows, 559 columns, and 415 model features
-  under `fe_v2_sec_xbrl`; low-dimensional additions include sequence call/put
-  volume imbalance aggregates, own-underlying pre-event return/RV run-up, and
-  SEC SIC coarse controls.
-- Preflight lake-quality audit is `ok=false`: options day aggregates are
-  covered, underlying day aggregates start on 2016-06-13 under the current
-  Massive entitlement, and full bid/ask/NBBO-equivalent quote coverage is still
-  missing. The main 2016-10-01 window starts after the known 2016-H1 underlying
-  entitlement gap.
-- Current model/report outputs have not yet been rerun against a refreshed
-  2016-10-01 through 2026-06-05 feature matrix.
+## Current Evidence Root
 
-## Current Docs Audit
+Use:
 
-- `docs/paper_plan.md` is the paper-style manuscript plan.
-- `docs/results_snapshot.md` is the paper-style Results and Discussion ledger.
-- README, paper plan, results snapshot, and current Serena memories distinguish
-  the broader 2016-01-01 preflight data layers from the active 2016-10-01 main
-  window and from the old 816-row historical modeling snapshot.
-- The PR #1 Chinese contributor docs are no longer present in `docs/` or
-  MkDocs nav; their useful ideas were absorbed into paper-facing docs and code.
+```text
+/home/tycheng/data/earnings-event-vol
+```
 
-## Current Legacy Audit
+Do not use repo-local `artifacts/` or `reports/` as current evidence after
+cleanup.
 
-- The retired legacy feature schema has been removed from the command/config/code
-  surface. The only accepted feature schema is `fe_v2_sec_xbrl`.
-- Retired legacy sequence ids remain only in retirement manifests/tests and are
-  not active model ids or runtime dependencies.
-- Historical ablation artifacts may remain under ignored
-  `artifacts/modeling_ablations/`; treat them as stale local artifacts only.
-- The current result set is not final paper-grade evidence because full
-  bid/ask/NBBO-equivalent execution remains pending and model/report outputs
-  need a rerun on the refreshed 2016-10-01 through 2026-06-05 feature matrix.
+## Current Audit Facts
+
+Lake quality:
+
+- `ok=false`
+- target window: 2016-10-01 to 2026-06-05
+- required datasets: 15
+- incomplete required datasets: 13
+- `paper_grade_execution_ready=false`
+
+Completion gap:
+
+- `ok=false`
+- `paper_grade_ready=false`
+- status counts: `complete=8`, `diagnostic_only=1`, `incomplete=3`
+- blockers: quote-IVAR/surface paper-grade upgrade, sequence full-suite
+  population, target-window data coverage, paper-grade bid/ask/NBBO execution.
+
+## Stale-State Risks
+
+Treat these as stale unless explicitly restored from the cold-run root:
+
+- older 502-event quote slice;
+- older 10,921,438 matched quote-row bounded slice;
+- older 816-row modeling snapshot;
+- broader preflight rows;
+- repo-local ignored `artifacts/` and `reports/`;
+- parent wrapper `.serena`;
+- repo-local `.venv`.
+
+## Current Completion Assessment
+
+Complete for proxy-stage research:
+
+- data engineering through quote batch merge;
+- feature matrix;
+- model suite;
+- report figures;
+- quote-confidence summaries;
+- IVAR-defeat artifacts;
+- casebook artifacts;
+- tests/docs build.
+
+Incomplete for paper-grade claims:
+
+- full-window quote/NBBO-equivalent execution;
+- full paper-grade quote-IVAR/surface route;
+- robust positive economics;
+- sequence full-suite model rows in the verified refresh.

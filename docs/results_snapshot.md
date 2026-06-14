@@ -5,101 +5,60 @@ hide:
 
 # Results and Discussion
 
-This page is the paper-facing results ledger for the canonical local proxy
-research package. It is written as the manuscript's `Results and Discussion`
-section and should be read together with [Paper Plan](paper_plan.md).
+This page is the paper-facing results ledger for the current cold-run proxy
+research package. It should be read with [Paper Plan](paper_plan.md).
 
-Generated outputs remain under ignored `artifacts/`, `reports/`, and external
-`DATA_DIR` locations. Selected figures are copied into
-`docs/assets/images/modeling/`. The evidence grade is still
-`no_nbbo_trade_proxy`: current option prices come from trade-aggregate proxy
-marks, not quote midpoints, bid/ask records, OPRA, or NBBO.
+Current canonical evidence root:
 
-Massive historical quote access is now usable through targeted
-`/v3/quotes/{optionsTicker}` REST windows. A bounded REST slice run with
-`--quote-workers 8`, cache reuse, and sixteen merged follow-on shards
-(`offset64_size64`, `offset128_size64`, `offset192_size64`,
-`offset256_size64`, `offset320_size16`, `offset336_size16`,
-`offset352_size16`, `offset368_size16`, `offset384_size16`,
-`offset400_size16`, `offset416_size16`, `offset432_size16`,
-`offset448_size16`, `offset464_size16`, `offset480_size16`,
-`offset496_size16`) has populated the quote-execution panel with 10,921,438
-matched quote rows, 14,366 window marks, 14,366 leg execution rows,
-3,599 straddle rows, 502 quote-IVAR diagnostic rows, and 502
-execution-confidence rows. It also builds bounded quote-IV diagnostics:
-7,183 quote-IV leg rows, 3,599 call-put surface-pair rows, and 502 surface-IVAR
-event rows, with 7,164 finite `quote_mid_iv` values, 3,573 finite quote
-mid-total-variance rows, and 471 finite surface-IVAR mid rows. Confidence bands
-are 448 high, 53 medium,
-and 1 low.
-This is quote-aware diagnostic evidence, not full-sample NBBO execution
-evidence.
+```text
+/home/tycheng/data/earnings-event-vol
+```
 
-This page is the handoff from the planned manuscript design to observed
-evidence. Each completed experiment from the paper plan should appear here with
-its sample, table or figure, outcome, interpretation, and claim boundary. The
-goal is not to repeat every generated artifact verbatim; it is to make the
-paper argument auditable by showing what was run, what won, what failed, and
-what cannot yet be claimed.
+Repo-local `artifacts/` and `reports/` are ignored local outputs and are not
+the current canonical evidence source. Selected figures from the cold-run
+report are copied into `docs/assets/images/modeling/`.
 
 ## 3. Results and Discussion
 
-This section follows the paper plan's experimental order. It first establishes
-execution grade and sample coverage, then reports forecast and ranking results,
-then premium-space proxy economics, then decomposition diagnostics, ablations,
-cost and calibration checks, sequence gates, and finally the sellable claim and
-remaining evidence requirements.
-
 ### 3.1 Execution Grade and Reproducibility Status
 
-The repo currently has a pre-window-change data and feature package plus a
-historical proxy-stage model/report snapshot. The default main window is now
-2016-10-01 to 2026-06-05. The event panel, contract reference gate,
-trade-proxy panel, feature matrix, and schema report were last rebuilt on the
-Mac for the broader 2016-01-01 preflight window; rebuild them for the main
-window before citing current-window results. The package is useful for internal
-research review and pipeline validation. It is not paper-grade execution
+The current run is a complete proxy-stage research package for
+2016-10-01 through 2026-06-05. It is not paper-grade executable trading
 evidence.
 
-| Item | Current state |
+| Item | Current value |
 | --- | --- |
-| Verified local run | 2026-06-12 broader-window contract-reference, trade-proxy, feature-matrix, and lake-quality refresh; 2026-06-13 dry-run for the new 2016-10-01 main window and `just check` |
-| Command | `data --stage contract-reference-validation`, `data --stage trade-proxy-panel`, `research --stage features --feature-schema-version fe_v2_sec_xbrl`, and `data --stage lake-quality-audit` |
-| Populated modeling snapshot | Historical model/report artifacts from the old 816-row feature matrix; stale after the feature rebuild |
-| Target rebuild/paper window | 2016-10-01 to 2026-06-05, pending historical quote/NBBO or equivalent data |
-| Universe | Monthly top 50 liquid U.S. single-name option underlyings |
-| Timing sample | BMO and AMC earnings announcements |
-| Split | Chronological event-level 70/15/15 |
-| Tuning protocol | Populated numeric snapshot predates the canonical `tuned_phase1_day_c2c_rank_log_rvar` profile; current code uses log-target train/validation-only selection on `day_c2c` with locked test once |
-| Feature schema | `fe_v2_sec_xbrl` default and only supported schema |
-| Bootstrap iterations | Current feature-stage manifest records 200 as the default research setting; model-stage bootstrap is pending |
-| Research manifest | Current `research_manifest.json` is `stage=features`; model/report manifest must be regenerated |
-| Lake quality audit | `artifacts/data_pipeline/lake_quality_audit/lake_quality_report.json`, `ok=false` for target-window coverage |
-| Completion gap audit | `artifacts/modeling/completion_gap_audit.csv` and `.json`, generated by report stage |
-| Output report | `reports/modeling/proxy_research_report.md` |
-| Feature schema report | `artifacts/modeling/feature_schema_report.csv` |
+| Evidence grade | `no_nbbo_trade_proxy` |
+| Data root | `/home/tycheng/data/earnings-event-vol` |
+| Target window | 2016-10-01 to 2026-06-05 |
+| Feature schema | `fe_v2_sec_xbrl` |
+| Tuning profile | `tuned_phase1_day_c2c_rank_log_rvar` |
+| Split | chronological 70/15/15 |
+| Forecast floor | `1e-6` |
+| Model stage | `ok=true` |
+| Report stage | `ok=true` |
+| Report figures | 11 |
 
-Reproducibility note: the numerical model tables below reflect the 2026-06-11
-proxy model run on the old 816-row feature matrix with `sequence_suite=all`.
-They are historical local evidence, not current 2016-10-01 to 2026-06-05
-target-window model results. The latest local preflight artifacts are the
-3,072-row trade-proxy event panel and the 3,071-row `fe_v2_sec_xbrl` feature
-matrix from the broader window. The code now removes the slow recurrent/SSM 5-seed sequence runtime
-path and uses the canonical `tuned_phase1_day_c2c_rank_log_rvar` profile:
-learned tabular models and FT-Transformer train on log-RVAR, forecasts are
-back-transformed to variance units, and stale `jump_c2o`, raw-target, or
-old-profile tuning caches are invalidated. Rerun models and report before
-treating any forecast, ranking, strategy, mask-only, or time-shuffle row as
-current-code numeric evidence.
-Until quote/NBBO or equivalent data are populated, all strategy numbers must
-remain labeled `paper_grade=false`.
+Lake-quality audit:
 
-**Discussion.** The current result can be sold only as signal-screening
-evidence. It cannot be sold as executable option-trading performance because
-the populated quote slice is bounded to 502 events and does not establish
-full-sample quote/NBBO crossing metrics. Quote availability, matched targeted
-REST rows, and request artifacts are necessary inputs, not yet completed
-paper-grade execution results.
+| Item | Value |
+| --- | ---: |
+| Audit `ok` | `false` |
+| Required datasets | 15 |
+| Incomplete required datasets | 13 |
+| Paper-grade execution ready | `false` |
+
+The blocking audit message is:
+
+```text
+requires full-window quote/NBBO or equivalent coverage and quote-IVAR beyond
+the current bounded diagnostic slice
+```
+
+**Discussion.** The current package is reproducible and analysis-complete for
+proxy research. It is not a final paper-grade execution package because the
+lake-quality and completion-gap audits explicitly block full bid/ask or
+NBBO-equivalent claims.
 
 ### 3.2 Research Question and Evidence Map
 
@@ -108,598 +67,254 @@ The paper-facing question is:
 > Can models improve trading decisions around option-implied earnings event
 > variance mispricing?
 
-Models forecast realized event variance. The market benchmark is
-`IVAR_event`. Ex post mispricing is `RVAR_event - IVAR_event`. The strategy
-layer converts predicted variance edge into premium-space expected edge and
-proxy PnL.
+The evidence hierarchy is:
 
-| Target | Role in the paper | How it is interpreted |
-| --- | --- | --- |
-| `jump_c2o` | Primary scientific ranking target | Close-to-open earnings jump variance. Used for forecast, ranking, and tail-selection evidence. |
-| `day_c2c` | Current proxy-PnL headline | Close-to-close full reaction-day variance. Used for the main premium-space proxy strategy. |
-| `reaction_o2c` | Diagnostic target | Open-to-close post-open digestion variance. Useful for decomposition and ranking diagnostics, not a headline IVAR-based strategy. |
-
-The result hierarchy is:
-
-| Evidence layer | Required conclusion discipline |
+| Evidence layer | Current status |
 | --- | --- |
-| Forecast fit | Report MAE, RMSE, and OOS R2 versus market IVAR, but do not sell RMSE alone. |
-| Ranking | Sell only if AUC, top-decile precision, and edge-decile monotonicity improve. |
-| Strategy proxy | Use `day_c2c` premium-space PnL as the current economic headline, with cost sensitivity. |
-| C2O and O2C option-VWAP proxies | Treat as no-NBBO diagnostic decompositions. |
-| Sequence models | Keep diagnostic unless they beat tabular baselines, mask-only controls, time-shuffle controls, and economics gates. |
-
-The experiment ledger below bridges [Paper Plan](paper_plan.md) to the
-remaining results tables. Rows that depend only on data and feature
-construction currently reflect the broader pre-window-change feature build,
-not a completed 2016-10-01 main-window rebuild. Rows that depend on forecasts,
-rankings, strategy PnL, robustness, IVAR defeat, or casebook outputs are
-historical until the data/feature/model/report stages are rerun on the active
-main-window feature matrix.
-
-| Planned experiment | Results section | Primary evidence | Current outcome | Interpretation |
-| --- | --- | --- | --- | --- |
-| Execution-grade and sample audit | 3.1, 3.3 | Reproducibility table and coverage table | Modeling manifest is `ok=true`; current evidence remains `no_nbbo_trade_proxy`. | Complete proxy-stage package, not paper-grade execution. |
-| Current `fe_v2_sec_xbrl` sequence-suite tuned package | 3.5, 3.6 | Main forecast/ranking table and C2C strategy table | Historical model snapshot only; the 2016-10-01 main-window feature matrix has not yet been rebuilt and used for model/report output. | Rerun data/features/models before citing any current forecast, ranking, strategy, or ensemble row. |
-| Benchmark ladder | 3.4, 3.5 | Model-suite table and primary C2O metrics | Historical snapshot shows Goyal-Saretto as a hard ranking benchmark; current main-window rerun pending. | Classical baselines remain required before any ML claim. |
-| Headline C2C proxy strategy | 3.6 | C2C ranking table and premium-space PnL table | Historical paper-facing tabular/benchmark rows were net-negative after proxy costs; current main-window model PnL pending. | Do not claim outperformance until the active main-window feature matrix is modeled. |
-| C2O post-open diagnostics | 3.7 | C2O option-VWAP proxy table | Historical diagnostic rows only. | C2O is scientific/ranking evidence, not the executable PnL headline. |
-| O2C decomposition diagnostics | 3.8 | O2C forecast/ranking table, proxy PnL table, scale diagnostic | Historical diagnostic rows only. | Useful decomposition, not a calibrated full-event strategy. |
-| Feature-schema hygiene | 3.9 | Feature-schema report and leakage audit | Broader pre-window-change schema report has 559 columns and 415 model features; the schema excludes raw IDs, time trends, post-event fields, and unsupported quote/NBBO fields. | Use schema coverage and leakage audit as design evidence; rebuild before citing current main-window counts. |
-| Cost sensitivity | 3.10 | Cost multiplier table and figure | Historical model-run sensitivity only. | Cost robustness is not quote-execution evidence. |
-| DTE/liquidity/regime robustness | 3.10 | `strategy_breakdowns.csv`, `ivar_defeat_breakdowns.csv`, `robustness_summary.csv` | Historical model/report robustness artifacts only until rerun. | Strategy splits are mostly small-cell/exploratory; current target-window robustness needs model/report refresh. |
-| Calibration and QLIKE | 3.11 | Calibration and QLIKE diagnostic figures | Ranking evidence is stronger than calibrated variance-level evidence. | Supports the metric hierarchy from the paper plan. |
-| Sequence diagnostic suite | 3.12 | `sequence_model_fit_diagnostics.csv`, `incremental_value_diagnostics.csv`, common-row metrics | Current feature-stage coverage artifacts exist; sequence model metrics remain historical until model rerun. | Do not sell sequence superiority without common-row controls and current economics. |
-| Quote-aware execution confidence and bounded quote-IV surface | 3.15 | Quote-window requests, matched quote subset, marks, leg/straddle execution, quote-IVAR, quote-IV surface, execution confidence bands, and quote-confidence summary tables | Bounded REST slice is populated: 14,366 requests, 10,921,438 matched quote rows, 14,366 marks, 14,366 leg rows, 3,599 straddle rows, 502 quote-IVAR rows, 7,183 quote-IV leg rows, 3,599 surface-pair rows, 502 surface-IVAR rows, 502 confidence rows, and refreshed quote-confidence summary tables. | Useful for quote-confidence and bounded quote-IV diagnostics; still not full-sample NBBO execution evidence. |
-| IVAR defeat analysis | 3.15 | Model-vs-IVAR event, summary, and confidence-breakdown tables | Refreshed artifacts exist: 4,260 event rows, 42 model/target summary rows, and 126 quote-confidence IVAR-defeat rows. | Use these to explain where models really beat market IVAR. |
-| False-positive / false-negative casebook | 3.15 | Casebook event, summary, and confidence-breakdown tables | Refreshed artifacts exist: 3,745 case events, 199 summary rows, and 531 quote-confidence casebook rows. | Use false positives, false negatives, model-corrects-market, market-right-model-wrong, and execution-fragile cases to structure the discussion. |
-
-The rest of this section expands those rows into manuscript-ready result
-blocks. Each block distinguishes the numerical result from the interpretation
-so a proxy-stage signal is not accidentally upgraded into an executable
-trading claim.
-
-The numeric tables below are the historically populated model snapshot. The
-ensemble row predates the active forecast-ensemble code change and the
-log-target canonical profile, so it should be treated as a historical ensemble
-row until the model stage is rerun under
-`tuned_phase1_day_c2c_rank_log_rvar`.
-
-### 3.2.1 Current-Spec Rerun Roadmap
-
-The next model-stage refresh must regenerate the selected-parameter and result
-artifacts under `tuned_phase1_day_c2c_rank_log_rvar`. The current-spec run
-should report:
-
-- log-target diagnostics for Elastic Net, LightGBM, XGBoost, and
-  FT-Transformer, including `target_transform=log_rvar`, `training_space`,
-  `evaluation_space`, `back_transform`, and `forecast_floor=1e-6`;
-- the dual-output LightGBM/XGBoost ensemble, with variance-unit forecast
-  average used for expected-edge magnitude and split-level base-edge rank
-  average used for ranking metrics, edge deciles, and top-k trade ordering;
-- sequence diagnostics with pairwise ranking computed in raw variance space
-  after log-output back-transformation;
-- updated IVAR-defeat and casebook tables from the new locked-test
-  predictions.
-
-Until those artifacts exist, all numerical interpretations below remain
-historical evidence from the populated old snapshot.
+| Forecast fit | Populated for all 3 targets and 9 active model ids. |
+| Ranking | Populated for all 3 targets and 9 active model ids. |
+| Strategy proxy | Populated, but positive rows are small-trade and proxy-only. |
+| Quote confidence | Populated across train/validation/test and all targets. |
+| IVAR defeat | Populated at event, metric, and breakdown levels. |
+| Casebook | Populated for false positives, false negatives, market-vs-model cases, and quote-confidence splits. |
+| Paper-grade execution | Blocked. |
 
 ### 3.3 Sample Construction and Coverage
 
-The broader pre-window-change data snapshot contains 5,785 universe-filtered SEC
-calendar rows and 3,072 BMO/AMC main-sample candidate events. Of these, 3,001
-currently have realized event variance and 3,071 have entry-window support.
-Contract-reference validation, trade-proxy construction, and feature
-construction have been rebuilt for that preflight window. Model/report
-artifacts and the feature matrix must be rerun for the 2016-10-01 main window
-before target-window forecast, ranking, strategy, or selected-parameter results
-are cited.
-
-| Measure | Value |
+| Artifact | Current value |
 | --- | ---: |
-| Dynamic SEC calendar rows | 5,785 |
-| BMO/AMC main-sample candidates | 3,072 |
-| Events with realized event variance | 3,001 |
-| Events with entry-window support | 3,071 |
-| Event contract candidates | 80,275 |
-| Raw event-window quote-pool contracts | 40,709 |
-| Raw event-window main DTE 5-14 contracts | 17,595 |
-| Reference-gated quote-pool contracts | 40,643 |
-| Reference-gated main DTE 5-14 contracts | 17,577 |
-| Reference-gated robustness DTE 3-21 contracts | 40,643 |
-| IVAR-support-only contracts | 39,566 |
-| SEC CompanyFacts standardized rows | 228,205 |
-| Trade-proxy event-panel rows | 3,072 |
-| Events with trade-proxy `IVAR_event` | 2,538 |
-| Proxy-usable contract rows | 80,006 |
-| Proxy contracts with usable pre-entry trade marks | 55,580 |
-| Feature matrix rows | 3,071 |
-| Feature matrix columns | 559 |
-| Model features | 415 |
-| Mean gross trade-proxy PnL | -93.90 USD |
-| Mean haircut trade-proxy PnL | -221.04 USD |
+| Feature matrix rows | 2,388 |
+| Feature-schema rows | 569 |
+| Model features | 407 |
+| Event-level model features | 249 |
+| Tree model features | 407 |
+| Prediction rows | 7,164 |
 
-The lake-quality audit is an explicit negative gate for the final target
-sample. For the 2016-10-01 to 2026-06-05 target window, the expected remaining
-paper-grade audit blocker is full target-window quote/NBBO-equivalent coverage.
-The main window starts after the observed 2016-H1 underlying daily entitlement
-gap. The no-NBBO trade-proxy route does not make the package paper-grade.
+Quote-execution diagnostics:
 
-| Lake audit artifact | Current value |
+| Artifact | Current value |
 | --- | ---: |
-| Audited datasets | 17 |
-| Required target-window datasets | 15 |
-| Incomplete required datasets | 14 |
-| Dataset status counts | 1 covered, 7 incomplete, 9 missing |
-| Options day-agg partitions | 2,752, target-span covered |
-| Underlying day-agg partitions | 2,510, first date 2016-06-13 |
-| 2016 options partition coverage | 252 / 261 weekdays |
-| 2016 underlying partition coverage | 141 / 261 weekdays |
-| Quote target-window datasets | Missing from canonical target-window quote lake |
-| Historical bounded quote rows | 10,921,438 in the old bounded diagnostic slice |
-| Gold trade-proxy event panel | 3,072 rows in the broader preflight snapshot |
-| Gold feature matrix | 3,071 rows in the broader preflight snapshot |
+| Quote execution route | `quote_batch_consolidation` |
+| Quote-confidence events | 2,329 |
+| Quote-window requests | 65,172 |
+| Matched quote rows | 21,680,332 |
+| Event windows without quote confidence | 60 |
+| Targeted request events with zero returned quote rows | 923 |
+| Full-day quote files written | `false` |
 
-Sequence coverage is weaker than tabular coverage: the refreshed
-feature-stage sequence-coverage artifact has 2,251 eligible events out of
-3,071 in the broader preflight feature matrix, a drop rate of 26.7%, and
-`high_sequence_selection_risk=true`. The daily sequence tensor has 20 steps by
-38 features. The hybrid tensor design remains 31 steps by 21 features: 19
-prior daily proxy-surface states plus 12 entry-day five-minute trade-aggregate
-proxy bins. The feature stage writes only the canonical
-`hybrid_sequence_tensor_v2.npz` hybrid tensor; the non-`_v2` duplicate is
-retired.
+Completion-gap audit:
 
-**Discussion.** The sample is large enough to run the complete proxy-stage
-tabular package and lightweight sequence diagnostics, but the 26.7% sequence
-drop rate remains a selection-risk flag. Sequence rows remain diagnostic until
-the current main-window model rerun beats tabular baselines,
-mask/time-shuffle controls, and economics gates.
+| Item | Current value |
+| --- | --- |
+| `ok` | `false` |
+| `paper_grade_ready` | `false` |
+| Status counts | `complete=8`, `diagnostic_only=1`, `incomplete=3` |
+| Blocking requirements | sequence full-suite population, target-window data coverage, paper-grade bid/ask/NBBO execution, quote-IVAR/surface paper-grade upgrade |
+
+**Discussion.** The quote route has moved from entitlement theory to concrete
+targeted extraction and diagnostics. However, the audit still blocks the
+upgrade from targeted diagnostic quote evidence to full-window paper-grade
+execution evidence.
+
+The source coverage audit shows the previous missing-event concern was not an
+early-window-only source claim. The verified merge covers contiguous target
+offsets 0-2388, and the remaining 60 event windows without quote confidence
+are classified as 22 no-candidate cases and 38 no-quote-eligible cases. The
+923 `missing` quote-confidence cases had targeted REST requests but returned
+zero quote rows; this is bounded evidence for those windows, not full
+historical NBBO unavailability.
 
 ### 3.4 Model Suite
 
-The model suite covers market, historical, spread, tabular ML, neural tabular,
-and sequence-diagnostic families.
+The current cold run evaluates 9 active model ids for each of 3 targets:
 
-| Family | Models | Status |
-| --- | --- | --- |
-| Market benchmark | Market-implied `IVAR_event` | Active neutral edge baseline |
-| Historical baselines | Last-four RVAR, last-four IVAR | Active deterministic baselines |
-| Classical spread benchmark | Goyal-Saretto-style RV-IV spread | Active comparator |
-| Linear tabular | Elastic Net | `ElasticNetCV` |
-| Nonlinear tabular | LightGBM, XGBoost | Validation-only tuning and train+validation refit |
-| Ensemble | LightGBM/XGBoost forecast ensemble | Dual-output: variance forecast average plus base-edge rank score; rerun required before replacing old ensemble rows |
-| Neural tabular | FT-Transformer | Validation-tuned; not a current headline model |
-| Sequence diagnostics | Ridge-flat aggregates, attention pooling, dilated CNN, mask-only, time-shuffle | Diagnostic only |
+| Family | Models |
+| --- | --- |
+| Market and historical benchmarks | `market_implied_event_variance`, `last_four_rvar`, `last_four_ivar` |
+| Classical spread benchmark | `goyal_saretto_rv_iv_spread` |
+| Learned tabular/deep models | `linear_elastic_net_tuned`, `lightgbm_tuned`, `xgboost_tuned`, `lightgbm_xgboost_forecast_ensemble`, `ft_transformer` |
+| Sequence tensor diagnostics | hybrid tensor v2, sequence coverage, quality reports, retired-model manifest |
 
-**Discussion.** The benchmark design is strong enough for a working-paper
-signal screen because it includes the main failure modes: market IVAR, simple
-history, signed RV-IV spread, tuned GBDT, neural tabular, and sequence controls.
-Current code uses a dual-output LightGBM/XGBoost ensemble: the variance-unit
-forecast average supplies expected-edge magnitude, while the split-level
-base-edge rank score supplies ranking metrics, edge deciles, and top-k trade
-ordering. Old ensemble rows should not be used as current-spec evidence after
-the next model refresh. The main missing benchmark class for paper-grade
-execution is not another ML model; it is quote/NBBO execution data.
+**Discussion.** The model ladder is strong enough for a benchmark-disciplined
+working paper. The verified refresh used `sequence_suite=none`; sequence
+tensors and quality reports are present, but sequence model rows are not active
+current metric evidence.
 
-### 3.5 Primary C2O Forecast and Ranking Results
+### 3.5 Forecast and Ranking Results
 
-Forecast and ranking columns in this populated snapshot use `jump_c2o`; the
-strategy column uses `day_c2c`, the current proxy-PnL headline. Current code now
-selects tuned hyperparameters on validation `day_c2c` in log-target space, so
-this table should be rerun before it is cited as current-spec evidence.
+Best ranking AUC by target:
 
-| Model | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Day-C2C net proxy PnL |
-|:---|---:|---:|---:|---:|---:|---:|
-| Market IVAR | 0.0099 | 0.0146 | 0.0000 | 0.1635 | 0.5000 | n/a |
-| Last-four RVAR | 0.0099 | 0.0238 | -1.6617 | 0.1818 | 0.5118 | -3,563 |
-| Last-four IVAR | 0.0123 | 0.0169 | -0.3442 | 0.1818 | 0.4861 | -10,888 |
-| Goyal-Saretto spread | 0.0075 | 0.0133 | 0.1692 | 0.2727 | 0.6200 | -1,948 |
-| Elastic Net | 0.0086 | 0.0135 | 0.1373 | 0.2727 | 0.5085 | -30,588 |
-| LightGBM | 0.0083 | 0.0129 | 0.2208 | 0.2727 | 0.5159 | -26,675 |
-| XGBoost | 0.0084 | 0.0129 | 0.2181 | 0.1818 | 0.5341 | -22,371 |
-| LightGBM/XGBoost ensemble | 0.0083 | 0.0127 | 0.2362 | 0.1818 | 0.5301 | -25,321 |
-| FT-Transformer | 0.0343 | 0.0351 | -4.8020 | 0.1818 | 0.5267 | -28,488 |
+| Target | Best model | AUC | Top-decile precision |
+| --- | --- | ---: | ---: |
+| `day_c2c` | `lightgbm_xgboost_forecast_ensemble` | 0.5823 | 0.4483 |
+| `jump_c2o` | `goyal_saretto_rv_iv_spread` | 0.5091 | 0.2069 |
+| `reaction_o2c` | `ft_transformer` | 0.6714 | 0.2414 |
 
-![Forecast performance](assets/images/modeling/forecast_performance.png)
+Best forecast OOS R2 versus IVAR by target:
 
-![AUC and top-decile precision](assets/images/modeling/auc_top_decile_precision.png)
+| Target | Best model | OOS R2 vs IVAR | RMSE |
+| --- | --- | ---: | ---: |
+| `day_c2c` | `xgboost_tuned` | 0.6438 | 0.0231 |
+| `jump_c2o` | `xgboost_tuned` | 0.7301 | 0.0208 |
+| `reaction_o2c` | `linear_elastic_net_tuned` | 0.9312 | 0.0082 |
 
-![Edge-decile realized mispricing](assets/images/modeling/edge_decile_realized_mispricing.png)
+Primary `day_c2c` ranking top rows:
 
-**Results.** For `jump_c2o`, LightGBM/XGBoost ensemble has the strongest OOS
-R2 versus IVAR at 0.2362. Goyal-Saretto spread has the lowest MAE at 0.0075
-and the best AUC at 0.6200. Top-decile precision is 27.3% for Goyal-Saretto,
-Elastic Net, and LightGBM.
+| Model | AUC | Top-decile precision | Edge-decile Spearman |
+| --- | ---: | ---: | ---: |
+| `lightgbm_xgboost_forecast_ensemble` | 0.5823 | 0.4483 | 0.5394 |
+| `xgboost_tuned` | 0.5821 | 0.4483 | 0.4424 |
+| `lightgbm_tuned` | 0.5818 | 0.4483 | 0.4303 |
+| `linear_elastic_net_tuned` | 0.5742 | 0.4483 | 0.6000 |
+| `ft_transformer` | 0.5718 | 0.4138 | 0.6970 |
+| `goyal_saretto_rv_iv_spread` | 0.5503 | 0.2414 | 0.1636 |
 
-**Discussion.** The level-fit result and the ranking result point to different
-models. This is useful evidence for signal screening, but it is not yet a
-clean economic result: the same models do not produce positive `day_c2c`
-headline proxy PnL after costs.
+Primary `day_c2c` forecast top rows:
 
-### 3.6 Headline C2C Proxy Strategy Results
+| Model | OOS R2 vs IVAR | RMSE | MAE |
+| --- | ---: | ---: | ---: |
+| `xgboost_tuned` | 0.6438 | 0.0231 | 0.0109 |
+| `lightgbm_xgboost_forecast_ensemble` | 0.6425 | 0.0231 | 0.0109 |
+| `lightgbm_tuned` | 0.6408 | 0.0232 | 0.0109 |
+| `linear_elastic_net_tuned` | 0.6307 | 0.0235 | 0.0111 |
+| `last_four_rvar` | 0.5604 | 0.0257 | 0.0147 |
 
-The `day_c2c` strategy layer is the only current proxy-PnL headline because it uses
-the full close-to-close event move and the pre-event option entry proxy. The
-market IVAR row has no trades under the zero-edge premium rule.
+**Discussion.** Forecast-fit evidence is stronger than economic evidence.
+XGBoost and the LightGBM/XGBoost ensemble are close on `day_c2c` ranking and
+forecast fit. This does not establish sequence superiority because sequence
+model rows were not populated in the verified refresh.
 
-| Model | OOS R2 vs IVAR | Top-decile precision | AUC | Edge-decile Spearman |
-|:---|---:|---:|---:|---:|
-| Market IVAR | 0.0000 | 0.2885 | 0.5000 | n/a |
-| Last-four RVAR | -2.1808 | 0.4545 | 0.5590 | 0.1758 |
-| Last-four IVAR | -0.2979 | 0.2727 | 0.5167 | -0.0303 |
-| Goyal-Saretto spread | -0.0275 | 0.5455 | 0.6185 | 0.5515 |
-| Elastic Net | -0.2417 | 0.2727 | 0.4779 | 0.2848 |
-| LightGBM | 0.0600 | 0.2727 | 0.5063 | 0.6364 |
-| XGBoost | 0.0161 | 0.1818 | 0.4977 | 0.6848 |
-| LightGBM/XGBoost ensemble | 0.0583 | 0.1818 | 0.4977 | 0.4909 |
-| FT-Transformer | -3.5935 | 0.2727 | 0.5090 | 0.6242 |
+### 3.6 Headline `day_c2c` Proxy Strategy Results
 
-| Model | n | Net PnL | Return on premium | Sharpe | Max drawdown | Hit rate |
-|:---|---:|---:|---:|---:|---:|---:|
-| Market IVAR | 0 | n/a | n/a | n/a | n/a | n/a |
-| Last-four RVAR | 37 | -3,563 | -0.0483 | -0.4270 | -11,994 | 0.324 |
-| Last-four IVAR | 72 | -10,888 | -0.0897 | -1.2911 | -11,914 | 0.292 |
-| Goyal-Saretto spread | 29 | -1,948 | -0.0286 | -0.2363 | -10,974 | 0.310 |
-| Elastic Net | 60 | -30,588 | -0.2242 | -1.2311 | -37,709 | 0.283 |
-| LightGBM | 60 | -26,675 | -0.1900 | -1.0508 | -32,017 | 0.317 |
-| XGBoost | 59 | -22,371 | -0.1690 | -0.8873 | -29,013 | 0.305 |
-| LightGBM/XGBoost ensemble | 60 | -25,321 | -0.1805 | -0.9993 | -31,962 | 0.300 |
-| FT-Transformer | 102 | -28,488 | -0.1434 | -1.0842 | -38,981 | 0.294 |
+Best `day_c2c` headline strategy rows by net PnL:
 
-![Strategy PnL by edge decile](assets/images/modeling/strategy_pnl_by_edge_decile.png)
+| Model | Strategy proxy | Trades | Net PnL | Return on premium | Sharpe | Hit rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `xgboost_tuned` | C2C exit preclose 15m | 3 | 1,484.41 | 0.4169 | 0.9498 | 0.6667 |
+| `lightgbm_tuned` | C2C exit preclose 15m | 1 | 78.57 | 0.1448 | n/a | 1.0000 |
+| `lightgbm_xgboost_forecast_ensemble` | C2C exit preclose 15m | 2 | -45.69 | -0.0525 | -0.2253 | 0.5000 |
+| `linear_elastic_net_tuned` | C2C exit preclose 15m | 3 | -125.66 | -0.0954 | -0.6883 | 0.3333 |
+| `goyal_saretto_rv_iv_spread` | C2C exit preclose 15m | 5 | -280.19 | -0.0198 | -0.0695 | 0.6000 |
+| `last_four_rvar` | C2C exit preclose 15m | 5 | -792.10 | -0.0625 | -0.2093 | 0.6000 |
 
-**Results.** The only positive `day_c2c` C2C proxy row in the current refresh
-is the mask-only sequence control at about +359 USD on 13 trades. That row is
-not a sellable model result. Among paper-facing tabular and benchmark rows,
-Goyal-Saretto spread is the least-negative row, with -1,948 USD net proxy PnL.
-The main tabular rows remain negative after the proxy haircut cost.
+**Discussion.** This is not a robust positive PnL result. The best net row is
+XGBoost with only 3 trades, and the second positive learned-model row has only
+1 trade. The paper should sell ranking/diagnostic value, not economic
+outperformance.
 
-**Discussion.** This is the main reason the project should not be sold as
-profitable trading performance yet. The current evidence supports
-mispricing-signal research, not a positive executable strategy claim.
+### 3.7 `jump_c2o` Diagnostics
 
-### 3.7 C2O Post-Open Option-VWAP Diagnostics
+Best `jump_c2o` ranking AUC is the Goyal-Saretto-style spread at 0.5091.
+Best forecast OOS R2 versus IVAR is XGBoost at 0.7301. The best proxy strategy
+row is the Goyal-Saretto-style spread on the 5-15 minute post-open option-VWAP
+diagnostic with 5 trades and 3,089.51 USD net PnL.
 
-The primary C2O option proxy uses same-contract option VWAP from 5 to 15
-minutes after the regular-session open. The 0-5 minute VWAP is an opening
-microstructure stress test. The intrinsic-open mark
-`abs(open_after - strike) * 100` is a jump diagnostic only, not an option-price
-exit.
+**Discussion.** `jump_c2o` is scientifically important because it isolates the
+overnight earnings jump. The strategy rows remain diagnostic because the
+execution path is not a full paper-grade bid/ask/NBBO route and trade counts
+are very small.
 
-| Proxy kind | Best current model by net PnL | n | Net PnL | Return on premium | Sharpe | Interpretation |
-|:---|:---|---:|---:|---:|---:|:---|
-| Intrinsic open diagnostic | Goyal-Saretto spread | 11 | -1,425 | -0.0639 | -0.2990 | Diagnostic only; not an option-price exit. |
-| Post-open option VWAP 0-5 | LightGBM/XGBoost ensemble | 33 | 3,351 | 0.0514 | 0.5753 | Opening microstructure stress proxy. |
-| Post-open option VWAP 5-15 | FT-Transformer | 94 | 3,128 | 0.0209 | 0.2891 | Primary C2O option-VWAP diagnostic mark. |
+### 3.8 `reaction_o2c` Diagnostics
 
-**Results.** The 0-5 and 5-15 minute option-VWAP diagnostics are positive for
-some models, but all C2O strategy rows remain `pnl_headline_eligible=false`.
+Best `reaction_o2c` ranking AUC is FT-Transformer at 0.6714. Best forecast
+OOS R2 versus IVAR is Elastic Net at 0.9312. The best proxy strategy row is the
+Goyal-Saretto-style spread with 4 trades and 1,637.39 USD net PnL.
 
-**Discussion.** C2O is useful scientifically because it isolates the overnight
-earnings jump. It should not become the economic headline until the project
-has quote-based entry and exit marks and a clean option-price execution model.
-
-### 3.8 O2C Post-Open Diagnostic Results
-
-`reaction_o2c` is the post-open digestion target. Its realized variance is
-post-open only, while `IVAR_event` is a full-event implied-variance comparator.
-That makes O2C useful for ranking and decomposition diagnostics, not for
-calibrated full-event mispricing claims.
-
-| Model | n | MAE | RMSE | OOS R2 vs IVAR | Top-decile precision | AUC | Edge-decile Spearman |
-|:---|---:|---:|---:|---:|---:|---:|---:|
-| Market IVAR | 104 | 0.0106 | 0.0142 | 0.0000 | 0.0385 | 0.5000 | n/a |
-| Last-four RVAR | 104 | 0.0026 | 0.0049 | 0.8806 | 0.1818 | 0.6875 | 0.9636 |
-| Last-four IVAR | 104 | 0.0127 | 0.0162 | -0.3042 | 0.1818 | 0.7500 | 0.3091 |
-| Goyal-Saretto spread | 104 | 0.0036 | 0.0067 | 0.7738 | 0.1818 | 0.6150 | 0.9758 |
-| Elastic Net | 104 | 0.0023 | 0.0034 | 0.9440 | 0.1818 | 0.6900 | 0.9879 |
-| LightGBM | 104 | 0.0023 | 0.0035 | 0.9404 | 0.1818 | 0.7350 | 1.0000 |
-| XGBoost | 104 | 0.0023 | 0.0034 | 0.9434 | 0.1818 | 0.7000 | 0.9879 |
-| LightGBM/XGBoost ensemble | 104 | 0.0023 | 0.0034 | 0.9435 | 0.1818 | 0.7200 | 1.0000 |
-| FT-Transformer | 104 | 0.0365 | 0.0367 | -5.7215 | 0.1818 | 0.6900 | 0.9879 |
-
-| O2C proxy kind | Best current model by net PnL | n | Net PnL | Return on premium | Sharpe | Headline eligible |
-|:---|:---|---:|---:|---:|---:|:---|
-| 0-5 option VWAP to C2C exit | Goyal-Saretto spread | 1 | 319 | 0.2559 | n/a | False |
-| 5-15 option VWAP to C2C exit | Goyal-Saretto spread | 1 | 232 | 0.1862 | n/a | False |
-
-| O2C scale diagnostic | Value |
-| --- | ---: |
-| Paired rows | 705 |
-| SD of `RVAR_event_reaction_o2c` | 0.0064 |
-| SD of `IVAR_event` | 0.0267 |
-| SD ratio, O2C to IVAR | 0.2397 |
-| Mean ratio, O2C to IVAR | 0.1664 |
-
-![O2C forecast performance](assets/images/modeling/o2c_forecast_performance.png)
-
-![O2C AUC and top-decile precision](assets/images/modeling/o2c_auc_top_decile_precision.png)
-
-![O2C diagnostic proxy PnL](assets/images/modeling/o2c_strategy_proxy_pnl.png)
-
-![O2C scale diagnostic](assets/images/modeling/o2c_scale_diagnostic.png)
-
-**Results.** Last-four IVAR has the best O2C ranking AUC at 0.7500; Elastic
-Net has the best OOS R2 versus IVAR at 0.9440. O2C strategy rows remain
-headline-ineligible, and the best positive proxy rows have only one trade.
-
-**Discussion.** O2C validates that the target decomposition is informative,
-but it is not the core economic claim. The scale diagnostic shows why
-full-event `IVAR_event` is a weak comparator for post-open realized variance:
-O2C variance is much smaller than full-event IVAR in the paired sample.
+**Discussion.** O2C validates that post-open digestion contains a different
+signal shape, but it should not be sold as the main event-variance trading
+claim.
 
 ### 3.9 Feature Schema Hygiene
 
-The current supported schema is `fe_v2_sec_xbrl`. Retired feature-profile
-ablations have been removed from the command surface, so this page should not
-cite historical profile comparisons as current evidence.
+The current feature schema has 569 report rows and 407 model features. The
+feature allowlist excludes raw identifiers, post-event outcomes, PnL fields,
+quote execution confidence, quote-IVAR, quote-IV surface diagnostics, and
+unsupported NBBO claims.
 
-| Schema item | Current status | Paper rule |
-| --- | --- | --- |
-| `fe_v2_sec_xbrl` feature report | Refreshed target-window artifact set: 3,071 feature rows, 559 total columns, and 415 model features. | Cite only with the matching feature-matrix manifest and model rerun status. |
-| Leakage audit | Implemented for model-feature columns. | Required before citing model metrics. |
-| Retired ablation artifacts | Historical only. | Do not use as current evidence. |
+**Discussion.** The feature schema is now strong enough for reproducible
+proxy-stage modeling. Future feature work should start with ablation and
+pruning, not broad feature expansion.
 
-**Results.** The current feature-stage evidence establishes the schema
-boundary, not a feature-profile comparison. The refreshed schema includes
-sequence call/put volume imbalance aggregates, own-underlying pre-event
-return/RV run-up, and SEC SIC coarse controls, while excluding raw IDs,
-post-event fields, exit outcomes, future PnL, and unsupported quote/NBBO
-claims.
+### 3.10 Quote-Aware Diagnostics
 
-**Discussion.** Future feature changes should be judged by validation/test
-ranking and premium-space economics under the same locked-test protocol, not by
-reviving retired feature profiles.
+Quote-confidence prediction coverage has 36 rows across train, validation,
+test, targets, and confidence bands.
 
-### 3.10 Cost Sensitivity
+Quote-IVAR summary:
 
-The default cost model is a proxy haircut:
+| Execution confidence band | Events | Mid-IVAR available | Ask-IVAR available | Median confidence score | Median spread/mid |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| high | 1,035 | 989 | 617 | 0.9444 | 0.0745 |
+| medium | 334 | 217 | 1 | 0.7083 | 0.2206 |
+| low | 37 | 0 | 0 | 0.3542 | 0.4500 |
+| missing | 982 | 0 | 0 | 0.0000 | n/a |
 
-```text
-proxy_cost_usd = 0.005 * entry_premium_usd
-```
+**Discussion.** Quote confidence is useful for explaining which cases have
+cleaner execution diagnostics. It does not by itself create paper-grade
+tradability.
 
-Multiplier 0 is an anchor, multiplier 1 is the default proxy assumption, and
-multipliers 3 and 5 are stress tests. Because true bid/ask costs are
-unavailable, this table is a proxy stress test rather than an execution-cost
-estimate.
+### 3.11 IVAR Defeat and Casebook
 
-| Model | 1x cost | 3x cost | 5x cost |
-|:---|---:|---:|---:|
-| Goyal-Saretto spread | -1,948 | -2,630 | -3,312 |
-| Elastic Net | -30,588 | -31,952 | -33,316 |
-| LightGBM | -26,675 | -28,079 | -29,483 |
-| XGBoost | -22,371 | -23,695 | -25,019 |
-| LightGBM/XGBoost ensemble | -25,321 | -26,724 | -28,127 |
+Current artifacts:
 
-![Cost sensitivity](assets/images/modeling/cost_sensitivity.png)
+| Artifact | Shape / rows |
+| --- | ---: |
+| `ivar_defeat_events.csv` | 7,641 rows |
+| `ivar_defeat_metrics.csv` | 27 rows |
+| `ivar_defeat_breakdowns.csv` | 3,078 rows |
+| `casebook_events.csv` | 2,722 rows |
+| `casebook_summary.csv` | 126 rows |
+| `quote_confidence_casebook_summary.csv` | 317 rows |
 
-**Results.** The current fast-run headline rows remain negative across the
-default proxy haircut and higher cost multipliers.
+**Discussion.** These artifacts make the failure analysis paper-ready in
+structure: false positives, false negatives, model-corrects-market,
+market-right-model-wrong, and execution-fragile cases can now be discussed
+systematically. The interpretation must still respect the proxy-stage
+execution boundary.
 
-**Discussion.** Cost sensitivity reinforces the evidence boundary. A model
-that ranks C2O variance better is not automatically an executable C2C strategy.
-The next paper-grade run must estimate entry and exit costs from quote or NBBO
-data.
+### 3.12 Calibration, QLIKE, Robustness, and Sequence Gate
 
-#### Robustness Summary
+The current report includes calibration, QLIKE, cost sensitivity, robustness,
+common-row pairwise metrics, sequence tensor diagnostics, and incremental-value
+diagnostics.
 
-The refreshed model stage now writes a compact subgroup gate:
-`artifacts/modeling/robustness_summary.csv`. It summarizes
-`strategy_breakdowns.csv` and `ivar_defeat_breakdowns.csv` across DTE,
-main-vs-robustness DTE flags, liquidity buckets, VIX-regime terciles, BMO/AMC
-timing, event year, ticker, and quote-confidence bands.
+Completion-gap blockers include `sequence_diagnostics_full_suite_populated`,
+so sequence model claims should remain deferred until a deliberate
+sequence-suite run is completed.
 
-| Source | Rows | Main usable dimensions | Current gate |
-| --- | ---: | --- | --- |
-| Strategy breakdowns | 3,075 | DTE, liquidity, VIX-regime, BMO/AMC, ticker, quote confidence | Mostly `exploratory_small_cells`; not enough for a robust strategy claim. |
-| IVAR defeat breakdowns | 3,804 | DTE, main DTE flag, liquidity, VIX-regime, BMO/AMC | DTE, liquidity, and VIX-regime are `available_multi_bucket`; quote-confidence and ticker splits remain small-cell. |
-| Robustness summary | 18 | One row per source and breakdown dimension | Use as a claim gate before interpreting subgroup tables. |
-
-**Results.** IVAR-defeat robustness is now explicit enough to discuss DTE,
-liquidity, and VIX-regime diagnostics: those dimensions have multiple buckets
-and minimum cell counts above the summary gate. Strategy robustness is weaker:
-the same dimensions include many small cells once rows are split by model,
-target, strategy proxy, and subgroup.
-
-**Discussion.** This is useful progress, but not a paper-grade robustness
-finish. The current summary supports careful model-vs-IVAR subgroup discussion;
-it does not rescue the negative headline C2C proxy economics or replace the
-full target-window / quote-execution sample.
-
-### 3.11 Calibration and QLIKE Diagnostics
-
-Calibration checks whether forecasted event-jump variance is on the same scale
-as realized event-jump variance, not only whether the model sorts events.
-QLIKE is kept as a diagnostic because near-zero forecasts dominate raw
-contributions for some rows.
-
-![Calibration plot](assets/images/modeling/calibration_plot.png)
-
-![QLIKE contribution diagnostic](assets/images/modeling/qlike_contribution_diagnostic.png)
-
-**Results.** The current evidence is stronger for ranking than for perfectly
-calibrated variance levels. Raw QLIKE is too sensitive to near-zero values to
-serve as the headline metric in this sample.
-
-**Discussion.** This supports the metric hierarchy in the paper plan: MAE,
-RMSE, and OOS R2 are necessary but insufficient; AUC, top-decile precision,
-edge-decile monotonicity, and premium-space proxy PnL are closer to the
-research question.
-
-### 3.12 Sequence Diagnostic Gate
-
-The active `sequence_suite=all` route is now the lightweight sequence
-diagnostic suite: ridge-flat aggregates, attention pooling, dilated CNN,
-mask-only, and time-shuffle controls. The removed 5-seed sequence ensembles are
-no longer public model ids, runtime dependencies, or part of the canonical
-report contract.
-The cleanup refresh used `bootstrap_iter=0`, so bootstrap confidence intervals
-are not recomputed in the current sequence table. The sequence-control runtime
-was cleaned up after the populated snapshot; rerun the model/report stages
-before citing mask-only or time-shuffle rows as updated implementation
-evidence.
-
-| Diagnostic | Current result |
-| --- | --- |
-| Sequence run in cleanup refresh | Yes, `sequence_suite=all` |
-| Sequence coverage | 2,251 eligible events out of 3,071 in the broader preflight feature matrix |
-| Drop rate | 26.7% |
-| Selection risk flag | `high_sequence_selection_risk=true` |
-| Active sequence/control rows | Historical model-stage rows only until rerun |
-| Current sequence claim | Diagnostic only; no headline-eligible sequence rows |
-
-The sequence model table below is from the historical model snapshot and must
-be regenerated before current main-window sequence claims.
-
-| Historical primary `jump_c2o` sequence row | Coverage | Gate AUC lift | Bootstrap CI | Gate result |
-| --- | ---:|---:|---:|--- |
-| Ridge-flat aggregates | 104 | -0.0593 | Not recomputed (`bootstrap_iter=0`) | Fail |
-| Attention pooling | 95 | -0.0111 | Not recomputed (`bootstrap_iter=0`) | Fail |
-| Dilated CNN | 95 | -0.0245 | Not recomputed (`bootstrap_iter=0`) | Fail |
-| Mask-only control | 95 | 0.0000 | Control baseline | Control |
-| Time-shuffle control | 95 | -0.0182 | Control baseline | Control |
-
-**Results.** Sequence diagnostics are now populated, but they do not create a
-sequence-model claim. On the primary `jump_c2o` target, every active
-real-sequence row has negative gate lift against the controls in the current
-cleanup refresh. Every real sequence row remains headline-ineligible.
-
-**Discussion.** The manuscript should not claim sequence superiority. Sequence
-models can only become paper-facing after the sequence suite beats tabular
-baselines, mask-only controls, time-shuffle controls, and premium-space
-economics gates on a common-row basis.
+**Discussion.** The metric hierarchy in the paper plan is supported: ranking
+and tail selection are more relevant to the research question than raw RMSE
+alone, but strategy evidence remains too fragile for a trading-performance
+claim.
 
 ### 3.13 Current Sellable Claim
 
-The defensible near-term claim is:
+The defensible claim is:
 
-> In a no-NBBO proxy sample, the earnings event-variance problem is measurable
-> and benchmarkable with leakage-controlled target-window data and features.
-> Historical model evidence suggested Goyal-Saretto-style RV-IV spread was a
-> hard ranking benchmark, but current 2016-10-01 main-window data, feature,
-> model, and report results still need to be regenerated before making
-> model-specific claims.
+> We build a reproducible earnings event-variance mispricing research pipeline
+> with strong benchmark discipline, log-target model tuning, targeted
+> quote-aware diagnostics, IVAR-defeat analysis, and casebook interpretation.
+> The current evidence supports signal screening, not paper-grade executable
+> option-trading outperformance.
 
-The current paper angle should emphasize:
+The current package should not claim:
 
-- the trading question is event-variance mispricing, not generic IV
-  forecasting;
-- ranking and top-decile selection matter more than unconditional RMSE;
-- classical RV-IV spread remains a required benchmark to beat on ranking;
-- tuned GBDT/ensemble rows cannot be cited as current until model/report rerun;
-- feature-schema hygiene is documented, while sequence rows remain diagnostic
-  and fail the primary gate;
-- all current market-trade results are no-NBBO trade-aggregate proxy results.
-
-### 3.14 Claim Boundaries and Required Next Evidence
-
-Do not claim:
-
-- paper-grade executable performance;
-- bid/ask, quote-mid, OPRA, or NBBO execution;
+- paper-grade executable trading performance;
+- full bid/ask, OPRA, or NBBO execution;
 - sequence-model superiority;
-- feature-schema improvement versus retired historical profiles;
-- that lower RMSE alone implies economic value;
-- that C2O or O2C diagnostic rows are the economic headline.
+- robust positive strategy PnL;
+- complete full-window quote-IVAR/surface coverage.
 
-Paper-grade claims require:
+### 3.14 Next Evidence Required
 
-| Requirement | Why it is needed |
+| Requirement | Current status |
 | --- | --- |
-| Targeted quote execution panel | Converts quote flat-file availability into event/leg/window bid-ask diagnostics. |
-| Historical quote/NBBO or equivalent data | Converts no-NBBO proxy marks into executable entry/exit evidence beyond the current targeted extractor. |
-| Quote-based `IVAR_event` construction | Replaces trade-close IV proxies with quote-consistent implied variance. |
-| Leg-level execution and realistic bid/ask crossing | Converts premium-space proxy edge into executable PnL. |
-| Longer historical sample | Supports stronger inference, liquidity stratification, and crisis/regime checks. |
-| Full-sample DTE/liquidity/VIX robustness | Current proxy-stage summary exists, but paper-grade robustness needs larger historical/quote coverage and fewer small cells. |
-| Clustered/bootstrap inference over final sample | Separates stable cross-sectional signal from small-sample luck. |
-| Lake quality audit gate | Keeps the target-window data-coverage blocker explicit before any final paper claim. |
+| Full-window quote/NBBO or equivalent coverage | Blocked by lake audit. |
+| Full-sample quote-IVAR/surface evidence | Diagnostic only; completion gap remains. |
+| Paper-grade bid/ask crossing | Not complete. |
+| Sequence full-suite model rows | Not populated in the verified refresh. |
+| Robust economic claim | Not supported by current small-trade positive rows. |
 
-### 3.15 Quote-Aware Diagnostics, IVAR Defeat, and Casebook
-
-The quote-aware block is now populated for a bounded slice. It is not the full
-historical quote/NBBO run, but it gives concrete evidence about what changes
-when strategy and failure analysis are stratified by quote-execution confidence.
-The data-pipeline quote artifacts below reflect the latest 502-event merge, and
-the model/report quote-confidence summaries have been refreshed against that
-bounded quote slice.
-The quote pipeline now also supports resumable batch slices with
-`--quote-event-offset`, `--max-events`, and `--quote-batch-label`; batch runs
-write under `batches/batch=...` and leave the canonical bounded artifacts
-unchanged. The `quote-execution-merge` stage can then consolidate verified
-batch shards into the canonical quote lake and research-facing CSV/report
-artifacts. This is an execution mechanism for expanding coverage, not evidence
-that the full historical quote/NBBO sample is complete.
-
-| Artifact | Rows | Role |
-| --- | ---: | --- |
-| `quote_confidence_prediction_coverage.csv` | 30 | Split/target coverage by execution-confidence band. |
-| `quote_ivar_summary.csv` | 4 | Event-level quote-IVAR availability by confidence band. |
-| `quote_iv_surface.csv` | 7,183 | Bounded entry-window quote-derived leg-level Black-Scholes IV diagnostics. |
-| `quote_iv_surface_summary.csv` | 3,599 | Event/expiry/strike call-put quote-IV surface-pair diagnostics. |
-| `quote_surface_ivar_event.csv` | 502 | Bounded quote-IV total-variance event extraction; 471 finite mid-IVAR rows. |
-| `quote_confidence_strategy_summary.csv` | 72 | Strategy metrics by execution-confidence band. |
-| `quote_confidence_ivar_defeat_summary.csv` | 126 | Model-vs-IVAR defeat metrics by execution-confidence band. |
-| `quote_confidence_casebook_summary.csv` | 531 | Casebook failure taxonomy by execution-confidence band. |
-
-**Quote-IVAR availability.**
-
-| Band | Events | Mid-IVAR available | Ask-IVAR available | Median mid IVAR | Median ask IVAR | Median confidence | Median spread/mid |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| High | 274 | 262 | 167 | 0.006007 | 0.005904 | 0.938 | 0.077 |
-| Medium | 35 | 23 | 0 | 0.010660 | n/a | 0.736 | 0.201 |
-| Low | 1 | 0 | 0 | n/a | n/a | 0.229 | 0.051 |
-| Missing | 506 | 0 | 0 | n/a | n/a | n/a | n/a |
-
-Locked-test coverage is still small: for each target, the test split has 38
-high-confidence rows, 9 medium-confidence rows, and 76 missing-confidence rows.
-Across targets this is 141 high/medium target rows across 47 unique events. The
-quote-IVAR rows are therefore usable for diagnostics and case review, not for a
-headline execution claim.
-
-**Strategy interpretation.** For the headline `day_c2c` proxy strategy, the
-high-confidence quote slice still does not rescue the paper-facing economics.
-Several sequence/control rows become positive in the expanded high-confidence
-slice, led by mask-only at about +2,796 USD on 3 trades and attention pooling at
-about +1,665 USD on 6 trades, with dilated CNN at about +834 USD on 6 trades.
-This is exactly why the control gates matter. The high-confidence tabular rows
-remain net-negative: Goyal-Saretto is about -4,745 USD on 8 trades, XGBoost
-about -28,701 USD on 22 trades, the LightGBM/XGBoost ensemble about -31,651 USD
-on 23 trades, LightGBM about -31,695 USD on 23 trades, Elastic Net about
--30,816 USD on 22 trades, and FT-Transformer about -36,080 USD on 36 trades.
-This supports a conservative
-reading: quote confidence helps identify cleaner cases, but the current bounded
-slice is not an execution upgrade.
-
-**IVAR defeat interpretation.** The quote-confidence IVAR-defeat table confirms
-that the model-vs-market story depends on target and sample size. For
-`jump_c2o`, dilated CNN beats market IVAR on absolute error for 78.8% of 33
-high-confidence rows; mask-only and time-shuffle are each 75.8%; Goyal-Saretto
-is 75.0% on 36 rows. For `day_c2c`, mask-only leads at 72.7% on 33
-high-confidence rows, time-shuffle is 69.7%, and Goyal-Saretto is 63.9% on 36
-rows. For diagnostic `reaction_o2c`, LightGBM and XGBoost are 91.7% on 36
-high-confidence rows, while last-four RVAR and ridge-flat sequence are 88.9%.
-These
-cells are useful case-review evidence, not standalone proof of superiority,
-especially because sequence controls remain competitive. The conclusion is not
-that quote confidence creates a new winner; it makes the model-vs-market
-comparison more auditable.
-
-**Casebook interpretation.** The casebook now separates execution-fragile cases
-from model failures. High-confidence rows still contain false positives, false
-negatives, and market-right/model-wrong examples, so quote quality alone does
-not explain model failure. In the high-confidence slice, the taxonomy has 369
-model-corrected-market cases, 277 market-right/model-wrong cases, 206 false
-positives, 138 false negatives, and 100 execution-fragile cases. Missing-confidence
-rows still dominate the execution-fragile bucket with 1,043 cases. This is the right
-way to use the casebook: high-confidence failures diagnose model behavior,
-while missing-confidence failures diagnose execution-data coverage.
-
-**Bottom line.** The project has the target-window no-NBBO data and feature
-code paths needed for an internal working-paper draft, but current model/report
-results still need to be regenerated on the refreshed feature matrix. It does
-not yet have the final data quality or execution evidence needed for a
-submission-level empirical finance paper.
+The next paper decision is whether to present this as a conservative
+signal-screening paper or invest in full-window quote/NBBO-equivalent coverage
+before submission.

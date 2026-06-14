@@ -1997,6 +1997,10 @@ def _torch_log_rvar_to_variance(log_values: torch.Tensor) -> torch.Tensor:
     return torch.clamp(torch.exp(log_values) - FORECAST_FLOOR, min=FORECAST_FLOOR)
 
 
+def _torch_training_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _canonical_target_diagnostics(
     *,
     early_stop_metric: str | None = None,
@@ -2053,11 +2057,10 @@ def _ranking_score_col_for_model(
         model_id == "lightgbm_xgboost_forecast_ensemble"
         and ENSEMBLE_RANK_SIGNAL_COL in frame.columns
     ):
-        frame[score_col] = pd.to_numeric(frame[ENSEMBLE_RANK_SIGNAL_COL], errors="coerce")
-    else:
-        frame[score_col] = pd.to_numeric(frame[forecast_col], errors="coerce") - pd.to_numeric(
-            frame["ivar_event"], errors="coerce"
-        )
+        return ENSEMBLE_RANK_SIGNAL_COL
+    frame[score_col] = pd.to_numeric(frame[forecast_col], errors="coerce") - pd.to_numeric(
+        frame["ivar_event"], errors="coerce"
+    )
     return score_col
 
 
@@ -2782,6 +2785,7 @@ def _fit_ft_transformer_once(
     *,
     features: Sequence[str],
     seed: int,
+    device: torch.device,
     d_token: int,
     n_heads: int,
     n_layers: int,
@@ -2798,12 +2802,14 @@ def _fit_ft_transformer_once(
         n_layers=n_layers,
         dropout=dropout,
         positive_output=False,
-    )
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     x_train = torch.tensor(
-        _numeric_matrix(train_fit, features).to_numpy(dtype=float), dtype=torch.float32
+        _numeric_matrix(train_fit, features).to_numpy(dtype=float),
+        dtype=torch.float32,
+        device=device,
     )
-    y_train = torch.tensor(_training_target_values(train_fit), dtype=torch.float32)
+    y_train = torch.tensor(_training_target_values(train_fit), dtype=torch.float32, device=device)
     for _ in range(max(1, epochs)):
         model.train()
         optimizer.zero_grad()
@@ -2836,6 +2842,7 @@ def _train_ft_transformer(
             {"status": "skipped_insufficient_finite_targets"},
             None,
         )
+    device = _torch_training_device()
     params = _cached_params(tuning_state, "ft_transformer")
     selection_target = cast(
         str,
@@ -2843,7 +2850,9 @@ def _train_ft_transformer(
     )
     if params is None:
         x_val = torch.tensor(
-            _numeric_matrix(validation_fit, features).to_numpy(dtype=float), dtype=torch.float32
+            _numeric_matrix(validation_fit, features).to_numpy(dtype=float),
+            dtype=torch.float32,
+            device=device,
         )
 
         def objective(trial: Any) -> float:
@@ -2869,17 +2878,23 @@ def _train_ft_transformer(
                 n_layers=int(trial_params["n_layers"]),
                 dropout=float(trial_params["dropout"]),
                 positive_output=False,
-            )
+            ).to(device)
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr=float(trial_params["lr"]),
                 weight_decay=float(trial_params["weight_decay"]),
             )
             x_train = torch.tensor(
-                _numeric_matrix(train_fit, features).to_numpy(dtype=float), dtype=torch.float32
+                _numeric_matrix(train_fit, features).to_numpy(dtype=float),
+                dtype=torch.float32,
+                device=device,
             )
-            y_train = torch.tensor(_training_target_values(train_fit), dtype=torch.float32)
-            y_val = torch.tensor(_training_target_values(validation_fit), dtype=torch.float32)
+            y_train = torch.tensor(
+                _training_target_values(train_fit), dtype=torch.float32, device=device
+            )
+            y_val = torch.tensor(
+                _training_target_values(validation_fit), dtype=torch.float32, device=device
+            )
             best_state: dict[str, torch.Tensor] | None = None
             best_loss = float("inf")
             epochs_run = 0
@@ -2897,7 +2912,8 @@ def _train_ft_transformer(
                 if val_loss < best_loss:
                     best_loss = val_loss
                     best_state = {
-                        key: value.detach().clone() for key, value in model.state_dict().items()
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
                     }
                     stale = 0
                 else:
@@ -2908,7 +2924,7 @@ def _train_ft_transformer(
                 model.load_state_dict(best_state)
             model.eval()
             with torch.no_grad():
-                forecast = _back_transform_model_forecast(model(x_val).detach().numpy())
+                forecast = _back_transform_model_forecast(model(x_val).detach().cpu().numpy())
             metrics = _validation_tuning_metrics(validation_fit, forecast=forecast)
             target_diagnostics = _canonical_target_diagnostics(
                 early_stop_metric="mse_log_rvar",
@@ -2958,6 +2974,7 @@ def _train_ft_transformer(
             train_validation_fit,
             features=features,
             seed=seed,
+            device=device,
             d_token=_param_int(params, "d_token"),
             n_heads=_param_int(params, "n_heads"),
             n_layers=_param_int(params, "n_layers"),
@@ -2980,9 +2997,11 @@ def _train_ft_transformer(
                         torch.tensor(
                             _numeric_matrix(split_frame, features).to_numpy(dtype=float),
                             dtype=torch.float32,
+                            device=device,
                         )
                     )
                     .detach()
+                    .cpu()
                     .numpy()
                 )
         if seed_values:
@@ -3017,6 +3036,7 @@ def _train_ft_transformer(
             "trained_seed_count": int(len(final_models)),
             "seed_list": ",".join(str(seed) for seed in FT_TRANSFORMER_FINAL_SEEDS),
             "ensemble_method": "mean_prediction_over_seeds",
+            "device": device.type,
             "refit_rows": int(len(train_validation_fit)),
         },
         final_models,
@@ -4079,7 +4099,7 @@ def build_common_row_diagnostics(
         for model_id, column in forecast_columns.items():
             score_col = f"_score_{model_id}"
             if column in test:
-                _ranking_score_col_for_model(
+                score_col = _ranking_score_col_for_model(
                     test,
                     model_id=model_id,
                     forecast_col=column,
@@ -5476,12 +5496,12 @@ def build_metric_tables(
             scored_all = target_frame.copy()
             if column not in scored_all:
                 continue
-            score_col = f"score_{model_id}"
-            _ranking_score_col_for_model(
+            base_score_col = f"score_{model_id}"
+            score_col = _ranking_score_col_for_model(
                 scored,
                 model_id=model_id,
                 forecast_col=column,
-                score_col=score_col,
+                score_col=base_score_col,
             )
             _ranking_score_col_for_model(
                 scored_all,
@@ -7519,17 +7539,24 @@ def _latest_xbrl_values_for_event(facts: pd.DataFrame, event: pd.Series) -> dict
     if pd.isna(asof_ts):
         asof_ts = pd.to_datetime(event.get("event_entry_timestamp"), errors="coerce", utc=True)
     asof_date = asof_ts.date() if not pd.isna(asof_ts) else pd.NaT
-    frame = facts.loc[facts["ticker"].astype(str).str.upper().eq(ticker)].copy()
+    if "_ticker_upper" in facts.columns:
+        frame = facts.loc[facts["_ticker_upper"].eq(ticker)].copy()
+    else:
+        frame = facts.loc[facts["ticker"].astype(str).str.upper().eq(ticker)].copy()
     if frame.empty:
         return {}
-    filed_raw = frame["filed"] if "filed" in frame.columns else pd.Series(pd.NaT, index=frame.index)
-    frame["filed_date"] = pd.to_datetime(filed_raw, errors="coerce").dt.date
-    acceptance_raw = (
-        frame["acceptance_datetime"]
-        if "acceptance_datetime" in frame.columns
-        else pd.Series(pd.NaT, index=frame.index)
-    )
-    frame["acceptance_ts"] = pd.to_datetime(acceptance_raw, errors="coerce", utc=True)
+    if "filed_date" not in frame.columns:
+        filed_raw = (
+            frame["filed"] if "filed" in frame.columns else pd.Series(pd.NaT, index=frame.index)
+        )
+        frame["filed_date"] = pd.to_datetime(filed_raw, errors="coerce").dt.date
+    if "acceptance_ts" not in frame.columns:
+        acceptance_raw = (
+            frame["acceptance_datetime"]
+            if "acceptance_datetime" in frame.columns
+            else pd.Series(pd.NaT, index=frame.index)
+        )
+        frame["acceptance_ts"] = pd.to_datetime(acceptance_raw, errors="coerce", utc=True)
     has_acceptance = frame["acceptance_ts"].notna()
     allowed_by_acceptance = has_acceptance & frame["acceptance_ts"].le(asof_ts)
     allowed_by_filed = (
@@ -7610,7 +7637,37 @@ def merge_sec_xbrl_features(features: pd.DataFrame, config: ProjectConfig) -> pd
         out["xbrl_fact_coverage_count"] = 0
         out["xbrl_dropped_same_day_filed_rows"] = 0
         return out
-    records = [_latest_xbrl_values_for_event(facts, row) for _, row in out.iterrows()]
+    prepared_facts = facts.copy()
+    if "ticker" in prepared_facts.columns:
+        prepared_facts["_ticker_upper"] = prepared_facts["ticker"].astype(str).str.upper()
+    else:
+        prepared_facts["_ticker_upper"] = ""
+    filed_raw = (
+        prepared_facts["filed"]
+        if "filed" in prepared_facts.columns
+        else pd.Series(pd.NaT, index=prepared_facts.index)
+    )
+    prepared_facts["filed_date"] = pd.to_datetime(filed_raw, errors="coerce").dt.date
+    acceptance_raw = (
+        prepared_facts["acceptance_datetime"]
+        if "acceptance_datetime" in prepared_facts.columns
+        else pd.Series(pd.NaT, index=prepared_facts.index)
+    )
+    prepared_facts["acceptance_ts"] = pd.to_datetime(acceptance_raw, errors="coerce", utc=True)
+    facts_by_ticker = {
+        ticker: frame
+        for ticker, frame in prepared_facts.groupby("_ticker_upper", sort=False)
+        if ticker
+    }
+    records = []
+    for _, row in out.iterrows():
+        ticker = str(row.get("ticker") or "").upper()
+        records.append(
+            _latest_xbrl_values_for_event(
+                facts_by_ticker.get(ticker, pd.DataFrame()),
+                row,
+            )
+        )
     xbrl = pd.DataFrame(records, index=out.index)
     if xbrl.empty:
         out["xbrl_available"] = False

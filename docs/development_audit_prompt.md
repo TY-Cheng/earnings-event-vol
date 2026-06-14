@@ -63,9 +63,10 @@ Data route and labeling:
   flagged when the exit-preclose trade-aggregate mark is missing/unusable or
   when the option expires on the exit date.
 - The current main no-NBBO target window is `2016-10-01` to `2026-06-05`.
-  Broader Mac preflight artifacts from the previous `2016-01-01` window must
-  be identified as preflight only. Current model/report metric artifacts may
-  still be historical until rerun on the refreshed main-window feature matrix.
+  The current canonical evidence is the WSL2/CUDA cold-run root
+  `/home/tycheng/data/earnings-event-vol`. Older repo-local
+  artifacts, older bounded quote slices, and broader preflight materializations
+  must be identified as stale or preflight only.
 - Universe construction filters ETF/index/non-single-name symbols before
   selecting the monthly top 50.
 - SEC EDGAR submissions plus SEC primary filing documents are the primary

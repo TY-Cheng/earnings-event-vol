@@ -39,11 +39,11 @@ Research object:
 Data:
 
 - The options source and entitlement window are stated explicitly.
-- Current main no-NBBO data and feature artifacts should target `2016-10-01`
-  through `2026-06-05`; broader `2016-01-01` Mac artifacts must be labeled as
-  preflight if they have not been rebuilt for the main window. Current
-  model/report results must be identified separately if they still come from
-  historical pre-rerun artifacts.
+- Current main no-NBBO data, feature, model, and report artifacts target
+  `2016-10-01` through `2026-06-05` in the WSL2/CUDA cold-run root
+  `/home/tycheng/data/earnings-event-vol`. Older repo-local
+  artifacts, older bounded quote slices, and broader preflight materializations
+  must be labeled stale or preflight only.
 - Market-data inputs are stated precisely: options day aggregates for universe,
   contract, IV proxy, fallback exit diagnostics, and sequence construction;
   underlying day aggregates for vendor OHLC opens, C2O/C2C/O2C targets, and
@@ -59,10 +59,9 @@ Data:
   option day-aggregate close is not used as a strategy-exit fallback.
 - O2C proxy PnL is a realized decomposition diagnostic, not a model-driven
   strategy headline without a post-open residual-IV baseline.
-- The 2016-10-01 to 2026-06-05 no-NBBO data and feature sample may be
-  described as processed only after the matching main-window rebuild completes;
-  paper-grade execution still requires historical bid/ask or NBBO-equivalent
-  data for that range.
+- The 2016-10-01 to 2026-06-05 no-NBBO cold-run sample may be described as
+  processed for proxy-stage research; paper-grade execution still requires
+  historical bid/ask or NBBO-equivalent data for that range.
 - Earnings events come from SEC EDGAR submissions plus SEC primary filing
   document validation.
 - Massive 8-K text is auxiliary fallback only.
@@ -132,4 +131,4 @@ Backtests:
 - Calendar returns interpreted as pure event-variance returns.
 - Variance-space edge compared directly to dollar transaction costs.
 - Historical proxy/model results presented as current target-window paper
-  evidence without a matching refreshed feature matrix and model/report rerun.
+  evidence without matching the current cold-run manifests.

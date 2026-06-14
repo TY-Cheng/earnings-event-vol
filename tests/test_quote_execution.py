@@ -855,6 +855,65 @@ def test_quote_execution_panel_fetches_targeted_rest_quotes_with_cache(
     assert "unexpected" not in pd.read_parquet(cache_files[1]).columns
 
 
+def test_quote_execution_panel_rest_route_handles_empty_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_path = tmp_path / "massive.key"
+    key_path.write_text("test-key\n", encoding="utf-8")
+    config = replace(
+        load_project_config(),
+        massive_api_key_file=key_path,
+        massive_base_url="https://api.massive.test",
+        massive_requests_per_minute=0,
+    )
+
+    class EmptyResponse:
+        text = ""
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"results": []}
+
+    class EmptyClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            _ = args, kwargs
+
+        def __enter__(self) -> EmptyClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            _ = args
+
+        def get(self, url: str, params: dict[str, object]) -> EmptyResponse:
+            _ = url, params
+            return EmptyResponse()
+
+    monkeypatch.setattr("earnings_event_vol.quote_execution.httpx.Client", EmptyClient)
+    report = extract_quote_execution_panel(
+        config=config,
+        contracts=_quote_contracts(),
+        windows=_quote_windows(),
+        out_dir=tmp_path / "empty-rest",
+        dates=(date(2026, 2, 5),),
+        metadata_only=False,
+        quote_source="rest",
+        quote_cache_dir=tmp_path / "quote_cache",
+        quote_workers=2,
+    )
+
+    assert report.ok is True
+    assert report.quote_rows_scanned == 0
+    assert report.quote_rows_matched == 0
+    quotes = pd.read_csv(tmp_path / "empty-rest" / "quote_window_quotes.csv")
+    marks = pd.read_csv(tmp_path / "empty-rest" / "quote_window_marks.csv")
+    assert "options_ticker" in quotes.columns
+    assert "options_ticker" in marks.columns
+    assert set(marks["quote_status"]) == {QUOTE_STATUS_MISSING}
+
+
 def test_quote_rest_cache_loader_discards_empty_files(tmp_path: Path) -> None:
     cache_path = tmp_path / "empty.parquet"
     cache_path.touch()
@@ -955,6 +1014,39 @@ def test_quote_rest_retries_paginates_and_redacts_errors(tmp_path: Path) -> None
             config=config,
         )
 
+    class MalformedJsonThenOkResponse:
+        text = ""
+
+        def __init__(self, malformed: bool) -> None:
+            self._malformed = malformed
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            if self._malformed:
+                raise json.JSONDecodeError("bad json", "{", 1)
+            return {"results": [{"ok": True}]}
+
+    class MalformedJsonThenOkClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, url: str, params: dict[str, object]) -> MalformedJsonThenOkResponse:
+            _ = url, params
+            self.calls += 1
+            return MalformedJsonThenOkResponse(malformed=self.calls == 1)
+
+    malformed_client = MalformedJsonThenOkClient()
+    payload = quote_execution_module._get_json_with_retries(
+        cast(httpx.Client, malformed_client),
+        "https://api.massive.test/v3/quotes/O:ABC",
+        params={"apiKey": "test-key"},
+        config=config,
+    )
+    assert payload == {"results": [{"ok": True}]}
+    assert malformed_client.calls == 2
+
 
 def test_quote_execution_misc_defensive_branches(
     tmp_path: Path,
@@ -987,6 +1079,7 @@ def test_quote_execution_misc_defensive_branches(
         massive_base_url="https://api.massive.test",
         massive_max_retries=1,
         massive_retry_backoff_seconds=0.5,
+        massive_requests_per_minute=0,
     )
     sleeps: list[float] = []
     monkeypatch.setattr("earnings_event_vol.quote_execution.time_module.sleep", sleeps.append)

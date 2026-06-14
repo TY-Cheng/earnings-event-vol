@@ -203,10 +203,12 @@ from earnings_event_vol.research import (
     _log_rvar_to_variance,
     _model_ids_for_sequence_suite,
     _numeric_matrix,
+    _ranking_score_col_for_model,
     _sequence_losses,
     _target_ids_for_sequence_suite,
     _target_to_log_rvar,
     _torch_log_rvar_to_variance,
+    _torch_training_device,
     _write_tuning_artifacts,
     aggregate_sequence_features,
     assign_event_splits,
@@ -7472,6 +7474,16 @@ def test_ft_transformer_log_mode_uses_unconstrained_head() -> None:
     assert (_log_rvar_to_variance(raw_log_output) >= FORECAST_FLOOR).all()
 
 
+def test_torch_training_device_prefers_cuda_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _torch_training_device().type == "cuda"
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _torch_training_device().type == "cpu"
+
+
 def test_research_tuning_cli_and_model_ids() -> None:
     parser = build_parser()
     args = parser.parse_args(
@@ -7579,6 +7591,34 @@ def test_lightgbm_xgboost_forecast_ensemble_uses_variance_units(tmp_path: Path) 
     assert row["ensemble_method"] == "equal_weight_forecast_average"
     assert row["prediction_scale"] == "variance_units"
     assert row["ranking_signal_col"] == ENSEMBLE_RANK_SIGNAL_COL
+
+
+def test_ranking_score_col_for_ensemble_uses_canonical_rank_signal() -> None:
+    frame = pd.DataFrame(
+        {
+            "ivar_event": [0.01, 0.02],
+            "forecast_lightgbm_xgboost_forecast_ensemble": [0.03, 0.01],
+            ENSEMBLE_RANK_SIGNAL_COL: [0.75, 0.25],
+        }
+    )
+    score_col = _ranking_score_col_for_model(
+        frame,
+        model_id="lightgbm_xgboost_forecast_ensemble",
+        forecast_col="forecast_lightgbm_xgboost_forecast_ensemble",
+        score_col="score_lightgbm_xgboost_forecast_ensemble",
+    )
+
+    assert score_col == ENSEMBLE_RANK_SIGNAL_COL
+    assert "score_lightgbm_xgboost_forecast_ensemble" not in frame
+
+    base_score_col = _ranking_score_col_for_model(
+        frame,
+        model_id="lightgbm_tuned",
+        forecast_col="forecast_lightgbm_xgboost_forecast_ensemble",
+        score_col="score_lightgbm_tuned",
+    )
+    assert base_score_col == "score_lightgbm_tuned"
+    assert frame["score_lightgbm_tuned"].tolist() == pytest.approx([0.02, -0.01])
 
 
 def test_best_completed_trial_respects_penalized_objective() -> None:

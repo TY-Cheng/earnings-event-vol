@@ -5,10 +5,11 @@ hide:
 
 # Future Work
 
-Keep the first paper narrow. The current repo has a working no-NBBO proxy data
-and feature route, but the headline paper still needs a main-window
-2016-10-01 to 2026-06-05 data/feature/model/report rerun, paper-grade data,
-robustness, and inference.
+Keep the first paper narrow. The current repo has a completed no-NBBO proxy
+cold run for 2016-10-01 to 2026-06-05, including data, features, models,
+reports, quote-aware diagnostics, IVAR defeat analysis, and casebook outputs.
+The headline paper still needs paper-grade execution data and final robustness
+discipline before making executable trading claims.
 
 ## Before Paper Claims
 
@@ -22,21 +23,20 @@ Paper-grade market data:
 
 Full sample:
 
-- Treat the 2016-10-01 to 2026-06-05 no-NBBO data and feature rebuild as the
-  current proxy baseline.
-- Keep the previous broader 2016-01-01 Mac materialization as a preflight
-  artifact only; do not cite it as the current main-window result after the
-  Oct-2016 target switch.
+- Treat the 2016-10-01 to 2026-06-05 no-NBBO cold run as the current proxy
+  baseline.
+- Do not cite older repo-local artifacts, older bounded 502-event quote slices,
+  or broader preflight materializations as current evidence.
 - Preserve monthly top-50 liquid single-name universe construction.
 - Keep ETF, index, volatility, commodity trust, and other non-single-name
   symbols out of the main universe.
-- Re-run models, figures, reports, and robustness tables after the full data
-  and model runtime route is stable.
+- Re-run models, figures, reports, and robustness tables only after a new data
+  or paper-grade quote/NBBO route changes the evidence base.
 
 Robustness and inference:
 
 - Promote the current cost-stress and clustered forecast-loss diagnostics into
-  final tables only after the paper-grade data route is rebuilt.
+  final tables only after the paper-grade data route is complete.
 - Re-run main DTE `5-14` and robustness DTE `3-21` samples separately.
 - Add block bootstrap confidence intervals.
 - Add model-confidence-set or SPA-style checks if many thresholds or models are
@@ -60,7 +60,7 @@ Sequence route:
 - Add explicit stale-artifact checks so docs cannot cite obsolete 50-event or
   3-event calibration runs after a larger proxy run exists.
 - Promote key proxy report numbers into `docs/results_snapshot.md` from
-  machine-readable artifacts.
+  machine-readable artifacts whenever the external cold-run root changes.
 - Add a small command that prints the current sample window, event count, IVAR
   coverage, model rows, and paper-grade flag.
 - Keep stale-result checks for `tuning_trials.csv`,
